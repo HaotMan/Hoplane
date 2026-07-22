@@ -1,0 +1,58 @@
+# Dependencies and package-manager caches
+node_modules/
+.pnpm-store/
+
+# Build, packaging, test, and coverage outputs
+dist/
+apps/desktop/dist/
+release/
+out/
+coverage/
+.vitest/
+*.tsbuildinfo
+
+# Hoplane local runtime data
+.hoplane/
+.hoplane-data/
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.enc
+*.token
+*.pid
+
+# Environment files and private credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Operating-system metadata
+.DS_Store
+.AppleDouble
+Thumbs.db
+desktop.ini
+
+# IDE and editor-local settings
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Temporary and tool caches
+tmp/
+temp/
+.cache/

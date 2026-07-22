@@ -1,0 +1,12 @@
+interface:
+  display_name: "Hoplane SSH"
+  short_description: "Use policy-controlled SSH hosts through Hoplane"
+  default_prompt: "Use $hoplane to inspect a configured remote server safely."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "hoplane"
+      description: "Policy-controlled SSH command and file-transfer tools"
+      transport: "stdio"
+policy:
+  allow_implicit_invocation: true

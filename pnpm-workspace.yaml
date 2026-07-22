@@ -1,0 +1,11 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+  - "services/*"
+
+allowBuilds:
+  cpu-features: false
+  electron: true
+  electron-winstaller: false
+  esbuild: true
+  ssh2: false
