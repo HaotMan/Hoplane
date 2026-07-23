@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
-import { HoplaneDatabase } from "../packages/core/src/database.js";
+import { HoplaneDatabase, POLICY_TEMPLATE_CONSOLIDATION_CLEANUP_SETTING } from "../packages/core/src/database.js";
 import { POLICY_TEMPLATES } from "../packages/shared/src/index.js";
 
 const dirs: string[] = [];
@@ -25,6 +25,49 @@ describe("HoplaneDatabase", () => {
     const fullAccess = policies.find((policy) => policy.name === "全权限（高风险）")!;
     expect(fullAccess.document).toMatchObject({ schemaVersion: 3, commandBlacklist: [], files: { allowUpload: true, allowDownload: true } });
     db.close();
+  });
+  it("merges legacy Docker and Kubernetes templates and rebinds their hosts", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hoplane-test-")); dirs.push(dir);
+    const path = join(dir, "merge.sqlite3");
+    const db = new HoplaneDatabase(path);
+    const document = db.listPolicies()[0]!.document;
+    const sourcePaths = [
+      join(dir, "policies", "docker-readonly.yaml"),
+      join(dir, "policies", "kubernetes-readonly.yaml"),
+      join(dir, "policies", "docker-operations.yaml"),
+      join(dir, "policies", "kubernetes-operations.yaml")
+    ];
+    const legacyPolicies = [
+      db.createPolicy("Docker 排障（只读）", document, { sourcePath: sourcePaths[0] }),
+      db.createPolicy("Kubernetes 排障（只读）", document, { sourcePath: sourcePaths[1] }),
+      db.createPolicy("Docker 运维（受限）", document, { sourcePath: sourcePaths[2] }),
+      db.createPolicy("Kubernetes 应用运维（受限）", document, { sourcePath: sourcePaths[3] })
+    ];
+    const hosts = legacyPolicies.map((policy, index) => db.createHost({
+      name: `legacy-${index}`, hostname: "127.0.0.1", port: 22, username: "root", credentialId: null,
+      policyId: policy.id, groupName: null, tags: [], defaultDirectory: null, enabled: true, aiAccessEnabled: true
+    }));
+    db.close();
+
+    const raw = new DatabaseSync(path);
+    raw.prepare("DELETE FROM schema_migrations WHERE version = 7").run();
+    raw.close();
+
+    const migrated = new HoplaneDatabase(path);
+    expect(migrated.listPolicies().map((policy) => policy.name)).not.toEqual(expect.arrayContaining([
+      "Docker 排障（只读）", "Kubernetes 排障（只读）", "Docker 运维（受限）", "Kubernetes 应用运维（受限）"
+    ]));
+    expect(hosts.slice(0, 2).map((host) => migrated.getHost(host.id)?.policyId)).toEqual([
+      migrated.listPolicies().find((policy) => policy.name === "容器排障（只读）")!.id,
+      migrated.listPolicies().find((policy) => policy.name === "容器排障（只读）")!.id
+    ]);
+    expect(hosts.slice(2).map((host) => migrated.getHost(host.id)?.policyId)).toEqual([
+      migrated.listPolicies().find((policy) => policy.name === "容器运维（受限）")!.id,
+      migrated.listPolicies().find((policy) => policy.name === "容器运维（受限）")!.id
+    ]);
+    expect(hosts.map((host) => migrated.getHost(host.id)?.configRevision)).toEqual(hosts.map((host) => host.configRevision + 1));
+    expect(migrated.getSetting(POLICY_TEMPLATE_CONSOLIDATION_CLEANUP_SETTING, [])).toEqual(sourcePaths);
+    migrated.close();
   });
   it("repairs a legacy database whose migration record is ahead of its policy table", async () => {
     const dir = await mkdtemp(join(tmpdir(), "hoplane-test-")); dirs.push(dir);

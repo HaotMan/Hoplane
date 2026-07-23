@@ -60,6 +60,7 @@ export interface JsonAgentIntegrationState {
   skillInstalled: boolean;
   mcpConfigured: boolean;
   restartRequired: boolean;
+  configDirectory: string;
   agentHome: string;
   skillPath: string;
   configPath: string;
@@ -67,12 +68,28 @@ export interface JsonAgentIntegrationState {
   configSnippet: string;
   canInstall: boolean;
   configError: string | null;
+  candidates: JsonAgentHomeCandidate[];
+}
+
+export interface JsonAgentHomeCandidate {
+  path: string;
+  label: string;
+  source: "SELECTED" | "ENVIRONMENT" | "DEFAULT" | "COMMON";
+  exists: boolean;
+  isDirectory: boolean;
+  configStatus: "VALID" | "MISSING" | "INVALID";
+  configDetail: string;
+  writable: boolean;
+  selected: boolean;
 }
 
 interface JsonAgentIntegrationOptions {
+  configDirectory?: string;
   userHome?: string;
   skillSource?: string;
   runtime?: StdioRuntime;
+  candidateDirectories?: Array<{ path: string; label: string; source?: JsonAgentHomeCandidate["source"] }>;
+  environment?: NodeJS.ProcessEnv;
 }
 
 export class CodexIntegrationService {
@@ -254,25 +271,37 @@ export class CodexIntegrationService {
 }
 
 export class JsonAgentIntegrationService {
+  private selectedConfigDirectory?: string;
   private readonly userHome: string;
   private readonly skillSource: string;
   private readonly runtime: StdioRuntime;
+  private readonly candidateDirectories?: JsonAgentIntegrationOptions["candidateDirectories"];
+  private readonly environment: NodeJS.ProcessEnv;
 
   constructor(private readonly agent: JsonAgentKind, options: JsonAgentIntegrationOptions = {}) {
     this.userHome = options.userHome ?? homedir();
+    this.environment = options.environment ?? process.env;
+    this.selectedConfigDirectory = options.configDirectory ? normalizeAgentConfigDirectory(options.configDirectory, this.userHome, this.agent) : undefined;
+    this.candidateDirectories = options.candidateDirectories;
     this.skillSource = options.skillSource ?? process.env.HOPLANE_CODEX_SKILL_SOURCE ?? join(process.cwd(), "integrations", "codex", "hoplane");
     this.runtime = options.runtime ?? resolveStdioRuntime();
   }
 
   async getState(): Promise<JsonAgentIntegrationState> {
-    const agentHome = join(this.userHome, this.agent === "cursor" ? ".cursor" : ".claude");
-    const skillPath = join(agentHome, "skills", "hoplane");
-    const configPath = this.agent === "cursor" ? join(agentHome, "mcp.json") : join(this.userHome, ".claude.json");
-    const [skillInstalled, configInspection, homeWritable, configParentWritable] = await Promise.all([
+    const discovered = await this.discoverConfigDirectories();
+    const preferred = this.selectedConfigDirectory
+      ?? discovered.find((candidate) => candidate.configStatus === "VALID")?.path
+      ?? defaultAgentConfigDirectory(this.agent, this.userHome);
+    const configDirectory = normalizeAgentConfigDirectory(preferred, this.userHome, this.agent);
+    if (!discovered.some((candidate) => candidate.path === configDirectory)) {
+      discovered.unshift(await inspectJsonAgentDirectory(this.agent, configDirectory, "已选择的目录", "SELECTED", this.runtime));
+    }
+    const candidates = discovered.map((candidate) => ({ ...candidate, selected: candidate.path === configDirectory }));
+    const selectedCandidate = candidates.find((candidate) => candidate.selected)!;
+    const { agentHome, skillPath, configPath } = jsonAgentPaths(this.agent, configDirectory);
+    const [skillInstalled, configInspection] = await Promise.all([
       access(join(skillPath, "SKILL.md"), constants.R_OK).then(() => true).catch(() => false),
-      inspectJsonAgentConfig(configPath, this.runtime),
-      pathReadyForWrite(agentHome),
-      pathReadyForWrite(dirname(configPath))
+      inspectJsonAgentConfig(configPath, this.runtime)
     ]);
     return {
       agent: this.agent,
@@ -280,14 +309,52 @@ export class JsonAgentIntegrationService {
       skillInstalled,
       mcpConfigured: configInspection.configured,
       restartRequired: false,
+      configDirectory,
       agentHome,
       skillPath,
       configPath,
       runtimeCommand: this.runtime.command,
       configSnippet: renderJsonMcpConfig(this.runtime),
-      canInstall: homeWritable && configParentWritable && configInspection.error === null,
-      configError: configInspection.error
+      canInstall: selectedCandidate.writable && selectedCandidate.configStatus !== "INVALID",
+      configError: configInspection.error,
+      candidates
     };
+  }
+
+  async selectConfigDirectory(path: string): Promise<JsonAgentIntegrationState> {
+    const normalized = normalizeAgentConfigDirectory(path, this.userHome, this.agent);
+    const candidate = await inspectJsonAgentDirectory(this.agent, normalized, "手动选择", "SELECTED", this.runtime);
+    if (candidate.configStatus === "INVALID") {
+      throw new AppError("AGENT_INTEGRATION_DIRECTORY_INVALID", candidate.configDetail, false, undefined, { agent: this.agent, path: normalized }, 409);
+    }
+    if (!candidate.writable) {
+      throw new AppError("AGENT_INTEGRATION_DIRECTORY_NOT_WRITABLE", "配置目录或其最近的现有父目录不可写", false, undefined, { agent: this.agent, path: normalized }, 409);
+    }
+    this.selectedConfigDirectory = normalized;
+    return this.getState();
+  }
+
+  async discoverConfigDirectories(): Promise<JsonAgentHomeCandidate[]> {
+    const seeds: Array<{ path: string; label: string; source: JsonAgentHomeCandidate["source"] }> = [];
+    if (this.selectedConfigDirectory) seeds.push({ path: this.selectedConfigDirectory, label: "已选择的目录", source: "SELECTED" });
+    if (this.candidateDirectories) {
+      seeds.push(...this.candidateDirectories.map((candidate) => ({ ...candidate, source: candidate.source ?? "COMMON" as const })));
+    } else if (this.agent === "cursor") {
+      seeds.push(
+        { path: join(this.userHome, ".cursor"), label: "Cursor 用户目录", source: "DEFAULT" },
+        { path: join(this.userHome, ".config", "cursor"), label: "XDG 常见目录", source: "COMMON" }
+      );
+      if (this.environment.APPDATA) seeds.push({ path: join(this.environment.APPDATA, ".cursor"), label: "Windows Roaming 用户目录", source: "COMMON" });
+    } else {
+      seeds.push({ path: this.userHome, label: "用户主目录", source: "DEFAULT" });
+      if (this.environment.USERPROFILE) seeds.push({ path: this.environment.USERPROFILE, label: "Windows 用户目录", source: "COMMON" });
+    }
+    const unique = new Map<string, typeof seeds[number]>();
+    for (const seed of seeds) {
+      const path = normalizeAgentConfigDirectory(seed.path, this.userHome, this.agent);
+      if (!unique.has(path)) unique.set(path, { ...seed, path });
+    }
+    return Promise.all([...unique.values()].map((seed) => inspectJsonAgentDirectory(this.agent, seed.path, seed.label, seed.source, this.runtime)));
   }
 
   async install(): Promise<JsonAgentIntegrationState> {
@@ -338,6 +405,62 @@ export class JsonAgentIntegrationService {
       throw new AppError("AGENT_SKILL_MISSING", `Bundled Hoplane Skill is missing: ${this.skillSource}`, false, undefined, { agent: this.agent }, 409);
     });
   }
+}
+
+function jsonAgentPaths(agent: JsonAgentKind, configDirectory: string): { agentHome: string; skillPath: string; configPath: string } {
+  const agentHome = agent === "cursor" ? configDirectory : join(configDirectory, ".claude");
+  return {
+    agentHome,
+    skillPath: join(agentHome, "skills", "hoplane"),
+    configPath: agent === "cursor" ? join(configDirectory, "mcp.json") : join(configDirectory, ".claude.json")
+  };
+}
+
+function defaultAgentConfigDirectory(agent: JsonAgentKind, userHome: string): string {
+  return agent === "cursor" ? join(userHome, ".cursor") : userHome;
+}
+
+async function inspectJsonAgentDirectory(
+  agent: JsonAgentKind,
+  path: string,
+  label: string,
+  source: JsonAgentHomeCandidate["source"],
+  runtime: StdioRuntime
+): Promise<JsonAgentHomeCandidate> {
+  const info = await stat(path).catch(() => null);
+  const exists = info !== null;
+  const isDirectory = Boolean(info?.isDirectory());
+  const { agentHome, configPath } = jsonAgentPaths(agent, path);
+  let configStatus: JsonAgentHomeCandidate["configStatus"] = "MISSING";
+  let configDetail = `未找到 ${agent === "cursor" ? "mcp.json" : ".claude.json"}，安装时将创建`;
+  if (exists && !isDirectory) {
+    configStatus = "INVALID";
+    configDetail = "候选路径不是目录";
+  } else {
+    const configInfo = await stat(configPath).catch(() => null);
+    if (configInfo) {
+      const inspection = await inspectJsonAgentConfig(configPath, runtime);
+      configStatus = inspection.error ? "INVALID" : "VALID";
+      configDetail = inspection.error ?? `${agent === "cursor" ? "mcp.json" : ".claude.json"} 可读取并通过 JSON 结构检查`;
+    }
+  }
+  const writable = (!exists || isDirectory)
+    && await pathReadyForWrite(path)
+    && await pathReadyForWrite(agentHome)
+    && await pathReadyForWrite(dirname(configPath));
+  return { path, label, source, exists, isDirectory, configStatus, configDetail, writable, selected: false };
+}
+
+function normalizeAgentConfigDirectory(path: string, userHome: string, agent: JsonAgentKind): string {
+  const trimmed = path.trim();
+  if (!trimmed || trimmed.includes("\0") || trimmed.length > 4096) {
+    throw new AppError("AGENT_INTEGRATION_DIRECTORY_INVALID", `${agent === "cursor" ? "Cursor" : "Claude Code"} 配置目录路径无效`, false, undefined, { agent }, 400);
+  }
+  const expanded = trimmed === "~" ? userHome : trimmed.startsWith("~/") || trimmed.startsWith("~\\") ? join(userHome, trimmed.slice(2)) : trimmed;
+  if (!isAbsolute(expanded)) {
+    throw new AppError("AGENT_INTEGRATION_DIRECTORY_INVALID", "配置目录必须使用绝对路径", false, undefined, { agent, path: trimmed }, 400);
+  }
+  return normalize(expanded);
 }
 
 async function inspectCodexHome(path: string, label: string, source: CodexHomeCandidate["source"]): Promise<CodexHomeCandidate> {

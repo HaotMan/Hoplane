@@ -48,20 +48,18 @@ describe("PolicyService V3 blacklist mode", () => {
     expect(tracing.files).toMatchObject({ allowUpload: false, allowDownload: false, allowOverwrite: false });
   });
 
-  it("uses progressively narrower Docker and Kubernetes blacklists", () => {
-    const dockerReadOnly = findPolicyTemplate("docker-readonly")!.document;
-    const dockerOperations = findPolicyTemplate("docker-operations")!.document;
-    expect(service.evaluateCommand(dockerReadOnly, "docker ps").decision).toBe("ALLOW");
-    expect(service.evaluateCommand(dockerReadOnly, "docker restart api").decision).toBe("DENY");
-    expect(service.evaluateCommand(dockerOperations, "docker restart api").decision).toBe("ALLOW");
-    expect(service.evaluateCommand(dockerOperations, "docker exec api sh").decision).toBe("DENY");
+  it("combines Docker and Kubernetes permissions into container templates", () => {
+    const readOnly = findPolicyTemplate("container-readonly")!.document;
+    expect(service.evaluateCommand(readOnly, "docker ps").decision).toBe("ALLOW");
+    expect(service.evaluateCommand(readOnly, "docker restart api").decision).toBe("DENY");
+    expect(service.evaluateCommand(readOnly, "kubectl get pods").decision).toBe("ALLOW");
+    expect(service.evaluateCommand(readOnly, "kubectl scale deployment api --replicas=2").decision).toBe("DENY");
 
-    const k8sReadOnly = findPolicyTemplate("kubernetes-readonly")!.document;
-    const k8sOperations = findPolicyTemplate("kubernetes-operations")!.document;
-    expect(service.evaluateCommand(k8sReadOnly, "kubectl get pods").decision).toBe("ALLOW");
-    expect(service.evaluateCommand(k8sReadOnly, "kubectl scale deployment api --replicas=2").decision).toBe("DENY");
-    expect(service.evaluateCommand(k8sOperations, "kubectl scale deployment api --replicas=2").decision).toBe("ALLOW");
-    expect(service.evaluateCommand(k8sOperations, "kubectl exec api -- sh").decision).toBe("DENY");
+    const operations = findPolicyTemplate("container-operations")!.document;
+    expect(service.evaluateCommand(operations, "docker restart api").decision).toBe("ALLOW");
+    expect(service.evaluateCommand(operations, "docker exec api sh").decision).toBe("DENY");
+    expect(service.evaluateCommand(operations, "kubectl scale deployment api --replicas=2").decision).toBe("ALLOW");
+    expect(service.evaluateCommand(operations, "kubectl exec api -- sh").decision).toBe("DENY");
   });
 
   it("supports a match-all blacklist for completely disabled policies", () => {

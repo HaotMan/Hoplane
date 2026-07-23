@@ -82,6 +82,9 @@
       ],
       "identity": null
     },
+    "dmg": {
+      "artifactName": "${productName}-${version}-macos-${arch}-installer.${ext}"
+    },
     "win": {
       "target": [
         {
@@ -101,6 +104,7 @@
       "requestedExecutionLevel": "asInvoker"
     },
     "nsis": {
+      "artifactName": "${productName}-${version}-windows-${arch}-installer.${ext}",
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,

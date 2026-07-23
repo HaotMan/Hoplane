@@ -118,6 +118,10 @@ const POLICY_V2_COLUMNS: ReadonlyArray<readonly [string, string]> = [
 const POLICY_V2_STRUCTURAL_MIGRATION = 4;
 const HOST_MONITOR_OUTPUT_MIGRATION = 5;
 const POLICY_BLACKLIST_MIGRATION = 6;
+const POLICY_TEMPLATE_CONSOLIDATION_MIGRATION = 7;
+export const POLICY_TEMPLATE_CONSOLIDATION_CLEANUP_SETTING = "policy.v3TemplateConsolidationCleanup";
+const LEGACY_READONLY_TEMPLATE_NAMES = new Set(["Docker 排障（只读）", "Kubernetes 排障（只读）"]);
+const LEGACY_OPERATIONS_TEMPLATE_NAMES = new Set(["Docker 运维（受限）", "Kubernetes 应用运维（受限）"]);
 
 type CreateHostInput = Omit<Host, "id" | "createdAt" | "updatedAt" | "configRevision" | "status" | "monitorOutputEnabled"> & {
   monitorOutputEnabled?: boolean;
@@ -206,19 +210,49 @@ export class HoplaneDatabase {
   }
 
   private seed(resetToV2: boolean): void {
+    const consolidateTemplates = !this.db.prepare("SELECT 1 FROM schema_migrations WHERE version = ?").get(POLICY_TEMPLATE_CONSOLIDATION_MIGRATION);
     this.transaction(() => {
       if (resetToV2) {
+        const legacyPaths = this.listPolicies().filter((policy) => LEGACY_READONLY_TEMPLATE_NAMES.has(policy.name) || LEGACY_OPERATIONS_TEMPLATE_NAMES.has(policy.name)).flatMap((policy) => policy.sourcePath ? [policy.sourcePath] : []);
+        if (legacyPaths.length > 0) this.setSetting(POLICY_TEMPLATE_CONSOLIDATION_CLEANUP_SETTING, legacyPaths);
         this.db.prepare("UPDATE hosts SET policy_id=NULL").run();
         this.db.prepare("DELETE FROM policies").run();
       }
       const existingNames = new Set(this.listPolicies().map((policy) => policy.name));
       for (const template of POLICY_TEMPLATES) if (!existingNames.has(template.name)) this.createPolicy(template.name, template.document);
+      if (consolidateTemplates && !resetToV2) this.consolidateLegacyPolicyTemplates();
       if (resetToV2) {
         const defaultPolicy = this.listPolicies().find((policy) => policy.name === DEFAULT_POLICY_TEMPLATE.name)!;
         this.db.prepare("UPDATE hosts SET policy_id=?,updated_at=? WHERE policy_id IS NULL").run(defaultPolicy.id, now());
         this.setSetting("policy.v3BlacklistUpgradeNotice", { appliedAt: now(), reboundPolicyId: defaultPolicy.id });
       }
+      if (consolidateTemplates) this.db.prepare("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES (?,?)").run(POLICY_TEMPLATE_CONSOLIDATION_MIGRATION, now());
     });
+  }
+
+  private consolidateLegacyPolicyTemplates(): void {
+    const policies = this.listPolicies();
+    const readonlyTarget = policies.find((policy) => policy.name === "容器排障（只读）");
+    const operationsTarget = policies.find((policy) => policy.name === "容器运维（受限）");
+    if (!readonlyTarget || !operationsTarget) throw new Error("Consolidated policy templates were not seeded");
+    const legacyReadonly = policies.filter((policy) => LEGACY_READONLY_TEMPLATE_NAMES.has(policy.name));
+    const legacyOperations = policies.filter((policy) => LEGACY_OPERATIONS_TEMPLATE_NAMES.has(policy.name));
+    this.rebindAndDeletePolicies(legacyReadonly, readonlyTarget.id);
+    this.rebindAndDeletePolicies(legacyOperations, operationsTarget.id);
+    const paths = [...legacyReadonly, ...legacyOperations].flatMap((policy) => policy.sourcePath ? [policy.sourcePath] : []);
+    if (paths.length > 0) {
+      const pending = this.getSetting<string[]>(POLICY_TEMPLATE_CONSOLIDATION_CLEANUP_SETTING, []);
+      this.setSetting(POLICY_TEMPLATE_CONSOLIDATION_CLEANUP_SETTING, [...new Set([...pending, ...paths])]);
+    }
+  }
+
+  private rebindAndDeletePolicies(policies: Policy[], targetId: string): void {
+    if (policies.length === 0) return;
+    const timestamp = now();
+    for (const policy of policies) {
+      this.db.prepare("UPDATE hosts SET policy_id=?,config_revision=config_revision+1,updated_at=? WHERE policy_id=?").run(targetId, timestamp, policy.id);
+      this.db.prepare("DELETE FROM policies WHERE id=?").run(policy.id);
+    }
   }
 
   transaction<T>(fn: () => T): T {

@@ -3,6 +3,7 @@ import { COMMAND_BLACKLIST_CATALOG, DEFAULT_POLICY_TEMPLATE, findPolicyTemplate,
 import { policySourceSchema } from "../../../packages/shared/src/schemas";
 import { parseDocument, stringify } from "yaml";
 import { api, ApiError, patch, post, put, remove } from "./api";
+import { groupHosts, selectedHostCopyText } from "./host-list";
 import type { AuditLog, Credential, Host, HostMonitorEvent, Policy, PolicyCommandRule, PolicyDocument, RevealedCredential } from "./types";
 
 type Page = "hosts" | "policies" | "audit" | "settings";
@@ -77,6 +78,9 @@ function HostsPage({ notify }: { notify: Notify }) {
   const [monitorHostId, setMonitorHostId] = useState<string | null>(null);
   const [testingHostId, setTestingHostId] = useState<string | null>(null);
   const [updatingHostId, setUpdatingHostId] = useState<string | null>(null);
+  const [multiSelectMode, setMultiSelectMode] = useState(false);
+  const [selectedHostIds, setSelectedHostIds] = useState<Set<string>>(() => new Set());
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => new Set());
   const [testResults, setTestResults] = useState<Record<string, { kind: "ok" | "error" | "pending"; text: string }>>({});
   const load = useCallback(async () => {
     try {
@@ -85,6 +89,44 @@ function HostsPage({ notify }: { notify: Notify }) {
     } catch (error) { notify("error", message(error)); }
   }, [notify]);
   useEffect(() => { void load(); const timer = window.setInterval(() => void load(), 10_000); return () => window.clearInterval(timer); }, [load]);
+  useEffect(() => {
+    const available = new Set(hosts.map((host) => host.id));
+    setSelectedHostIds((current) => new Set([...current].filter((id) => available.has(id))));
+  }, [hosts]);
+
+  function selectHost(hostId: string, selected: boolean) {
+    setSelectedHostIds((current) => {
+      const next = new Set(current);
+      if (selected) next.add(hostId); else next.delete(hostId);
+      return next;
+    });
+  }
+  function selectHosts(hostIds: string[], selected: boolean) {
+    setSelectedHostIds((current) => {
+      const next = new Set(current);
+      for (const id of hostIds) if (selected) next.add(id); else next.delete(id);
+      return next;
+    });
+  }
+  function toggleGroup(groupKey: string) {
+    setCollapsedGroups((current) => {
+      const next = new Set(current);
+      if (next.has(groupKey)) next.delete(groupKey); else next.add(groupKey);
+      return next;
+    });
+  }
+  function leaveMultiSelectMode() {
+    setMultiSelectMode(false);
+    setSelectedHostIds(new Set());
+  }
+  async function copySelectedHostNames() {
+    const value = selectedHostCopyText(hosts, selectedHostIds);
+    if (!value) return;
+    try {
+      await navigator.clipboard.writeText(value);
+      notify("ok", `已复制 ${selectedHostIds.size} 台主机的名称和地址`);
+    } catch { notify("error", "无法写入剪贴板，请检查系统剪贴板权限"); }
+  }
 
   async function test(host: Host) {
     if (testingHostId) return;
@@ -130,21 +172,46 @@ function HostsPage({ notify }: { notify: Notify }) {
   const monitoredHost = monitorHostId ? hosts.find((host) => host.id === monitorHostId) : undefined;
   const monitoredCredential = monitoredHost?.credentialId ? credentials.find((credential) => credential.id === monitoredHost.credentialId) : undefined;
   if (monitorHostId && monitoredHost) return <HostMonitorPage host={monitoredHost} credential={monitoredCredential} onBack={() => setMonitorHostId(null)} onHostChanged={load} notify={notify} />;
+  const groups = groupHosts(hosts);
+  const allSelected = hosts.length > 0 && selectedHostIds.size === hosts.length;
+  const someSelected = selectedHostIds.size > 0 && !allSelected;
+  const existingGroupNames = groups.filter((group) => !group.ungrouped).map((group) => group.name);
   return <section><PageHeader eyebrow="Infrastructure" title="SSH 主机"><button className="primary" onClick={() => setEditing("new")}>添加主机</button></PageHeader>
     <div className="summary-row">
       <Metric label="主机总数" value={hosts.length} /><Metric label="允许 AI" value={hosts.filter(h => h.enabled && h.aiAccessEnabled).length} />
       <Metric label="在线连接" value={hosts.filter(h => h.status === "CONNECTED").length} />
     </div>
-    <div className="panel table-panel">
-      <table><thead><tr><th>主机</th><th>分组</th><th>状态</th><th>AI 权限</th><th>策略</th><th /></tr></thead>
-      <tbody>{hosts.map(host => <tr key={host.id}>
-        <td><button className="host-name-link" onClick={() => setMonitorHostId(host.id)}><strong>{host.name}</strong><small>{host.username}@{host.hostname}:{host.port}</small></button></td><td>{host.groupName ?? "—"}</td>
-        <td><Status value={host.enabled ? host.status : "DISABLED"} />{testResults[host.id] && <small className={`test-result ${testResults[host.id]!.kind}`}>{testResults[host.id]!.text}</small>}</td><td><span className={host.enabled && host.aiAccessEnabled ? "badge allow" : "badge"}>{!host.enabled ? "主机停用" : host.aiAccessEnabled ? "已开放" : "未开放"}</span></td>
-        <td>{policies.find(p => p.id === host.policyId)?.name ?? "未配置"}</td>
-        <td className="actions"><button onClick={() => setMonitorHostId(host.id)}>只读终端</button><button disabled={!host.enabled || testingHostId !== null || updatingHostId !== null} onClick={() => void test(host)}>{testingHostId === host.id ? "测试中…" : "测试"}</button><button className={host.enabled ? "danger-link" : ""} disabled={testingHostId !== null || updatingHostId !== null} onClick={() => void toggleHost(host)}>{updatingHostId === host.id ? "处理中…" : host.enabled ? "停用" : "启用"}</button><button disabled={testingHostId === host.id || updatingHostId === host.id} onClick={() => setEditing(host)}>编辑</button><button className="danger-link" disabled={testingHostId === host.id || updatingHostId === host.id} onClick={async () => { if (confirm(`删除 ${host.name}？`)) { await remove(`/v1/hosts/${host.id}`); await load(); } }}>删除</button></td>
-      </tr>)}</tbody></table>{hosts.length === 0 && <Empty text="还没有主机。添加主机时可以直接填写密码、私钥或 SSH Agent。" />}</div>
-    {editing && <HostDialog host={editing === "new" ? null : editing} credentials={credentials} policies={policies} onClose={() => setEditing(null)} onSaved={async () => { setEditing(null); await load(); notify("ok", "主机已保存"); }} />}
+    <div className="panel table-panel host-table-panel">
+      {hosts.length > 0 && <div className="host-list-toolbar"><div><strong>{multiSelectMode ? selectedHostIds.size > 0 ? `已选择 ${selectedHostIds.size} 台主机` : "请选择主机" : `${groups.length} 个分组`}</strong><small>{multiSelectMode ? "复制内容为显示名称和主机地址，每行一台" : "点击分组名称可展开或折叠"}</small></div><div>{multiSelectMode ? <><button onClick={() => selectHosts(hosts.map((host) => host.id), !allSelected)}>{allSelected ? "取消全选" : "全选主机"}</button><button className="primary" disabled={selectedHostIds.size === 0} onClick={() => void copySelectedHostNames()}>复制名称和地址</button><button onClick={leaveMultiSelectMode}>完成</button></> : <button onClick={() => setMultiSelectMode(true)}>多选</button>}</div></div>}
+      <table><thead><tr>{multiSelectMode && <th className="host-select-cell"><SelectionCheckbox label="选择全部主机" checked={allSelected} indeterminate={someSelected} disabled={hosts.length === 0} onChange={(selected) => selectHosts(hosts.map((host) => host.id), selected)} /></th>}<th>主机</th><th>状态</th><th>AI 权限</th><th>策略</th><th /></tr></thead>
+      <tbody>{groups.map((group) => {
+        const groupIds = group.hosts.map((host) => host.id);
+        const selectedInGroup = groupIds.filter((id) => selectedHostIds.has(id)).length;
+        const groupSelected = selectedInGroup === group.hosts.length;
+        const collapsed = collapsedGroups.has(group.key);
+        return <GroupRows key={group.key} groupName={group.name} hosts={group.hosts} collapsed={collapsed} selectionMode={multiSelectMode} selectedIds={selectedHostIds} groupSelected={groupSelected} groupIndeterminate={selectedInGroup > 0 && !groupSelected} policies={policies} testResults={testResults} testingHostId={testingHostId} updatingHostId={updatingHostId} onToggleGroup={() => toggleGroup(group.key)} onSelectGroup={(selected) => selectHosts(groupIds, selected)} onSelectHost={selectHost} onMonitor={setMonitorHostId} onTest={test} onToggleHost={toggleHost} onEdit={setEditing} onDelete={async (host) => { if (confirm(`删除 ${host.name}？`)) { await remove(`/v1/hosts/${host.id}`); await load(); } }} />;
+      })}</tbody></table>{hosts.length === 0 && <Empty text="还没有主机。添加主机时可以直接填写密码、私钥或 SSH Agent。" />}</div>
+    {editing && <HostDialog host={editing === "new" ? null : editing} credentials={credentials} policies={policies} groupNames={existingGroupNames} onClose={() => setEditing(null)} onSaved={async () => { setEditing(null); await load(); notify("ok", "主机已保存"); }} />}
   </section>;
+}
+
+function GroupRows({ groupName, hosts, collapsed, selectionMode, selectedIds, groupSelected, groupIndeterminate, policies, testResults, testingHostId, updatingHostId, onToggleGroup, onSelectGroup, onSelectHost, onMonitor, onTest, onToggleHost, onEdit, onDelete }: { groupName: string; hosts: Host[]; collapsed: boolean; selectionMode: boolean; selectedIds: ReadonlySet<string>; groupSelected: boolean; groupIndeterminate: boolean; policies: Policy[]; testResults: Record<string, { kind: "ok" | "error" | "pending"; text: string }>; testingHostId: string | null; updatingHostId: string | null; onToggleGroup(): void; onSelectGroup(selected: boolean): void; onSelectHost(hostId: string, selected: boolean): void; onMonitor(hostId: string): void; onTest(host: Host): Promise<void>; onToggleHost(host: Host): Promise<void>; onEdit(host: Host): void; onDelete(host: Host): Promise<void> }) {
+  return <>
+    <tr className="host-group-row">{selectionMode && <td className="host-select-cell"><SelectionCheckbox label={`选择${groupName}中的全部主机`} checked={groupSelected} indeterminate={groupIndeterminate} onChange={onSelectGroup} /></td>}<td colSpan={5}><button className="host-group-toggle" aria-expanded={!collapsed} onClick={onToggleGroup}><i className={collapsed ? "collapsed" : ""} aria-hidden="true" /><strong>{groupName}</strong><span>{hosts.length} 台</span>{selectionMode && hosts.some((host) => selectedIds.has(host.id)) && <em>{hosts.filter((host) => selectedIds.has(host.id)).length} 台已选</em>}</button></td></tr>
+    {!collapsed && hosts.map((host) => <tr key={host.id} className={`host-member-row ${selectedIds.has(host.id) ? "host-row-selected" : ""}`}>
+      {selectionMode && <td className="host-select-cell"><SelectionCheckbox label={`选择主机 ${host.name}`} checked={selectedIds.has(host.id)} onChange={(selected) => onSelectHost(host.id, selected)} /></td>}
+      <td className="host-member-cell"><div className="host-name-text"><strong>{host.name}</strong><small>{host.username}@{host.hostname}:{host.port}</small></div></td>
+      <td><Status value={host.enabled ? host.status : "DISABLED"} />{testResults[host.id] && <small className={`test-result ${testResults[host.id]!.kind}`}>{testResults[host.id]!.text}</small>}</td><td><span className={host.enabled && host.aiAccessEnabled ? "badge allow" : "badge"}>{!host.enabled ? "主机停用" : host.aiAccessEnabled ? "已开放" : "未开放"}</span></td>
+      <td>{policies.find((policy) => policy.id === host.policyId)?.name ?? "未配置"}</td>
+      <td className="actions"><button onClick={() => onMonitor(host.id)}>指令记录</button><button disabled={!host.enabled || testingHostId !== null || updatingHostId !== null} onClick={() => void onTest(host)}>{testingHostId === host.id ? "测试中…" : "测试"}</button><button className={host.enabled ? "danger-link" : ""} disabled={testingHostId !== null || updatingHostId !== null} onClick={() => void onToggleHost(host)}>{updatingHostId === host.id ? "处理中…" : host.enabled ? "停用" : "启用"}</button><button disabled={testingHostId === host.id || updatingHostId === host.id} onClick={() => onEdit(host)}>编辑</button><button className="danger-link" disabled={testingHostId === host.id || updatingHostId === host.id} onClick={() => void onDelete(host)}>删除</button></td>
+    </tr>)}
+  </>;
+}
+
+function SelectionCheckbox({ label, checked, indeterminate = false, disabled = false, onChange }: { label: string; checked: boolean; indeterminate?: boolean; disabled?: boolean; onChange(selected: boolean): void }) {
+  const ref = useRef<HTMLInputElement>(null);
+  useEffect(() => { if (ref.current) ref.current.indeterminate = indeterminate; }, [indeterminate]);
+  return <input ref={ref} type="checkbox" aria-label={label} checked={checked} disabled={disabled} onChange={(event) => onChange(event.target.checked)} />;
 }
 
 function HostMonitorPage({ host, credential, onBack, onHostChanged, notify }: { host: Host; credential?: Credential; onBack(): void; onHostChanged(): Promise<void>; notify: Notify }) {
@@ -301,7 +368,7 @@ function statusText(status: string, value: Pick<AuditLog, "exitCode" | "duration
   return `${labels[status] ?? status}${details.length ? ` · ${details.join(" · ")}` : ""}`;
 }
 
-function HostDialog({ host, credentials, policies, onClose, onSaved }: { host: Host | null; credentials: Credential[]; policies: Policy[]; onClose(): void; onSaved(): Promise<void> }) {
+function HostDialog({ host, credentials, policies, groupNames, onClose, onSaved }: { host: Host | null; credentials: Credential[]; policies: Policy[]; groupNames: string[]; onClose(): void; onSaved(): Promise<void> }) {
   const currentCredential = host?.credentialId ? credentials.find((credential) => credential.id === host.credentialId) : undefined;
   const recommendedPolicyId = policies.find((policy) => policy.name === DEFAULT_POLICY_TEMPLATE.name)?.id ?? "";
   const [authMode, setAuthMode] = useState<"PASSWORD" | "PRIVATE_KEY" | "SSH_AGENT">(currentCredential?.type ?? "PASSWORD");
@@ -334,7 +401,7 @@ function HostDialog({ host, credentials, policies, onClose, onSaved }: { host: H
     finally { setBusy(false); }
   }
   return <Modal title={host ? "编辑主机" : "添加主机"} onClose={onClose}><form onSubmit={submit} className="form-grid">
-    <label>显示名称<input name="name" required defaultValue={host?.name} /></label><label>分组<input name="groupName" defaultValue={host?.groupName ?? ""} /></label>
+    <label>显示名称<input name="name" required defaultValue={host?.name} /></label><label>分组<input name="groupName" list="host-group-options" defaultValue={host?.groupName ?? ""} placeholder="选择已有分组或输入新分组" /><datalist id="host-group-options">{groupNames.map((groupName) => <option key={groupName} value={groupName} />)}</datalist></label>
     <label className="span-2">主机地址<input name="hostname" required defaultValue={host?.hostname} placeholder="server.example.com" /></label>
     <label>端口<input name="port" type="number" min="1" max="65535" required defaultValue={host?.port ?? 22} /></label><label>用户名<input name="username" required defaultValue={host?.username} /></label>
     <div className="span-2 auth-section">
@@ -591,7 +658,8 @@ interface CodexHomeCandidate {
 interface CodexDiagnostic { ok: boolean; toolNames: string[]; checks: Array<{ name: string; ok: boolean; detail: string }> }
 interface JsonAgentIntegrationState {
   agent: "cursor" | "claude-code"; installed: boolean; skillInstalled: boolean; mcpConfigured: boolean; restartRequired: boolean;
-  agentHome: string; skillPath: string; configPath: string; runtimeCommand: string; configSnippet: string; canInstall: boolean; configError: string | null;
+  configDirectory: string; agentHome: string; skillPath: string; configPath: string; runtimeCommand: string; configSnippet: string;
+  canInstall: boolean; configError: string | null; candidates: CodexHomeCandidate[];
 }
 interface AgentIntegrationsState { cursor: JsonAgentIntegrationState; claudeCode: JsonAgentIntegrationState }
 
@@ -626,11 +694,13 @@ function SettingsPage({ notify, vaultState, onVaultChanged }: { notify: Notify; 
   const [integrationBusy, setIntegrationBusy] = useState(false);
   const [showToken, setShowToken] = useState(false);
   const [manualCodexHome, setManualCodexHome] = useState("");
+  const [manualAgentDirectories, setManualAgentDirectories] = useState<Record<"cursor" | "claude-code", string>>({ cursor: "", "claude-code": "" });
   const [integrationChannel, setIntegrationChannel] = useState<IntegrationChannel>("codex");
   const load = useCallback(async () => {
     try {
       const [mcpState, codexState, agentStates] = await Promise.all([api<McpSettings>("/v1/mcp-settings"), api<CodexIntegrationState>("/v1/codex-integration"), api<AgentIntegrationsState>("/v1/agent-integrations")]);
       setSettings(mcpState); setCodex(codexState); setAgentIntegrations(agentStates); setManualCodexHome(codexState.codexHome);
+      setManualAgentDirectories({ cursor: agentStates.cursor.configDirectory, "claude-code": agentStates.claudeCode.configDirectory });
     }
     catch (error) { notify("error", message(error)); }
   }, [notify]);
@@ -735,6 +805,31 @@ function SettingsPage({ notify, vaultState, onVaultChanged }: { notify: Notify; 
     finally { setIntegrationBusy(false); }
   }
 
+  async function selectJsonAgentDirectory(agent: "cursor" | "claude-code", path: string) {
+    if (integrationBusy) return;
+    const name = agent === "cursor" ? "Cursor" : "Claude Code";
+    setIntegrationBusy(true);
+    try {
+      const next = await post<JsonAgentIntegrationState>(`/v1/agent-integrations/${agent}/select`, { path });
+      setAgentIntegrations(current => current ? { ...current, [agent === "cursor" ? "cursor" : "claudeCode"]: next } : current);
+      setManualAgentDirectories(current => ({ ...current, [agent]: next.configDirectory }));
+      notify("ok", `已选择 ${name} 配置目录：${next.configDirectory}`);
+    } catch (error) { notify("error", `${name} 配置目录不可用：${message(error)}`); }
+    finally { setIntegrationBusy(false); }
+  }
+
+  async function refreshJsonAgentDirectories() {
+    if (integrationBusy) return;
+    setIntegrationBusy(true);
+    try {
+      const next = await api<AgentIntegrationsState>("/v1/agent-integrations");
+      setAgentIntegrations(next);
+      setManualAgentDirectories({ cursor: next.cursor.configDirectory, "claude-code": next.claudeCode.configDirectory });
+      notify("ok", "常见配置目录已重新扫描");
+    } catch (error) { notify("error", `目录扫描失败：${message(error)}`); }
+    finally { setIntegrationBusy(false); }
+  }
+
   const integrationTabs: Array<{ id: IntegrationChannel; label: string; detail: string }> = [
     { id: "codex", label: "Codex", detail: "一键集成" },
     { id: "cursor", label: "Cursor", detail: "一键集成" },
@@ -747,7 +842,7 @@ function SettingsPage({ notify, vaultState, onVaultChanged }: { notify: Notify; 
   return <section><PageHeader eyebrow="Integrations" title="Agent 接入">
     <span className={`service-state ${(integrationChannel === "codex" ? codex?.installed : integrationChannel === "other" ? settings?.enabled : selectedAgentInstalled) ? "on" : "off"}`}><i />{integrationChannel === "codex" ? codex?.installed ? "Codex 已配置" : "Codex 未配置" : integrationChannel === "other" ? settings?.enabled ? "本地 MCP 已开启" : "本地 MCP 未开启" : selectedAgentInstalled ? "一键集成已安装" : "一键集成未安装"}</span>
   </PageHeader>
-    <article className="panel vault-setting"><div><span className="eyebrow">Credential storage</span><h2>凭据存储</h2><p>macOS 和 Windows 统一使用主密码保护的本地 AES-256-GCM 加密文件，派生密钥只保存在内存中。</p></div><div className="vault-setting-actions"><span className="badge allow">本地加密保险库</span><button disabled={busy || !vaultState?.unlocked} onClick={() => void lockVault()}>立即锁定</button></div></article>
+    <article className="panel vault-setting"><div><span className="eyebrow">Credential storage</span><h2>凭据存储</h2><p>凭据统一存储在受主密码保护的本地 AES-256-GCM 加密文件中，派生密钥仅保留在内存中。</p></div><div className="vault-setting-actions"><span className="badge allow">本地加密保险库</span><button disabled={busy || !vaultState?.unlocked} onClick={() => void lockVault()}>立即锁定</button></div></article>
     <div className="integration-tabs" role="tablist" aria-label="Agent 接入方式">{integrationTabs.map((tab) => <button key={tab.id} type="button" role="tab" aria-selected={integrationChannel === tab.id} aria-controls={`integration-panel-${tab.id}`} id={`integration-tab-${tab.id}`} className={integrationChannel === tab.id ? "selected" : ""} onClick={() => setIntegrationChannel(tab.id)}><strong>{tab.label}</strong><span>{tab.detail}</span></button>)}</div>
     {integrationChannel === "codex" && <article className="panel codex-integration" id="integration-panel-codex" role="tabpanel" aria-labelledby="integration-tab-codex">
       <div className="codex-integration-head"><div><span className="eyebrow">Recommended · stdio</span><h2>Codex 一键集成</h2><p>安装 Hoplane Skill，并把使用当前 App 内置运行时的 stdio MCP 写入 Codex 配置。不依赖系统 Node、源码目录或 HTTP 传输。</p></div><span className={`badge integration-status-badge ${codex?.installed ? "allow" : ""}`}>{codex?.installed ? "已安装" : "未安装"}</span></div>
@@ -768,7 +863,11 @@ function SettingsPage({ notify, vaultState, onVaultChanged }: { notify: Notify; 
       channel={integrationChannel}
       integration={integrationChannel === "cursor" ? agentIntegrations?.cursor ?? null : agentIntegrations?.claudeCode ?? null}
       busy={integrationBusy}
+      manualDirectory={manualAgentDirectories[integrationChannel]}
       onInstall={() => void installJsonAgent(integrationChannel)}
+      onRefresh={() => void refreshJsonAgentDirectories()}
+      onSelect={(path) => void selectJsonAgentDirectory(integrationChannel, path)}
+      onManualDirectoryChange={(path) => setManualAgentDirectories(current => ({ ...current, [integrationChannel]: path }))}
       onCopy={(value, label) => void copy(value, label)}
     />}
     {integrationChannel === "other" && <><div className="mcp-hero panel" id="integration-panel-other" role="tabpanel" aria-labelledby="integration-tab-other">
@@ -783,17 +882,28 @@ function SettingsPage({ notify, vaultState, onVaultChanged }: { notify: Notify; 
   </section>;
 }
 
-function AgentOneClickIntegration({ channel, integration, busy, onInstall, onCopy }: {
+function AgentOneClickIntegration({ channel, integration, busy, manualDirectory, onInstall, onRefresh, onSelect, onManualDirectoryChange, onCopy }: {
   channel: "cursor" | "claude-code";
   integration: JsonAgentIntegrationState | null;
   busy: boolean;
+  manualDirectory: string;
   onInstall(): void;
+  onRefresh(): void;
+  onSelect(path: string): void;
+  onManualDirectoryChange(path: string): void;
   onCopy(value: string, label: string): void;
 }) {
   const isCursor = channel === "cursor";
   const name = isCursor ? "Cursor" : "Claude Code";
   return <article className="panel codex-integration agent-native-integration" id={`integration-panel-${channel}`} role="tabpanel" aria-labelledby={`integration-tab-${channel}`}>
     <div className="codex-integration-head"><div><span className="eyebrow">Recommended · stdio</span><h2>{name} 一键集成</h2><p>自动安装 Hoplane Skill，并把 App 内置 stdio MCP 写入 {name} 的用户级配置。不依赖系统 Node、本地 HTTP 服务或访问 Token。</p></div><span className={`badge integration-status-badge ${integration?.installed ? "allow" : ""}`}>{integration?.installed ? "已安装" : "未安装"}</span></div>
+    <div className="codex-home-discovery">
+      <div className="codex-home-head"><div><strong>{name} 配置目录</strong><span>仅检查有限的常见位置，不递归扫描用户目录。请选择要写入 Skill 和 MCP 配置的位置。</span></div><button disabled={busy} onClick={onRefresh}>重新扫描</button></div>
+      <div className="codex-home-list">{integration?.candidates.map((candidate) => <button type="button" key={candidate.path} className={candidate.selected ? "selected" : ""} disabled={busy || candidate.configStatus === "INVALID" || !candidate.writable} onClick={() => onSelect(candidate.path)}>
+        <span className="codex-home-radio"><i /></span><span className="codex-home-info"><strong>{candidate.label}</strong><code>{candidate.path}</code><small>{candidate.configDetail}</small></span><span className="codex-home-badges"><em className={`config-${candidate.configStatus.toLowerCase()}`}>{candidate.configStatus === "VALID" ? "配置有效" : candidate.configStatus === "MISSING" ? "将新建配置" : "配置异常"}</em><em className={candidate.writable ? "writable" : "blocked"}>{candidate.writable ? "可写" : "不可写"}</em></span>
+      </button>)}</div>
+      <form className="codex-home-manual" onSubmit={(event) => { event.preventDefault(); onSelect(manualDirectory); }}><label>手动选择目录<input value={manualDirectory} onChange={(event) => onManualDirectoryChange(event.target.value)} required maxLength={4096} placeholder={isCursor ? "/Users/name/.cursor" : "/Users/name"} /></label><button type="submit" disabled={busy || !manualDirectory.trim()}>使用此目录</button></form>
+    </div>
     <div className="agent-install-summary"><div><span>Skill 安装位置</span><code>{integration?.skillPath ?? "正在检测…"}</code></div><div><span>MCP 配置文件</span><code>{integration?.configPath ?? "正在检测…"}</code></div></div>
     {integration?.configError && <div className="form-error" role="alert">配置文件暂不可自动修改：{integration.configError}</div>}
     <pre>{integration?.configSnippet ?? "正在生成 stdio MCP 配置…"}</pre>

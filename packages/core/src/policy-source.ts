@@ -1,11 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import chokidar, { type FSWatcher } from "chokidar";
 import { parseDocument, stringify } from "yaml";
 import { AppError, policySourceSchema, type Policy, type PolicyDocument } from "../../shared/src/index.js";
 import type { CoreConfig } from "./config.js";
-import type { HoplaneDatabase } from "./database.js";
+import { POLICY_TEMPLATE_CONSOLIDATION_CLEANUP_SETTING, type HoplaneDatabase } from "./database.js";
 
 export interface PolicySourceView {
   id: string;
@@ -26,6 +26,7 @@ export class PolicySourceService {
   async initialize(): Promise<void> {
     await mkdir(this.config.policyDir, { recursive: true, mode: 0o700 });
     await chmod(this.config.policyDir, 0o700).catch(() => undefined);
+    await this.removeConsolidatedTemplateSources();
     for (const policy of this.database.listPolicies()) {
       if (!policy.sourcePath) await this.persistExisting(policy);
     }
@@ -154,6 +155,26 @@ export class PolicySourceService {
     const yaml = serializePolicy(policy);
     await this.atomicWrite(path, yaml);
     this.database.updatePolicySourceState(policy.id, { sourcePath: path, sourceStatus: "SYNCED", sourceError: null, sourceHash: hash(yaml), enabled: true });
+  }
+
+  private async removeConsolidatedTemplateSources(): Promise<void> {
+    const pending = this.database.getSetting<string[]>(POLICY_TEMPLATE_CONSOLIDATION_CLEANUP_SETTING, []);
+    if (pending.length === 0) return;
+    const policyRoot = resolve(this.config.policyDir);
+    const failed: string[] = [];
+    for (const sourcePath of pending) {
+      const resolved = resolve(sourcePath);
+      const pathFromRoot = relative(policyRoot, resolved);
+      const insidePolicyDirectory = pathFromRoot !== "" && pathFromRoot !== ".." && !pathFromRoot.startsWith(`..${sep}`) && !isAbsolute(pathFromRoot);
+      if (!insidePolicyDirectory) continue;
+      try {
+        await unlink(resolved);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") failed.push(sourcePath);
+      }
+    }
+    this.database.setSetting(POLICY_TEMPLATE_CONSOLIDATION_CLEANUP_SETTING, failed);
+    if (failed.length > 0) throw new AppError("POLICY_TEMPLATE_CLEANUP_FAILED", `无法删除 ${failed.length} 个旧内置策略文件`);
   }
 
   private async atomicWrite(path: string, content: string): Promise<void> {

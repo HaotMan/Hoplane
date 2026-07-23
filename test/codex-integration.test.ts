@@ -128,6 +128,67 @@ describe("Codex integration", () => {
     expect((await new JsonAgentIntegrationService("claude-code", options).getState()).installed).toBe(true);
   });
 
+  it("scans bounded Cursor and Claude Code config directories and supports manual selection", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hoplane-agent-discovery-")); dirs.push(root);
+    const cursorValid = join(root, ".cursor");
+    const cursorInvalid = join(root, "cursor-invalid");
+    const cursorMissing = join(root, "cursor-new");
+    const cursorNested = join(root, "projects", "deep", ".cursor");
+    await mkdir(cursorValid, { recursive: true });
+    await mkdir(cursorInvalid, { recursive: true });
+    await mkdir(cursorNested, { recursive: true });
+    await writeFile(join(cursorValid, "mcp.json"), JSON.stringify({ mcpServers: {} }), "utf8");
+    await writeFile(join(cursorInvalid, "mcp.json"), "{broken", "utf8");
+    await writeFile(join(cursorNested, "mcp.json"), JSON.stringify({ nested: true }), "utf8");
+    const cursorService = new JsonAgentIntegrationService("cursor", {
+      userHome: root,
+      environment: {},
+      candidateDirectories: [
+        { path: cursorValid, label: "valid", source: "DEFAULT" },
+        { path: cursorInvalid, label: "invalid" },
+        { path: cursorMissing, label: "missing" }
+      ],
+      runtime
+    });
+    const cursor = await cursorService.getState();
+    expect(cursor.configDirectory).toBe(cursorValid);
+    expect(cursor.candidates).toHaveLength(3);
+    expect(cursor.candidates.find((candidate) => candidate.path === cursorInvalid)?.configStatus).toBe("INVALID");
+    expect(cursor.candidates.some((candidate) => candidate.path === cursorNested)).toBe(false);
+    expect(await cursorService.selectConfigDirectory(cursorMissing)).toMatchObject({
+      configDirectory: cursorMissing,
+      configPath: join(cursorMissing, "mcp.json"),
+      skillPath: join(cursorMissing, "skills", "hoplane"),
+      canInstall: true
+    });
+    await expect(cursorService.selectConfigDirectory(cursorInvalid)).rejects.toThrow(/JSON/u);
+    await expect(cursorService.selectConfigDirectory("relative/cursor")).rejects.toThrow(/绝对路径/u);
+
+    const claudeValidRoot = join(root, "claude-user");
+    const claudeMissingRoot = join(root, "claude-new-user");
+    await mkdir(claudeValidRoot, { recursive: true });
+    await writeFile(join(claudeValidRoot, ".claude.json"), JSON.stringify({ mcpServers: {} }), "utf8");
+    const claudeService = new JsonAgentIntegrationService("claude-code", {
+      userHome: root,
+      environment: {},
+      candidateDirectories: [
+        { path: claudeValidRoot, label: "valid", source: "DEFAULT" },
+        { path: claudeMissingRoot, label: "missing" }
+      ],
+      runtime
+    });
+    expect(await claudeService.getState()).toMatchObject({
+      configDirectory: claudeValidRoot,
+      agentHome: join(claudeValidRoot, ".claude"),
+      configPath: join(claudeValidRoot, ".claude.json")
+    });
+    expect(await claudeService.selectConfigDirectory(claudeMissingRoot)).toMatchObject({
+      configDirectory: claudeMissingRoot,
+      skillPath: join(claudeMissingRoot, ".claude", "skills", "hoplane"),
+      canInstall: true
+    });
+  });
+
   it("refuses to overwrite malformed agent JSON config", async () => {
     const root = await mkdtemp(join(tmpdir(), "hoplane-agent-invalid-")); dirs.push(root);
     await mkdir(join(root, ".cursor"), { recursive: true });

@@ -60,8 +60,10 @@ const operations = new OperationService(database, new PolicyService(), ssh, moni
 const mcpService = new McpServiceManager(config, database, vault, operations);
 const savedCodexHome = database.getSetting<string | null>("codex.home", null);
 const codexIntegration = new CodexIntegrationService(savedCodexHome ? { codexHome: savedCodexHome } : {});
-const cursorIntegration = new JsonAgentIntegrationService("cursor");
-const claudeCodeIntegration = new JsonAgentIntegrationService("claude-code");
+const savedCursorDirectory = database.getSetting<string | null>("integration.cursor.directory", null);
+const savedClaudeCodeDirectory = database.getSetting<string | null>("integration.claude-code.directory", null);
+const cursorIntegration = new JsonAgentIntegrationService("cursor", savedCursorDirectory ? { configDirectory: savedCursorDirectory } : {});
+const claudeCodeIntegration = new JsonAgentIntegrationService("claude-code", savedClaudeCodeDirectory ? { configDirectory: savedClaudeCodeDirectory } : {});
 const staticRoot = options.staticRoot ?? join(process.cwd(), "apps", "desktop", "dist");
 
 const server = createServer(async (request, response) => {
@@ -239,6 +241,13 @@ async function routeApi(request: IncomingMessage, response: ServerResponse, url:
   if (method === "GET" && url.pathname === "/v1/agent-integrations") {
     const [cursor, claudeCode] = await Promise.all([cursorIntegration.getState(), claudeCodeIntegration.getState()]);
     return json(response, 200, { cursor, claudeCode });
+  }
+  if (method === "POST" && url.pathname.startsWith("/v1/agent-integrations/") && url.pathname.endsWith("/select")) {
+    const agent = z.enum(["cursor", "claude-code"]).parse(url.pathname.split("/")[3]);
+    const input = z.object({ path: z.string().trim().min(1).max(4096) }).parse(await body(request));
+    const state = await (agent === "cursor" ? cursorIntegration : claudeCodeIntegration).selectConfigDirectory(input.path);
+    database.setSetting(`integration.${agent}.directory`, state.configDirectory);
+    return json(response, 200, state);
   }
   if (method === "POST" && url.pathname.startsWith("/v1/agent-integrations/") && url.pathname.endsWith("/install")) {
     const agent = z.enum(["cursor", "claude-code"]).parse(url.pathname.split("/")[3]);

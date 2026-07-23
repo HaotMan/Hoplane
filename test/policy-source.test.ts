@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { parse, stringify } from "yaml";
-import { HoplaneDatabase } from "../packages/core/src/database.js";
+import { HoplaneDatabase, POLICY_TEMPLATE_CONSOLIDATION_CLEANUP_SETTING } from "../packages/core/src/database.js";
 import { PolicySourceService } from "../packages/core/src/policy-source.js";
+import { POLICY_TEMPLATES } from "../packages/shared/src/index.js";
 import type { CoreConfig } from "../packages/core/src/config.js";
 
 const dirs: string[] = [];
@@ -15,6 +16,23 @@ function config(dir: string): CoreConfig {
 }
 
 describe("PolicySourceService", () => {
+  it("deletes superseded built-in template YAML before scanning", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hoplane-policy-cleanup-")); dirs.push(dir);
+    const policyDir = join(dir, "policies");
+    const legacyPath = join(policyDir, "docker-readonly.yaml");
+    await mkdir(policyDir, { recursive: true });
+    await writeFile(legacyPath, "legacy built-in policy");
+    const database = new HoplaneDatabase(join(dir, "hoplane.sqlite3"));
+    database.setSetting(POLICY_TEMPLATE_CONSOLIDATION_CLEANUP_SETTING, [legacyPath]);
+    const service = new PolicySourceService(config(dir), database, { watch: false });
+    try {
+      await service.initialize();
+      await expect(readFile(legacyPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+      expect(database.getSetting(POLICY_TEMPLATE_CONSOLIDATION_CLEANUP_SETTING, [legacyPath])).toEqual([]);
+      expect(database.listPolicies()).toHaveLength(POLICY_TEMPLATES.length);
+    } finally { await service.close(); database.close(); }
+  });
+
   it("persists templates, syncs external YAML, rejects invalid edits, and restores deletion", async () => {
     const dir = await mkdtemp(join(tmpdir(), "hoplane-policy-source-")); dirs.push(dir);
     const database = new HoplaneDatabase(join(dir, "hoplane.sqlite3"));
