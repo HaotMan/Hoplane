@@ -15,7 +15,7 @@ export function createHoplaneMcpServer(backend: HoplaneMcpBackend): McpServer {
 
   server.registerTool("list_hosts", {
     title: "List SSH hosts",
-    description: "List SSH hosts explicitly enabled for AI access. Credentials are never returned.",
+    description: "List SSH hosts explicitly enabled for AI access. Credentials are never returned. Each host includes a `sudo` field: when `sudo.available` is true you can run privileged commands with a leading `sudo` (Hoplane handles authentication automatically).",
     inputSchema: {}
   }, async () => toolCall(() => backend.listHosts()));
 
@@ -27,7 +27,7 @@ export function createHoplaneMcpServer(backend: HoplaneMcpBackend): McpServer {
 
   server.registerTool("execute_command", {
     title: "Execute remote command",
-    description: "Execute a policy-approved, non-interactive command on a specific SSH host.",
+    description: "Execute a policy-approved, non-interactive command on a specific SSH host. sudo IS supported when the host's `sudo.available` (from list_hosts) is true: just use `sudo` anywhere in the command, including several chained invocations (e.g. `sudo apt-get update && sudo apt-get install -y nginx`) — Hoplane authenticates every sudo invocation automatically, so never ask the user for a password, never embed one in the command, and never use workarounds like `su` or permission changes. If `sudo.available` is false, sudo commands are rejected; ask the user to enable sudo in the Hoplane app instead.",
     inputSchema: {
       host_id: z.string().uuid(), command: z.string().min(1).max(32_768), directory: z.string().max(4096).optional(),
       timeout_ms: z.number().int().min(100).max(300_000).default(30_000)

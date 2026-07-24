@@ -17,6 +17,12 @@ Use Hoplane's MCP tools for every remote operation so credentials remain hidden 
 6. Use `execute_command`, `upload_file`, or `download_file` as requested. Preserve the user's command and paths; do not broaden an operation after a policy denial.
 7. Return stdout, stderr, exit code, duration, or transfer size concisely. Explain policy denials using the returned reason code.
 
+## Privileged commands (sudo)
+
+- `list_hosts` reports a `sudo` field per host. When `sudo.available` is true, run privileged commands with `sudo` as usual — anywhere in the command, including chains such as `sudo apt-get update && sudo apt-get install -y nginx` or `cd /opt && sudo make install`. Hoplane authenticates every sudo invocation automatically and non-interactively — no password prompt will appear and you must never ask the user for one.
+- Do not avoid sudo with workarounds such as `su`, `pkexec`, copying files to writable paths, or loosening permissions. If sudo is what the task needs, use sudo.
+- When `sudo.available` is false, sudo commands are rejected with `SUDO_DISABLED`. Report this to the user and ask them to enable sudo for the active login on the host page of the Hoplane app; do not attempt to bypass it.
+
 ## Guardrails
 
 - Never request, read, print, or copy SSH passwords, private keys, passphrases, Core tokens, or vault contents.

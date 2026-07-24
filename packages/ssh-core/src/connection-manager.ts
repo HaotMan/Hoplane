@@ -52,7 +52,7 @@ export class SSHConnectionManager {
     onStderr?: (chunk: Buffer) => void;
   }): Promise<Omit<CommandResult, "operationId" | "durationMs">> {
     const client = await this.getConnection(hostId);
-    const sudoPassword = /^\s*sudo(?=\s|$)/u.test(command) ? await this.resolveSudoPassword(hostId) : null;
+    const sudoPassword = findSudoInvocations(command).length > 0 ? await this.resolveSudoPassword(hostId) : null;
     const sudoExecution = prepareSudoExecution(command, sudoPassword !== null);
     const fullCommand = options.directory ? `cd -- ${shellQuote(options.directory)} && ${sudoExecution.command}` : sudoExecution.command;
     return new Promise((resolve, reject) => {
@@ -86,8 +86,9 @@ export class SSHConnectionManager {
           stdoutTruncated ||= result.truncated;
         });
         stream.stderr.on("data", (chunk: Buffer) => {
-          const filtered = sudoPrompt?.push(chunk) ?? { visible: chunk, prompted: false };
-          if (filtered.prompted && sudoPassword !== null) stream.end(`${sudoPassword}\n`);
+          const filtered = sudoPrompt?.push(chunk) ?? { visible: chunk, prompted: 0 };
+          // stdin stays open so every sudo in a chained command can be answered.
+          if (filtered.prompted > 0 && sudoPassword !== null) stream.write(`${sudoPassword}\n`.repeat(filtered.prompted));
           appendStderr(filtered.visible);
         });
         const appendStderr = (chunk: Buffer) => {
@@ -353,35 +354,82 @@ export interface PreparedSudoExecution {
   promptMarker?: string;
 }
 
-/** Adds non-interactive sudo authentication without ever placing a password in the command. */
-export function prepareSudoExecution(command: string, hasManagedPassword: boolean, marker = `HOPLANE_SUDO_${randomUUID()}_`): PreparedSudoExecution {
-  if (!/^\s*sudo(?=\s|$)/u.test(command)) return { command };
-  if (!hasManagedPassword) return { command: command.replace(/^\s*sudo(?=\s|$)/u, "sudo -n") };
-  return {
-    command: command.replace(/^\s*sudo(?=\s|$)/u, `sudo -S -p ${shellQuote(marker)}`),
-    promptMarker: marker
-  };
+const COMMAND_SEPARATORS = new Set([";", "&", "|", "(", "{", "`", "\n"]);
+
+/**
+ * Finds the offset of every `sudo` that starts a shell command: at the beginning
+ * of the string or right after a separator (`;`, `&&`, `||`, `|`, `(`, `` ` ``,
+ * `{`, newline). Text inside single/double quotes is skipped, so e.g.
+ * `echo "a && sudo b"` is not treated as a sudo invocation. sudo credentials do
+ * not carry across invocations on a non-interactive SSH channel (no TTY means no
+ * usable timestamp cache), so every invocation needs its own authentication.
+ */
+export function findSudoInvocations(command: string): number[] {
+  const offsets: number[] = [];
+  let atCommandStart = true;
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index]!;
+    if (char === "\\") { index += 1; atCommandStart = false; continue; }
+    if (char === "'") {
+      const end = command.indexOf("'", index + 1);
+      index = end < 0 ? command.length : end;
+      atCommandStart = false;
+      continue;
+    }
+    if (char === '"') {
+      index += 1;
+      while (index < command.length && command[index] !== '"') { if (command[index] === "\\") index += 1; index += 1; }
+      atCommandStart = false;
+      continue;
+    }
+    if (COMMAND_SEPARATORS.has(char)) { atCommandStart = true; continue; }
+    if (/\s/u.test(char)) continue;
+    if (atCommandStart && command.startsWith("sudo", index) && (index + 4 === command.length || /\s/u.test(command[index + 4]!))) {
+      offsets.push(index);
+      index += 3;
+    }
+    atCommandStart = false;
+  }
+  return offsets;
 }
 
-/** Holds only a short stderr suffix so a sudo prompt split across SSH packets can be removed. */
+/** Adds non-interactive sudo authentication without ever placing a password in the command. */
+export function prepareSudoExecution(command: string, hasManagedPassword: boolean, marker = `HOPLANE_SUDO_${randomUUID()}_`): PreparedSudoExecution {
+  const invocations = findSudoInvocations(command);
+  if (invocations.length === 0) return { command };
+  const replacement = hasManagedPassword ? `sudo -S -p ${shellQuote(marker)}` : "sudo -n";
+  let rewritten = "";
+  let cursor = 0;
+  for (const offset of invocations) {
+    rewritten += command.slice(cursor, offset) + replacement;
+    cursor = offset + "sudo".length;
+  }
+  rewritten += command.slice(cursor);
+  return hasManagedPassword ? { command: rewritten, promptMarker: marker } : { command: rewritten };
+}
+
+/**
+ * Holds only a short stderr suffix so a sudo prompt split across SSH packets can
+ * be removed. Every prompt occurrence is reported: a chained command may invoke
+ * sudo several times and each invocation needs its own password answer.
+ */
 export class SudoPromptFilter {
   private readonly marker: Buffer;
   private pending = Buffer.alloc(0);
-  private answered = false;
 
   constructor(marker: string) { this.marker = Buffer.from(marker, "utf8"); }
 
-  push(chunk: Buffer): { visible: Buffer; prompted: boolean } {
+  push(chunk: Buffer): { visible: Buffer; prompted: number } {
     let combined = Buffer.concat([this.pending, chunk]);
     this.pending = Buffer.alloc(0);
-    let prompted = false;
+    let prompted = 0;
     const visible: Buffer[] = [];
     while (true) {
       const index = combined.indexOf(this.marker);
       if (index < 0) break;
       visible.push(combined.subarray(0, index));
       combined = combined.subarray(index + this.marker.length);
-      if (!this.answered) { this.answered = true; prompted = true; }
+      prompted += 1;
     }
     const retained = Math.min(Math.max(0, this.marker.length - 1), combined.length);
     const visibleLength = combined.length - retained;

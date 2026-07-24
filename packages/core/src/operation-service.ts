@@ -4,7 +4,7 @@ import type { CommandRequest, CommandResult, Host, Policy, TransferRequest, Tran
 import { AppError, asAppError } from "../../shared/src/index.js";
 import type { HoplaneDatabase } from "./database.js";
 import { PolicyService } from "../../policy/src/index.js";
-import { SSHConnectionManager } from "../../ssh-core/src/connection-manager.js";
+import { findSudoInvocations, SSHConnectionManager } from "../../ssh-core/src/connection-manager.js";
 import { redact } from "../../audit/src/redact.js";
 import { HostMonitor } from "./host-monitor.js";
 
@@ -16,12 +16,26 @@ export class OperationService {
     private readonly monitor: HostMonitor
   ) {}
 
-  listHosts(aiOnly: boolean): Array<Host & { capabilities: string[] }> {
-    return this.database.listHosts(aiOnly).map((host) => ({
-      ...host,
-      status: this.ssh.getStatus(host.id),
-      capabilities: capabilities(this.database.getPolicy(host.policyId ?? ""))
-    }));
+  listHosts(aiOnly: boolean): Array<Host & { capabilities: string[]; sudo: { available: boolean; hint: string } }> {
+    return this.database.listHosts(aiOnly).map((host) => {
+      const activeLogin = this.database.getActiveHostLogin(host.id);
+      const sudoAvailable = host.username === "root" || Boolean(activeLogin?.sudoEnabled);
+      const caps = capabilities(this.database.getPolicy(host.policyId ?? ""));
+      if (caps.length > 0 && sudoAvailable) caps.push("sudo");
+      return {
+        ...host,
+        status: this.ssh.getStatus(host.id),
+        capabilities: caps,
+        sudo: {
+          available: sudoAvailable,
+          hint: host.username === "root"
+            ? "Logged in as root: run privileged commands directly, no sudo needed."
+            : sudoAvailable
+              ? `sudo is ENABLED for login "${host.username}": prefix privileged commands with "sudo". Hoplane authenticates sudo automatically and non-interactively; never ask for or embed a password.`
+              : `sudo is DISABLED for login "${host.username}": sudo commands will be rejected. Do not work around this; ask the user to enable sudo for this login in the Hoplane app if privileges are required.`
+        }
+      };
+    });
   }
 
   async testHost(hostId: string, clientType: "MCP" | "CLI" | "UI", clientId?: string): Promise<{ operationId: string; status: "OK"; durationMs: number }> {
@@ -54,7 +68,7 @@ export class OperationService {
     try {
       const { policy } = this.requireOperationalContext(host, request.clientType, operationId);
       const activeLogin = this.database.getActiveHostLogin(request.hostId);
-      if (/^\s*sudo(?=\s|$)/u.test(request.command) && host!.username !== "root" && activeLogin && !activeLogin.sudoEnabled) {
+      if (findSudoInvocations(request.command).length > 0 && host!.username !== "root" && activeLogin && !activeLogin.sudoEnabled) {
         this.updateAudit(operationId, request.hostId, {
           policyId: policy.id, policyVersion: policy.version, policyDecision: "DENY",
           decisionReasonCode: "SUDO_DISABLED_FOR_LOGIN", status: "DENIED"
