@@ -1,4 +1,5 @@
 export type CredentialType = "PASSWORD" | "PRIVATE_KEY" | "SSH_AGENT";
+export type SudoAuthMode = "NONE" | "LOGIN_PASSWORD" | "CUSTOM_PASSWORD";
 export type HostStatus =
   | "DISCONNECTED"
   | "CONNECTING"
@@ -42,6 +43,7 @@ export interface Host {
   port: number;
   username: string;
   credentialId: string | null;
+  activeLoginId: string | null;
   policyId: string | null;
   groupName: string | null;
   tags: string[];
@@ -55,16 +57,30 @@ export interface Host {
   status?: HostStatus;
 }
 
+export interface HostLogin {
+  id: string;
+  hostId: string;
+  username: string;
+  credentialId: string | null;
+  sudoEnabled: boolean;
+  active: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface Credential {
   id: string;
   name: string;
   type: CredentialType;
   secretRef: string | null;
+  sudoMode: SudoAuthMode;
+  sudoSecretRef: string | null;
   metadata: {
     privateKeyPath?: string;
     agentSocket?: string;
   };
   hasSecret: boolean;
+  hasSudoSecret: boolean;
   createdAt: string;
   updatedAt: string;
 }

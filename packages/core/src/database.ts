@@ -1,6 +1,6 @@
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { randomUUID } from "node:crypto";
-import type { AuditLog, Credential, CredentialType, Host, OperationStatus, Policy, PolicyDecision, PolicyDocument, PolicySourceStatus } from "../../shared/src/index.js";
+import type { AuditLog, Credential, CredentialType, Host, HostLogin, OperationStatus, Policy, PolicyDecision, PolicyDocument, PolicySourceStatus, SudoAuthMode } from "../../shared/src/index.js";
 import { AppError, DEFAULT_POLICY_TEMPLATE, POLICY_TEMPLATES } from "../../shared/src/index.js";
 
 type Row = Record<string, unknown>;
@@ -17,6 +17,8 @@ const MIGRATIONS = [
     name TEXT NOT NULL,
     type TEXT NOT NULL CHECK(type IN ('PASSWORD', 'PRIVATE_KEY', 'SSH_AGENT')),
     secret_ref TEXT,
+    sudo_mode TEXT NOT NULL DEFAULT 'NONE',
+    sudo_secret_ref TEXT,
     metadata_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -119,12 +121,16 @@ const POLICY_V2_STRUCTURAL_MIGRATION = 4;
 const HOST_MONITOR_OUTPUT_MIGRATION = 5;
 const POLICY_BLACKLIST_MIGRATION = 6;
 const POLICY_TEMPLATE_CONSOLIDATION_MIGRATION = 7;
+const SUDO_AUTH_MIGRATION = 8;
+const HOST_LOGINS_MIGRATION = 9;
 export const POLICY_TEMPLATE_CONSOLIDATION_CLEANUP_SETTING = "policy.v3TemplateConsolidationCleanup";
 const LEGACY_READONLY_TEMPLATE_NAMES = new Set(["Docker 排障（只读）", "Kubernetes 排障（只读）"]);
 const LEGACY_OPERATIONS_TEMPLATE_NAMES = new Set(["Docker 运维（受限）", "Kubernetes 应用运维（受限）"]);
 
-type CreateHostInput = Omit<Host, "id" | "createdAt" | "updatedAt" | "configRevision" | "status" | "monitorOutputEnabled"> & {
+type CreateHostInput = Omit<Host, "id" | "createdAt" | "updatedAt" | "configRevision" | "status" | "monitorOutputEnabled" | "activeLoginId"> & {
   monitorOutputEnabled?: boolean;
+  activeLoginId?: string | null;
+  sudoEnabled?: boolean;
 };
 
 export class HoplaneDatabase {
@@ -197,6 +203,57 @@ export class HoplaneDatabase {
       this.db.prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)")
         .run(POLICY_BLACKLIST_MIGRATION, now());
       resetToV2 = true;
+    }
+    this.db.exec(`CREATE TABLE IF NOT EXISTS credentials (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL,
+      type TEXT NOT NULL CHECK(type IN ('PASSWORD', 'PRIVATE_KEY', 'SSH_AGENT')),
+      secret_ref TEXT, sudo_mode TEXT NOT NULL DEFAULT 'NONE', sudo_secret_ref TEXT,
+      metadata_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    )`);
+    const credentialColumns = new Set((this.db.prepare("PRAGMA table_info(credentials)").all() as Row[]).map((row) => String(row.name)));
+    if (!credentialColumns.has("sudo_mode") || !credentialColumns.has("sudo_secret_ref") || !applied.has(SUDO_AUTH_MIGRATION)) {
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        if (!credentialColumns.has("sudo_mode")) this.db.exec("ALTER TABLE credentials ADD COLUMN sudo_mode TEXT NOT NULL DEFAULT 'NONE'");
+        if (!credentialColumns.has("sudo_secret_ref")) this.db.exec("ALTER TABLE credentials ADD COLUMN sudo_secret_ref TEXT");
+        this.db.prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(SUDO_AUTH_MIGRATION, now());
+        this.db.exec("COMMIT");
+      } catch (error) {
+        this.db.exec("ROLLBACK");
+        throw error;
+      }
+    }
+    const hostColumnsAfterSudo = new Set((this.db.prepare("PRAGMA table_info(hosts)").all() as Row[]).map((row) => String(row.name)));
+    if (!hostColumnsAfterSudo.has("active_login_id") || !applied.has(HOST_LOGINS_MIGRATION)) {
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        if (!hostColumnsAfterSudo.has("active_login_id")) this.db.exec("ALTER TABLE hosts ADD COLUMN active_login_id TEXT");
+        this.db.exec(`CREATE TABLE IF NOT EXISTS host_logins (
+          id TEXT PRIMARY KEY,
+          host_id TEXT NOT NULL REFERENCES hosts(id) ON DELETE CASCADE,
+          username TEXT NOT NULL,
+          credential_id TEXT REFERENCES credentials(id) ON DELETE RESTRICT,
+          sudo_enabled INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(host_id, username)
+        );
+        CREATE INDEX IF NOT EXISTS idx_host_logins_host ON host_logins(host_id);`);
+        const hosts = this.db.prepare("SELECT id,username,credential_id,active_login_id FROM hosts").all() as Row[];
+        for (const host of hosts) {
+          if (host.active_login_id) continue;
+          const id = randomUUID();
+          const timestamp = now();
+          this.db.prepare("INSERT INTO host_logins(id,host_id,username,credential_id,sudo_enabled,created_at,updated_at) VALUES (?,?,?,?,1,?,?)")
+            .run(id, String(host.id), String(host.username), host.credential_id as SQLInputValue, timestamp, timestamp);
+          this.db.prepare("UPDATE hosts SET active_login_id=? WHERE id=?").run(id, String(host.id));
+        }
+        this.db.prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(HOST_LOGINS_MIGRATION, now());
+        this.db.exec("COMMIT");
+      } catch (error) {
+        this.db.exec("ROLLBACK");
+        throw error;
+      }
     }
     return resetToV2;
   }
@@ -296,11 +353,13 @@ export class HoplaneDatabase {
     const id = randomUUID();
     const timestamp = now();
     this.db.prepare(`INSERT INTO hosts
-      (id,name,hostname,port,username,credential_id,policy_id,group_name,tags_json,default_directory,enabled,ai_access_enabled,monitor_output_enabled,config_revision,created_at,updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)`).run(
+      (id,name,hostname,port,username,credential_id,active_login_id,policy_id,group_name,tags_json,default_directory,enabled,ai_access_enabled,monitor_output_enabled,config_revision,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,NULL,?,?,?,?,?,?,?,1,?,?)`).run(
       id, input.name, input.hostname, input.port, input.username, input.credentialId, input.policyId,
       input.groupName, JSON.stringify(input.tags), input.defaultDirectory, bool(input.enabled), bool(input.aiAccessEnabled), bool(input.monitorOutputEnabled ?? false), timestamp, timestamp
     );
+    const login = this.createHostLogin(id, input.username, input.credentialId, input.sudoEnabled ?? input.username === "root");
+    this.db.prepare("UPDATE hosts SET active_login_id=? WHERE id=?").run(login.id, id);
     return this.requireHost(id);
   }
 
@@ -308,10 +367,14 @@ export class HoplaneDatabase {
     const current = this.requireHost(id);
     const next = { ...current, ...patch, id: current.id };
     const connectionChanged = current.hostname !== next.hostname || current.port !== next.port || current.username !== next.username || current.credentialId !== next.credentialId;
-    this.db.prepare(`UPDATE hosts SET name=?,hostname=?,port=?,username=?,credential_id=?,policy_id=?,group_name=?,tags_json=?,default_directory=?,enabled=?,ai_access_enabled=?,monitor_output_enabled=?,config_revision=config_revision+?,updated_at=? WHERE id=?`).run(
-      next.name, next.hostname, next.port, next.username, next.credentialId, next.policyId, next.groupName,
+    this.db.prepare(`UPDATE hosts SET name=?,hostname=?,port=?,username=?,credential_id=?,active_login_id=?,policy_id=?,group_name=?,tags_json=?,default_directory=?,enabled=?,ai_access_enabled=?,monitor_output_enabled=?,config_revision=config_revision+?,updated_at=? WHERE id=?`).run(
+      next.name, next.hostname, next.port, next.username, next.credentialId, next.activeLoginId, next.policyId, next.groupName,
       JSON.stringify(next.tags), next.defaultDirectory, bool(next.enabled), bool(next.aiAccessEnabled), bool(next.monitorOutputEnabled), connectionChanged ? 1 : 0, now(), id
     );
+    if (current.activeLoginId && (current.username !== next.username || current.credentialId !== next.credentialId)) {
+      this.db.prepare("UPDATE host_logins SET username=?,credential_id=?,updated_at=? WHERE id=?")
+        .run(next.username, next.credentialId, now(), current.activeLoginId);
+    }
     return this.requireHost(id);
   }
 
@@ -326,6 +389,81 @@ export class HoplaneDatabase {
     return host;
   }
 
+  listHostLogins(hostId?: string): HostLogin[] {
+    const rows = hostId
+      ? this.db.prepare("SELECT l.*,h.active_login_id FROM host_logins l JOIN hosts h ON h.id=l.host_id WHERE l.host_id=? ORDER BY l.username").all(hostId)
+      : this.db.prepare("SELECT l.*,h.active_login_id FROM host_logins l JOIN hosts h ON h.id=l.host_id ORDER BY l.host_id,l.username").all();
+    return (rows as Row[]).map(mapHostLogin);
+  }
+
+  getHostLogin(id: string): HostLogin | null {
+    const row = this.db.prepare("SELECT l.*,h.active_login_id FROM host_logins l JOIN hosts h ON h.id=l.host_id WHERE l.id=?").get(id) as Row | undefined;
+    return row ? mapHostLogin(row) : null;
+  }
+
+  getActiveHostLogin(hostId: string): HostLogin | null {
+    const host = this.getHost(hostId);
+    return host?.activeLoginId ? this.getHostLogin(host.activeLoginId) : null;
+  }
+
+  createHostLogin(hostId: string, username: string, credentialId: string | null, sudoEnabled: boolean): HostLogin {
+    this.requireHost(hostId);
+    const id = randomUUID();
+    const timestamp = now();
+    try {
+      this.db.prepare("INSERT INTO host_logins(id,host_id,username,credential_id,sudo_enabled,created_at,updated_at) VALUES (?,?,?,?,?,?,?)")
+        .run(id, hostId, username, credentialId, bool(sudoEnabled), timestamp, timestamp);
+    } catch {
+      throw new AppError("HOST_LOGIN_EXISTS", "A login with this username already exists on the host", false, undefined, undefined, 409);
+    }
+    return this.getHostLogin(id)!;
+  }
+
+  updateHostLogin(id: string, patch: { username?: string; credentialId?: string | null; sudoEnabled?: boolean }): HostLogin {
+    const current = this.getHostLogin(id);
+    if (!current) throw new AppError("HOST_LOGIN_NOT_FOUND", "Host login not found", false, undefined, undefined, 404);
+    const next = { ...current, ...patch };
+    try {
+      this.db.prepare("UPDATE host_logins SET username=?,credential_id=?,sudo_enabled=?,updated_at=? WHERE id=?")
+        .run(next.username, next.credentialId, bool(next.sudoEnabled), now(), id);
+    } catch {
+      throw new AppError("HOST_LOGIN_EXISTS", "A login with this username already exists on the host", false, undefined, undefined, 409);
+    }
+    if (current.active) {
+      this.db.prepare("UPDATE hosts SET username=?,credential_id=?,config_revision=config_revision+1,updated_at=? WHERE id=?")
+        .run(next.username, next.credentialId, now(), current.hostId);
+    }
+    return this.getHostLogin(id)!;
+  }
+
+  activateHostLogin(hostId: string, loginId: string): Host {
+    const login = this.getHostLogin(loginId);
+    if (!login || login.hostId !== hostId) throw new AppError("HOST_LOGIN_NOT_FOUND", "Host login not found", false, undefined, undefined, 404);
+    this.db.prepare("UPDATE hosts SET active_login_id=?,username=?,credential_id=?,config_revision=config_revision+1,updated_at=? WHERE id=?")
+      .run(login.id, login.username, login.credentialId, now(), hostId);
+    return this.requireHost(hostId);
+  }
+
+  deleteHostLogin(hostId: string, loginId: string): HostLogin {
+    const login = this.getHostLogin(loginId);
+    if (!login || login.hostId !== hostId) throw new AppError("HOST_LOGIN_NOT_FOUND", "Host login not found", false, undefined, undefined, 404);
+    if (login.active) throw new AppError("HOST_LOGIN_ACTIVE", "Switch to another login before deleting the active login", false, undefined, undefined, 409);
+    const count = this.listHostLogins(hostId).length;
+    if (count <= 1) throw new AppError("HOST_LOGIN_REQUIRED", "A host must keep at least one login", false, undefined, undefined, 409);
+    this.db.prepare("DELETE FROM host_logins WHERE id=?").run(loginId);
+    return login;
+  }
+
+  renameHostGroup(oldName: string, newName: string): number {
+    const result = this.db.prepare("UPDATE hosts SET group_name=?,updated_at=? WHERE group_name=?").run(newName, now(), oldName);
+    if (result.changes === 0) throw new AppError("HOST_GROUP_NOT_FOUND", "Host group not found", false, undefined, undefined, 404);
+    return Number(result.changes);
+  }
+
+  hostOwnsCredential(hostId: string, credentialId: string): boolean {
+    return Boolean(this.db.prepare("SELECT 1 FROM host_logins WHERE host_id=? AND credential_id=?").get(hostId, credentialId));
+  }
+
   listCredentials(): Credential[] {
     return (this.db.prepare("SELECT * FROM credentials ORDER BY name").all() as Row[]).map(mapCredential);
   }
@@ -335,19 +473,19 @@ export class HoplaneDatabase {
     return row ? mapCredential(row) : null;
   }
 
-  createCredential(name: string, type: CredentialType, secretRef: string | null, metadata: Credential["metadata"]): Credential {
+  createCredential(name: string, type: CredentialType, secretRef: string | null, metadata: Credential["metadata"], sudoMode: SudoAuthMode = "NONE", sudoSecretRef: string | null = null): Credential {
     const id = randomUUID();
     const timestamp = now();
-    this.db.prepare("INSERT INTO credentials(id,name,type,secret_ref,metadata_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?)")
-      .run(id, name, type, secretRef, JSON.stringify(metadata), timestamp, timestamp);
+    this.db.prepare("INSERT INTO credentials(id,name,type,secret_ref,sudo_mode,sudo_secret_ref,metadata_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)")
+      .run(id, name, type, secretRef, sudoMode, sudoSecretRef, JSON.stringify(metadata), timestamp, timestamp);
     return this.getCredential(id)!;
   }
 
-  updateCredential(id: string, name: string, type: CredentialType, secretRef: string | null, metadata: Credential["metadata"]): Credential {
+  updateCredential(id: string, name: string, type: CredentialType, secretRef: string | null, metadata: Credential["metadata"], sudoMode?: SudoAuthMode, sudoSecretRef?: string | null): Credential {
     const current = this.getCredential(id);
     if (!current) throw new AppError("CREDENTIAL_NOT_FOUND", "Credential not found", false, undefined, undefined, 404);
-    const result = this.db.prepare("UPDATE credentials SET name=?,type=?,secret_ref=?,metadata_json=?,updated_at=? WHERE id=?")
-      .run(name, type, secretRef, JSON.stringify(metadata), now(), id);
+    const result = this.db.prepare("UPDATE credentials SET name=?,type=?,secret_ref=?,sudo_mode=?,sudo_secret_ref=?,metadata_json=?,updated_at=? WHERE id=?")
+      .run(name, type, secretRef, sudoMode ?? current.sudoMode, sudoSecretRef === undefined ? current.sudoSecretRef : sudoSecretRef, JSON.stringify(metadata), now(), id);
     if (result.changes === 0) throw new AppError("CREDENTIAL_NOT_FOUND", "Credential not found", false, undefined, undefined, 404);
     this.db.prepare("UPDATE hosts SET config_revision=config_revision+1,updated_at=? WHERE credential_id=?").run(now(), id);
     return this.getCredential(id)!;
@@ -365,7 +503,7 @@ export class HoplaneDatabase {
   }
 
   credentialUsageCount(id: string): number {
-    const row = this.db.prepare("SELECT COUNT(*) AS count FROM hosts WHERE credential_id = ?").get(id) as Row;
+    const row = this.db.prepare("SELECT COUNT(*) AS count FROM host_logins WHERE credential_id = ?").get(id) as Row;
     return Number(row.count);
   }
 
@@ -514,9 +652,18 @@ function bool(value: boolean): number { return value ? 1 : 0; }
 function mapHost(row: Row): Host {
   return {
     id: String(row.id), name: String(row.name), hostname: String(row.hostname), port: Number(row.port), username: String(row.username),
-    credentialId: nullable(row.credential_id), policyId: nullable(row.policy_id), groupName: nullable(row.group_name),
+    credentialId: nullable(row.credential_id), activeLoginId: nullable(row.active_login_id), policyId: nullable(row.policy_id), groupName: nullable(row.group_name),
     tags: JSON.parse(String(row.tags_json)) as string[], defaultDirectory: nullable(row.default_directory),
     enabled: Boolean(row.enabled), aiAccessEnabled: Boolean(row.ai_access_enabled), monitorOutputEnabled: Boolean(row.monitor_output_enabled), configRevision: Number(row.config_revision),
+    createdAt: String(row.created_at), updatedAt: String(row.updated_at)
+  };
+}
+
+function mapHostLogin(row: Row): HostLogin {
+  return {
+    id: String(row.id), hostId: String(row.host_id), username: String(row.username),
+    credentialId: nullable(row.credential_id), sudoEnabled: Boolean(row.sudo_enabled),
+    active: String(row.id) === String(row.active_login_id),
     createdAt: String(row.created_at), updatedAt: String(row.updated_at)
   };
 }
@@ -524,8 +671,9 @@ function mapHost(row: Row): Host {
 function mapCredential(row: Row): Credential {
   return {
     id: String(row.id), name: String(row.name), type: String(row.type) as CredentialType,
-    secretRef: nullable(row.secret_ref), metadata: JSON.parse(String(row.metadata_json)) as Credential["metadata"],
-    hasSecret: Boolean(row.secret_ref), createdAt: String(row.created_at), updatedAt: String(row.updated_at)
+    secretRef: nullable(row.secret_ref), sudoMode: String(row.sudo_mode ?? "NONE") as SudoAuthMode, sudoSecretRef: nullable(row.sudo_secret_ref),
+    metadata: JSON.parse(String(row.metadata_json)) as Credential["metadata"],
+    hasSecret: Boolean(row.secret_ref), hasSudoSecret: Boolean(row.sudo_secret_ref), createdAt: String(row.created_at), updatedAt: String(row.updated_at)
   };
 }
 

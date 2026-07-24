@@ -1,9 +1,10 @@
-import { Client, type ConnectConfig, type SFTPWrapper } from "ssh2";
+import { Client, type ClientChannel, type ConnectConfig, type SFTPWrapper } from "ssh2";
 import { readFile } from "node:fs/promises";
 import { createWriteStream } from "node:fs";
 import { basename, dirname, join } from "node:path/posix";
 import { homedir } from "node:os";
-import type { CommandResult, Host, HostStatus } from "../../shared/src/index.js";
+import { randomUUID } from "node:crypto";
+import type { CommandResult, Credential, Host, HostStatus } from "../../shared/src/index.js";
 import { AppError } from "../../shared/src/index.js";
 import type { HoplaneDatabase } from "../../core/src/database.js";
 import type { CredentialVault } from "../../core/src/vault.js";
@@ -12,6 +13,13 @@ interface ManagedConnection {
   client: Client;
   revision: number;
   lastUsedAt: number;
+}
+
+export interface ShellSession {
+  username: string;
+  stream: ClientChannel;
+  setWindow(rows: number, cols: number): void;
+  close(): void;
 }
 
 export class SSHConnectionManager {
@@ -44,7 +52,9 @@ export class SSHConnectionManager {
     onStderr?: (chunk: Buffer) => void;
   }): Promise<Omit<CommandResult, "operationId" | "durationMs">> {
     const client = await this.getConnection(hostId);
-    const fullCommand = options.directory ? `cd -- ${shellQuote(options.directory)} && ${command}` : command;
+    const sudoPassword = /^\s*sudo(?=\s|$)/u.test(command) ? await this.resolveSudoPassword(hostId) : null;
+    const sudoExecution = prepareSudoExecution(command, sudoPassword !== null);
+    const fullCommand = options.directory ? `cd -- ${shellQuote(options.directory)} && ${sudoExecution.command}` : sudoExecution.command;
     return new Promise((resolve, reject) => {
       let settled = false;
       let stdout: Buffer = Buffer.alloc(0);
@@ -52,6 +62,7 @@ export class SSHConnectionManager {
       let stdoutTruncated = false;
       let stderrTruncated = false;
       let activeStream: { close(): void } | undefined;
+      const sudoPrompt = sudoExecution.promptMarker ? new SudoPromptFilter(sudoExecution.promptMarker) : null;
       const timer = setTimeout(() => {
         if (settled) return;
         settled = true;
@@ -75,14 +86,21 @@ export class SSHConnectionManager {
           stdoutTruncated ||= result.truncated;
         });
         stream.stderr.on("data", (chunk: Buffer) => {
+          const filtered = sudoPrompt?.push(chunk) ?? { visible: chunk, prompted: false };
+          if (filtered.prompted && sudoPassword !== null) stream.end(`${sudoPassword}\n`);
+          appendStderr(filtered.visible);
+        });
+        const appendStderr = (chunk: Buffer) => {
+          if (chunk.length === 0) return;
           const remaining = Math.max(0, this.outputLimitBytes - stderr.length);
           if (remaining > 0) options.onStderr?.(chunk.subarray(0, remaining));
           const result = appendLimited(stderr, chunk, this.outputLimitBytes);
           stderr = result.value;
           stderrTruncated ||= result.truncated;
-        });
+        };
         stream.on("close", (code: number | null) => {
           if (settled) return;
+          if (sudoPrompt) appendStderr(sudoPrompt.flush());
           settled = true;
           clearTimeout(timer);
           resolve({
@@ -95,6 +113,35 @@ export class SSHConnectionManager {
           settled = true;
           clearTimeout(timer);
           reject(classifySshError(streamError));
+        });
+      });
+    });
+  }
+
+  /**
+   * Opens an interactive PTY shell on a dedicated connection for the human terminal.
+   * The connection is independent from the AI connection pool: it may use any
+   * configured login and its lifecycle is bound to the returned session.
+   */
+  async openShellSession(hostId: string, loginId: string, options: { cols: number; rows: number; term?: string }): Promise<ShellSession> {
+    const host = this.requireEnabledHost(hostId);
+    const login = this.database.getHostLogin(loginId);
+    if (!login || login.hostId !== hostId) throw new AppError("HOST_LOGIN_NOT_FOUND", "The requested login does not belong to this host", false, undefined, undefined, 404);
+    const credential = login.credentialId ? this.database.getCredential(login.credentialId) : null;
+    if (!credential) throw new AppError("CREDENTIAL_NOT_FOUND", "The selected login has no usable credential", false, undefined, undefined, 409);
+    const client = await this.establishClient(host, credential, login.username, false);
+    return new Promise((resolve, reject) => {
+      client.shell({ term: options.term ?? "xterm-256color", cols: options.cols, rows: options.rows }, (error, stream) => {
+        if (error) {
+          client.end();
+          reject(classifySshError(error));
+          return;
+        }
+        resolve({
+          username: login.username,
+          stream,
+          setWindow: (rows, cols) => stream.setWindow(rows, cols, 0, 0),
+          close: () => { stream.end(); client.end(); }
         });
       });
     });
@@ -181,6 +228,22 @@ export class SSHConnectionManager {
     return new Promise((resolve, reject) => client.sftp((error, sftp) => error ? reject(new AppError("SFTP_UNAVAILABLE", error.message, true)) : resolve(sftp)));
   }
 
+  private async resolveSudoPassword(hostId: string): Promise<string | null> {
+    const host = this.requireEnabledHost(hostId);
+    const activeLogin = this.database.getActiveHostLogin(hostId);
+    if (host.username !== "root" && activeLogin && !activeLogin.sudoEnabled) {
+      throw new AppError("SUDO_DISABLED", `sudo is disabled for the active login "${host.username}"`, false, undefined, { username: host.username }, 403);
+    }
+    const credential = host.credentialId ? this.database.getCredential(host.credentialId) : null;
+    if (!credential || credential.sudoMode === "NONE") return null;
+    if (credential.sudoMode === "LOGIN_PASSWORD") {
+      if (credential.type !== "PASSWORD" || !credential.secretRef) throw new AppError("SUDO_CREDENTIAL_NOT_CONFIGURED", "The configured login password is unavailable for sudo", false, undefined, undefined, 409);
+      return this.vault.resolve(credential.secretRef);
+    }
+    if (!credential.sudoSecretRef) throw new AppError("SUDO_CREDENTIAL_NOT_CONFIGURED", "The configured sudo password is unavailable", false, undefined, undefined, 409);
+    return this.vault.resolve(credential.sudoSecretRef);
+  }
+
   private async getConnection(hostId: string): Promise<Client> {
     const host = this.requireEnabledHost(hostId);
     const existing = this.connections.get(hostId);
@@ -205,12 +268,17 @@ export class SSHConnectionManager {
     this.statuses.set(host.id, "CONNECTING");
     const credential = host.credentialId ? this.database.getCredential(host.credentialId) : null;
     if (!credential) throw new AppError("CREDENTIAL_NOT_FOUND", "Host has no usable credential", false, undefined, undefined, 409);
+    return this.establishClient(host, credential, host.username, true);
+  }
+
+  /** Connects a new ssh2 client. `trackStatus` ties the client to the pooled host status; shell sessions pass false. */
+  private async establishClient(host: Host, credential: Credential, username: string, trackStatus: boolean): Promise<Client> {
     const trustedFingerprint = this.database.getTrustedHostKey(host.id);
     let observedFingerprint: string | undefined;
     const config: ConnectConfig = {
       host: host.hostname,
       port: host.port,
-      username: host.username,
+      username,
       readyTimeout: 15_000,
       keepaliveInterval: 10_000,
       keepaliveCountMax: 3,
@@ -237,13 +305,13 @@ export class SSHConnectionManager {
     return new Promise((resolve, reject) => {
       const client = new Client();
       client.once("ready", () => {
-        this.statuses.set(host.id, "CONNECTED");
+        if (trackStatus) this.statuses.set(host.id, "CONNECTED");
         resolve(client);
       });
       client.once("error", (error: Error & { level?: string }) => {
         if (observedFingerprint && observedFingerprint !== trustedFingerprint) {
           const changed = Boolean(trustedFingerprint);
-          this.statuses.set(host.id, "HOST_KEY_BLOCKED");
+          if (trackStatus) this.statuses.set(host.id, "HOST_KEY_BLOCKED");
           reject(new AppError(changed ? "SSH_HOST_KEY_CHANGED" : "SSH_HOST_KEY_UNTRUSTED", changed ? "SSH host key changed" : "SSH host key is not trusted yet", false, undefined, {
             observedFingerprint,
             ...(trustedFingerprint ? { trustedFingerprint } : {})
@@ -251,10 +319,11 @@ export class SSHConnectionManager {
           return;
         }
         const classified = classifySshError(error);
-        this.statuses.set(host.id, classified.code === "SSH_AUTH_FAILED" ? "AUTH_FAILED" : "FAILED");
+        if (trackStatus) this.statuses.set(host.id, classified.code === "SSH_AUTH_FAILED" ? "AUTH_FAILED" : "FAILED");
         reject(classified);
       });
       client.on("close", () => {
+        if (!trackStatus) return;
         this.connections.delete(host.id);
         if (this.statuses.get(host.id) === "CONNECTED") this.statuses.set(host.id, "DISCONNECTED");
       });
@@ -278,13 +347,67 @@ function appendLimited(current: Buffer, chunk: Buffer, limit: number): { value: 
 }
 
 function shellQuote(value: string): string { return `'${value.replaceAll("'", `'\\''`)}'`; }
+
+export interface PreparedSudoExecution {
+  command: string;
+  promptMarker?: string;
+}
+
+/** Adds non-interactive sudo authentication without ever placing a password in the command. */
+export function prepareSudoExecution(command: string, hasManagedPassword: boolean, marker = `HOPLANE_SUDO_${randomUUID()}_`): PreparedSudoExecution {
+  if (!/^\s*sudo(?=\s|$)/u.test(command)) return { command };
+  if (!hasManagedPassword) return { command: command.replace(/^\s*sudo(?=\s|$)/u, "sudo -n") };
+  return {
+    command: command.replace(/^\s*sudo(?=\s|$)/u, `sudo -S -p ${shellQuote(marker)}`),
+    promptMarker: marker
+  };
+}
+
+/** Holds only a short stderr suffix so a sudo prompt split across SSH packets can be removed. */
+export class SudoPromptFilter {
+  private readonly marker: Buffer;
+  private pending = Buffer.alloc(0);
+  private answered = false;
+
+  constructor(marker: string) { this.marker = Buffer.from(marker, "utf8"); }
+
+  push(chunk: Buffer): { visible: Buffer; prompted: boolean } {
+    let combined = Buffer.concat([this.pending, chunk]);
+    this.pending = Buffer.alloc(0);
+    let prompted = false;
+    const visible: Buffer[] = [];
+    while (true) {
+      const index = combined.indexOf(this.marker);
+      if (index < 0) break;
+      visible.push(combined.subarray(0, index));
+      combined = combined.subarray(index + this.marker.length);
+      if (!this.answered) { this.answered = true; prompted = true; }
+    }
+    const retained = Math.min(Math.max(0, this.marker.length - 1), combined.length);
+    const visibleLength = combined.length - retained;
+    if (visibleLength > 0) visible.push(combined.subarray(0, visibleLength));
+    this.pending = combined.subarray(visibleLength);
+    return { visible: Buffer.concat(visible), prompted };
+  }
+
+  flush(): Buffer {
+    const value = this.pending;
+    this.pending = Buffer.alloc(0);
+    return value;
+  }
+}
 function expandHome(path: string): string { return path === "~" ? homedir() : path.startsWith("~/") ? `${homedir()}/${path.slice(2)}` : path; }
 
-function classifySshError(error: unknown): AppError {
+export function classifySshError(error: unknown): AppError {
   if (error instanceof AppError) return error;
   const message = error instanceof Error ? error.message : "SSH operation failed";
+  const code = typeof error === "object" && error !== null && "code" in error ? String((error as { code?: unknown }).code ?? "") : "";
   if (/authentication|all configured authentication methods failed/i.test(message)) return new AppError("SSH_AUTH_FAILED", message, false, undefined, undefined, 401);
   if (/no such file/i.test(message)) return new AppError("FILE_NOT_FOUND", message, false, undefined, undefined, 404);
+  if (code === "EHOSTUNREACH" || code === "ENETUNREACH" || /\b(?:EHOSTUNREACH|ENETUNREACH)\b/u.test(message)) return new AppError("SSH_HOST_UNREACHABLE", message, true, undefined, { networkCode: code || (message.match(/\b(?:EHOSTUNREACH|ENETUNREACH)\b/u)?.[0] ?? "") }, 502);
+  if (code === "ECONNREFUSED" || /\bECONNREFUSED\b/u.test(message)) return new AppError("SSH_CONNECTION_REFUSED", message, true, undefined, { networkCode: "ECONNREFUSED" }, 502);
+  if (code === "ETIMEDOUT" || /\bETIMEDOUT\b|timed?\s*out/iu.test(message)) return new AppError("SSH_CONNECTION_TIMEOUT", message, true, undefined, { networkCode: "ETIMEDOUT" }, 504);
+  if (code === "ENOTFOUND" || code === "EAI_AGAIN" || /\b(?:ENOTFOUND|EAI_AGAIN)\b/u.test(message)) return new AppError("SSH_HOST_NOT_FOUND", message, true, undefined, { networkCode: code }, 502);
   return new AppError("SSH_CONNECTION_FAILED", message, true, undefined, undefined, 502);
 }
 

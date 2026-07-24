@@ -52,7 +52,17 @@ interface CodexIntegrationOptions {
   environment?: NodeJS.ProcessEnv;
 }
 
-export type JsonAgentKind = "cursor" | "claude-code";
+export type JsonAgentKind = "cursor" | "claude-code" | "workbuddy";
+
+export const JSON_AGENT_LABELS: Record<JsonAgentKind, string> = {
+  cursor: "Cursor",
+  "claude-code": "Claude Code",
+  workbuddy: "WorkBuddy"
+};
+
+function jsonAgentConfigFileName(agent: JsonAgentKind): string {
+  return agent === "claude-code" ? ".claude.json" : "mcp.json";
+}
 
 export interface JsonAgentIntegrationState {
   agent: JsonAgentKind;
@@ -345,6 +355,12 @@ export class JsonAgentIntegrationService {
         { path: join(this.userHome, ".config", "cursor"), label: "XDG 常见目录", source: "COMMON" }
       );
       if (this.environment.APPDATA) seeds.push({ path: join(this.environment.APPDATA, ".cursor"), label: "Windows Roaming 用户目录", source: "COMMON" });
+    } else if (this.agent === "workbuddy") {
+      seeds.push(
+        { path: join(this.userHome, ".workbuddy"), label: "WorkBuddy 用户目录", source: "DEFAULT" },
+        { path: join(this.userHome, ".config", "workbuddy"), label: "XDG 常见目录", source: "COMMON" }
+      );
+      if (this.environment.APPDATA) seeds.push({ path: join(this.environment.APPDATA, ".workbuddy"), label: "Windows Roaming 用户目录", source: "COMMON" });
     } else {
       seeds.push({ path: this.userHome, label: "用户主目录", source: "DEFAULT" });
       if (this.environment.USERPROFILE) seeds.push({ path: this.environment.USERPROFILE, label: "Windows 用户目录", source: "COMMON" });
@@ -408,16 +424,18 @@ export class JsonAgentIntegrationService {
 }
 
 function jsonAgentPaths(agent: JsonAgentKind, configDirectory: string): { agentHome: string; skillPath: string; configPath: string } {
-  const agentHome = agent === "cursor" ? configDirectory : join(configDirectory, ".claude");
+  const agentHome = agent === "claude-code" ? join(configDirectory, ".claude") : configDirectory;
   return {
     agentHome,
     skillPath: join(agentHome, "skills", "hoplane"),
-    configPath: agent === "cursor" ? join(configDirectory, "mcp.json") : join(configDirectory, ".claude.json")
+    configPath: join(configDirectory, jsonAgentConfigFileName(agent))
   };
 }
 
 function defaultAgentConfigDirectory(agent: JsonAgentKind, userHome: string): string {
-  return agent === "cursor" ? join(userHome, ".cursor") : userHome;
+  if (agent === "cursor") return join(userHome, ".cursor");
+  if (agent === "workbuddy") return join(userHome, ".workbuddy");
+  return userHome;
 }
 
 async function inspectJsonAgentDirectory(
@@ -432,7 +450,7 @@ async function inspectJsonAgentDirectory(
   const isDirectory = Boolean(info?.isDirectory());
   const { agentHome, configPath } = jsonAgentPaths(agent, path);
   let configStatus: JsonAgentHomeCandidate["configStatus"] = "MISSING";
-  let configDetail = `未找到 ${agent === "cursor" ? "mcp.json" : ".claude.json"}，安装时将创建`;
+  let configDetail = `未找到 ${jsonAgentConfigFileName(agent)}，安装时将创建`;
   if (exists && !isDirectory) {
     configStatus = "INVALID";
     configDetail = "候选路径不是目录";
@@ -441,7 +459,7 @@ async function inspectJsonAgentDirectory(
     if (configInfo) {
       const inspection = await inspectJsonAgentConfig(configPath, runtime);
       configStatus = inspection.error ? "INVALID" : "VALID";
-      configDetail = inspection.error ?? `${agent === "cursor" ? "mcp.json" : ".claude.json"} 可读取并通过 JSON 结构检查`;
+      configDetail = inspection.error ?? `${jsonAgentConfigFileName(agent)} 可读取并通过 JSON 结构检查`;
     }
   }
   const writable = (!exists || isDirectory)
@@ -454,7 +472,7 @@ async function inspectJsonAgentDirectory(
 function normalizeAgentConfigDirectory(path: string, userHome: string, agent: JsonAgentKind): string {
   const trimmed = path.trim();
   if (!trimmed || trimmed.includes("\0") || trimmed.length > 4096) {
-    throw new AppError("AGENT_INTEGRATION_DIRECTORY_INVALID", `${agent === "cursor" ? "Cursor" : "Claude Code"} 配置目录路径无效`, false, undefined, { agent }, 400);
+    throw new AppError("AGENT_INTEGRATION_DIRECTORY_INVALID", `${JSON_AGENT_LABELS[agent]} 配置目录路径无效`, false, undefined, { agent }, 400);
   }
   const expanded = trimmed === "~" ? userHome : trimmed.startsWith("~/") || trimmed.startsWith("~\\") ? join(userHome, trimmed.slice(2)) : trimmed;
   if (!isAbsolute(expanded)) {

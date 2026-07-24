@@ -115,17 +115,22 @@ describe("Codex integration", () => {
 
     const cursor = await new JsonAgentIntegrationService("cursor", options).install();
     const claude = await new JsonAgentIntegrationService("claude-code", options).install();
+    const workbuddy = await new JsonAgentIntegrationService("workbuddy", options).install();
 
     expect(cursor).toMatchObject({ installed: true, restartRequired: true, skillPath: join(root, ".cursor", "skills", "hoplane") });
     expect(claude).toMatchObject({ installed: true, restartRequired: true, skillPath: join(root, ".claude", "skills", "hoplane") });
+    expect(workbuddy).toMatchObject({ installed: true, restartRequired: true, skillPath: join(root, ".workbuddy", "skills", "hoplane"), configPath: join(root, ".workbuddy", "mcp.json") });
     expect(await readFile(join(cursor.skillPath, "SKILL.md"), "utf8")).toContain("name: hoplane");
     expect(await readFile(join(claude.skillPath, "scripts", "diagnose.cmd"), "utf8")).toContain("ELECTRON_RUN_AS_NODE=1");
     const cursorConfig = JSON.parse(await readFile(join(root, ".cursor", "mcp.json"), "utf8"));
     const claudeConfig = JSON.parse(await readFile(join(root, ".claude.json"), "utf8"));
+    const workbuddyConfig = JSON.parse(await readFile(join(root, ".workbuddy", "mcp.json"), "utf8"));
     expect(cursorConfig).toMatchObject({ keep: true, mcpServers: { existing: { command: "existing" }, hoplane: { type: "stdio", command, args: [adapterEntry] } } });
     expect(claudeConfig).toMatchObject({ theme: "dark", mcpServers: { hoplane: { type: "stdio", command, args: [adapterEntry] } } });
+    expect(workbuddyConfig).toMatchObject({ mcpServers: { hoplane: { type: "stdio", command, args: [adapterEntry] } } });
     expect((await new JsonAgentIntegrationService("cursor", options).getState()).installed).toBe(true);
     expect((await new JsonAgentIntegrationService("claude-code", options).getState()).installed).toBe(true);
+    expect((await new JsonAgentIntegrationService("workbuddy", options).getState()).installed).toBe(true);
   });
 
   it("scans bounded Cursor and Claude Code config directories and supports manual selection", async () => {

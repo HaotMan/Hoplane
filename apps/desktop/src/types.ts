@@ -1,8 +1,10 @@
 export interface Host {
   id: string; name: string; hostname: string; port: number; username: string; credentialId: string | null; policyId: string | null;
+  activeLoginId: string | null;
   groupName: string | null; tags: string[]; defaultDirectory: string | null; enabled: boolean; aiAccessEnabled: boolean; monitorOutputEnabled: boolean; status: string;
 }
-export interface Credential { id: string; name: string; type: "PASSWORD" | "PRIVATE_KEY" | "SSH_AGENT"; metadata: { privateKeyPath?: string; agentSocket?: string }; hasSecret: boolean; }
+export interface HostLogin { id: string; hostId: string; username: string; credentialId: string | null; sudoEnabled: boolean; active: boolean; createdAt: string; updatedAt: string; }
+export interface Credential { id: string; name: string; type: "PASSWORD" | "PRIVATE_KEY" | "SSH_AGENT"; sudoMode: "NONE" | "LOGIN_PASSWORD" | "CUSTOM_PASSWORD"; metadata: { privateKeyPath?: string; agentSocket?: string }; hasSecret: boolean; hasSudoSecret: boolean; }
 export interface RevealedCredential { credential: Credential; secret: string | null; privateKey: string | null; expiresInSeconds: number; }
 export type Policy = SharedPolicy;
 export type PolicyDocument = SharedPolicyDocument;

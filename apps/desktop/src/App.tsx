@@ -1,14 +1,21 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useId, useRef, useState, type FormEvent } from "react";
 import { COMMAND_BLACKLIST_CATALOG, DEFAULT_POLICY_TEMPLATE, findPolicyTemplate, findPolicyTemplateByName, POLICY_TEMPLATES } from "../../../packages/shared/src/policy-templates";
 import { policySourceSchema } from "../../../packages/shared/src/schemas";
 import { parseDocument, stringify } from "yaml";
 import { api, ApiError, patch, post, put, remove } from "./api";
 import { groupHosts, selectedHostCopyText } from "./host-list";
-import type { AuditLog, Credential, Host, HostMonitorEvent, Policy, PolicyCommandRule, PolicyDocument, RevealedCredential } from "./types";
+import { HostTerminalPage } from "./host-terminal";
+import { Breadcrumb, PageHeader } from "./page-chrome";
+import type { AuditLog, Credential, Host, HostLogin, HostMonitorEvent, Policy, PolicyCommandRule, PolicyDocument, RevealedCredential } from "./types";
 
 type Page = "hosts" | "policies" | "audit" | "settings";
 type ThemePreference = "system" | "dark" | "light";
-type IntegrationChannel = "codex" | "cursor" | "claude-code" | "other";
+type IntegrationChannel = "codex" | "cursor" | "claude-code" | "workbuddy" | "other";
+const JSON_AGENT_NAMES = { cursor: "Cursor", "claude-code": "Claude Code", workbuddy: "WorkBuddy" } as const;
+type JsonAgentChannel = keyof typeof JSON_AGENT_NAMES;
+function agentStateKey(agent: JsonAgentChannel): "cursor" | "claudeCode" | "workbuddy" {
+  return agent === "claude-code" ? "claudeCode" : agent;
+}
 interface VaultState { localInitialized: boolean; unlocked: boolean }
 const THEME_STORAGE_KEY = "hoplane.theme";
 const pages: Array<{ id: Page; label: string; mark: string }> = [
@@ -66,26 +73,27 @@ function ThemePicker({ value, onChange }: { value: ThemePreference; onChange(val
   return <div className="theme-picker"><span>界面风格</span><div>{options.map((option) => <button key={option.value} title={option.label} aria-label={option.label} aria-pressed={value === option.value} className={value === option.value ? "selected" : ""} onClick={() => onChange(option.value)}><i>{option.short}</i><em>{option.label}</em></button>)}</div></div>;
 }
 
-function PageHeader({ eyebrow, title, children }: { eyebrow: string; title: string; children?: React.ReactNode }) {
-  return <header className="page-header"><div><span className="eyebrow">{eyebrow}</span><h1>{title}</h1></div>{children}</header>;
-}
-
 function HostsPage({ notify }: { notify: Notify }) {
   const [hosts, setHosts] = useState<Host[]>([]);
+  const [hostLogins, setHostLogins] = useState<HostLogin[]>([]);
   const [credentials, setCredentials] = useState<Credential[]>([]);
   const [policies, setPolicies] = useState<Policy[]>([]);
   const [editing, setEditing] = useState<Host | "new" | null>(null);
   const [monitorHostId, setMonitorHostId] = useState<string | null>(null);
+  const [terminalHostId, setTerminalHostId] = useState<string | null>(null);
   const [testingHostId, setTestingHostId] = useState<string | null>(null);
   const [updatingHostId, setUpdatingHostId] = useState<string | null>(null);
+  const [deletingHost, setDeletingHost] = useState<Host | null>(null);
+  const [renamingGroup, setRenamingGroup] = useState<string | null>(null);
+  const [deleteBusy, setDeleteBusy] = useState(false);
   const [multiSelectMode, setMultiSelectMode] = useState(false);
   const [selectedHostIds, setSelectedHostIds] = useState<Set<string>>(() => new Set());
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => new Set());
   const [testResults, setTestResults] = useState<Record<string, { kind: "ok" | "error" | "pending"; text: string }>>({});
   const load = useCallback(async () => {
     try {
-      const [h, c, p] = await Promise.all([api<Host[]>("/v1/hosts"), api<Credential[]>("/v1/credentials"), api<Policy[]>("/v1/policies")]);
-      setHosts(h); setCredentials(c); setPolicies(p);
+      const [h, l, c, p] = await Promise.all([api<Host[]>("/v1/hosts"), api<HostLogin[]>("/v1/host-logins"), api<Credential[]>("/v1/credentials"), api<Policy[]>("/v1/policies")]);
+      setHosts(h); setHostLogins(l); setCredentials(c); setPolicies(p);
     } catch (error) { notify("error", message(error)); }
   }, [notify]);
   useEffect(() => { void load(); const timer = window.setInterval(() => void load(), 10_000); return () => window.clearInterval(timer); }, [load]);
@@ -169,9 +177,73 @@ function HostsPage({ notify }: { notify: Notify }) {
     } catch (error) { notify("error", message(error)); }
     finally { setUpdatingHostId(null); }
   }
+  async function activateLogin(host: Host, loginId: string) {
+    if (updatingHostId || loginId === host.activeLoginId) return;
+    setUpdatingHostId(host.id);
+    try {
+      const login = hostLogins.find((item) => item.id === loginId);
+      await post(`/v1/hosts/${host.id}/logins/${loginId}/activate`);
+      setTestResults((current) => {
+        const next = { ...current };
+        delete next[host.id];
+        return next;
+      });
+      await load();
+      notify("ok", `${host.name} 已切换为 ${login?.username ?? "所选用户"}，AI 后续连接只使用该身份`);
+    } catch (error) { notify("error", message(error)); }
+    finally { setUpdatingHostId(null); }
+  }
+  async function changePolicy(host: Host, policyId: string) {
+    if (updatingHostId || (host.policyId ?? "") === policyId) return;
+    setUpdatingHostId(host.id);
+    try {
+      await patch(`/v1/hosts/${host.id}`, { policyId: policyId || null });
+      await load();
+      const policyName = policies.find((policy) => policy.id === policyId)?.name;
+      notify("ok", policyId ? `${host.name} 策略已切换为“${policyName ?? "所选策略"}”` : `${host.name} 已取消策略绑定`);
+    } catch (error) { notify("error", message(error)); }
+    finally { setUpdatingHostId(null); }
+  }
+  async function toggleSudo(host: Host, login: HostLogin) {
+    if (updatingHostId) return;
+    setUpdatingHostId(host.id);
+    try {
+      await patch(`/v1/hosts/${host.id}/logins/${login.id}/sudo`, { sudoEnabled: !login.sudoEnabled });
+      await load();
+      notify("ok", login.sudoEnabled ? `${host.name} 已禁止 ${login.username} 使用 sudo` : `${host.name} 已允许 ${login.username} 使用 sudo`);
+    } catch (error) { notify("error", message(error)); }
+    finally { setUpdatingHostId(null); }
+  }
+  async function renameGroup(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!renamingGroup) return;
+    const value = String(new FormData(event.currentTarget).get("newName") ?? "").trim();
+    if (!value || value === renamingGroup) { setRenamingGroup(null); return; }
+    try {
+      await patch("/v1/host-groups", { oldName: renamingGroup, newName: value });
+      setRenamingGroup(null);
+      await load();
+      notify("ok", `分组已重命名为“${value}”`);
+    } catch (error) { notify("error", message(error)); }
+  }
+  async function confirmDeleteHost() {
+    if (!deletingHost || deleteBusy) return;
+    setDeleteBusy(true);
+    try {
+      await remove(`/v1/hosts/${deletingHost.id}`);
+      const deletedName = deletingHost.name;
+      setDeletingHost(null);
+      await load();
+      notify("ok", `${deletedName} 已删除`);
+    } catch (error) {
+      notify("error", `删除失败：${message(error)}`);
+    } finally { setDeleteBusy(false); }
+  }
   const monitoredHost = monitorHostId ? hosts.find((host) => host.id === monitorHostId) : undefined;
   const monitoredCredential = monitoredHost?.credentialId ? credentials.find((credential) => credential.id === monitoredHost.credentialId) : undefined;
   if (monitorHostId && monitoredHost) return <HostMonitorPage host={monitoredHost} credential={monitoredCredential} onBack={() => setMonitorHostId(null)} onHostChanged={load} notify={notify} />;
+  const terminalHost = terminalHostId ? hosts.find((host) => host.id === terminalHostId) : undefined;
+  if (terminalHostId && terminalHost) return <HostTerminalPage key={terminalHost.id} host={terminalHost} logins={hostLogins.filter((login) => login.hostId === terminalHost.id)} onBack={() => setTerminalHostId(null)} />;
   const groups = groupHosts(hosts);
   const allSelected = hosts.length > 0 && selectedHostIds.size === hosts.length;
   const someSelected = selectedHostIds.size > 0 && !allSelected;
@@ -183,28 +255,40 @@ function HostsPage({ notify }: { notify: Notify }) {
     </div>
     <div className="panel table-panel host-table-panel">
       {hosts.length > 0 && <div className="host-list-toolbar"><div><strong>{multiSelectMode ? selectedHostIds.size > 0 ? `已选择 ${selectedHostIds.size} 台主机` : "请选择主机" : `${groups.length} 个分组`}</strong><small>{multiSelectMode ? "复制内容为显示名称和主机地址，每行一台" : "点击分组名称可展开或折叠"}</small></div><div>{multiSelectMode ? <><button onClick={() => selectHosts(hosts.map((host) => host.id), !allSelected)}>{allSelected ? "取消全选" : "全选主机"}</button><button className="primary" disabled={selectedHostIds.size === 0} onClick={() => void copySelectedHostNames()}>复制名称和地址</button><button onClick={leaveMultiSelectMode}>完成</button></> : <button onClick={() => setMultiSelectMode(true)}>多选</button>}</div></div>}
-      <table><thead><tr>{multiSelectMode && <th className="host-select-cell"><SelectionCheckbox label="选择全部主机" checked={allSelected} indeterminate={someSelected} disabled={hosts.length === 0} onChange={(selected) => selectHosts(hosts.map((host) => host.id), selected)} /></th>}<th>主机</th><th>状态</th><th>AI 权限</th><th>策略</th><th /></tr></thead>
+      <table><thead><tr>{multiSelectMode && <th className="host-select-cell"><SelectionCheckbox label="选择全部主机" checked={allSelected} indeterminate={someSelected} disabled={hosts.length === 0} onChange={(selected) => selectHosts(hosts.map((host) => host.id), selected)} /></th>}<th className="host-name-column">主机</th><th className="host-status-column">状态</th><th className="host-access-column">AI 权限</th><th className="host-policy-column">策略</th><th className="host-actions-column" /></tr></thead>
       <tbody>{groups.map((group) => {
         const groupIds = group.hosts.map((host) => host.id);
         const selectedInGroup = groupIds.filter((id) => selectedHostIds.has(id)).length;
         const groupSelected = selectedInGroup === group.hosts.length;
         const collapsed = collapsedGroups.has(group.key);
-        return <GroupRows key={group.key} groupName={group.name} hosts={group.hosts} collapsed={collapsed} selectionMode={multiSelectMode} selectedIds={selectedHostIds} groupSelected={groupSelected} groupIndeterminate={selectedInGroup > 0 && !groupSelected} policies={policies} testResults={testResults} testingHostId={testingHostId} updatingHostId={updatingHostId} onToggleGroup={() => toggleGroup(group.key)} onSelectGroup={(selected) => selectHosts(groupIds, selected)} onSelectHost={selectHost} onMonitor={setMonitorHostId} onTest={test} onToggleHost={toggleHost} onEdit={setEditing} onDelete={async (host) => { if (confirm(`删除 ${host.name}？`)) { await remove(`/v1/hosts/${host.id}`); await load(); } }} />;
+        return <GroupRows key={group.key} groupName={group.name} ungrouped={group.ungrouped} hosts={group.hosts} hostLogins={hostLogins} collapsed={collapsed} selectionMode={multiSelectMode} selectedIds={selectedHostIds} groupSelected={groupSelected} groupIndeterminate={selectedInGroup > 0 && !groupSelected} policies={policies} testResults={testResults} testingHostId={testingHostId} updatingHostId={updatingHostId} onToggleGroup={() => toggleGroup(group.key)} onRenameGroup={() => setRenamingGroup(group.name)} onSelectGroup={(selected) => selectHosts(groupIds, selected)} onSelectHost={selectHost} onActivateLogin={activateLogin} onChangePolicy={changePolicy} onToggleSudo={toggleSudo} onOpenTerminal={setTerminalHostId} onMonitor={setMonitorHostId} onTest={test} onToggleHost={toggleHost} onEdit={setEditing} onDelete={setDeletingHost} />;
       })}</tbody></table>{hosts.length === 0 && <Empty text="还没有主机。添加主机时可以直接填写密码、私钥或 SSH Agent。" />}</div>
-    {editing && <HostDialog host={editing === "new" ? null : editing} credentials={credentials} policies={policies} groupNames={existingGroupNames} onClose={() => setEditing(null)} onSaved={async () => { setEditing(null); await load(); notify("ok", "主机已保存"); }} />}
+    {editing && <HostDialog host={editing === "new" ? null : editing} credentials={credentials} policies={policies} groupNames={existingGroupNames} onAccountsChanged={load} onClose={() => setEditing(null)} onSaved={async (saved, created) => {
+      setEditing(null);
+      await load();
+      notify("ok", created ? "主机已保存，正在自动测试连接…" : "主机已保存");
+      if (created) void test(saved);
+    }} />}
+    {renamingGroup && <Modal title="重命名分组" onClose={() => setRenamingGroup(null)}><form onSubmit={renameGroup} className="form-grid"><label className="span-2">新的分组名称<input name="newName" required maxLength={120} autoFocus defaultValue={renamingGroup} /></label><div className="form-actions span-2"><button type="button" onClick={() => setRenamingGroup(null)}>取消</button><button className="primary">保存名称</button></div></form></Modal>}
+    {deletingHost && <Modal title="删除主机" onClose={() => !deleteBusy && setDeletingHost(null)}><div className="confirmation-copy"><strong>确定删除“{deletingHost.name}”吗？</strong><p>该主机的连接配置、专属凭据和信任记录会被删除，已有审计记录仍会保留。</p></div><div className="form-actions"><button onClick={() => setDeletingHost(null)} disabled={deleteBusy}>取消</button><button className="danger-button" onClick={() => void confirmDeleteHost()} disabled={deleteBusy}>{deleteBusy ? "删除中…" : "确认删除"}</button></div></Modal>}
   </section>;
 }
 
-function GroupRows({ groupName, hosts, collapsed, selectionMode, selectedIds, groupSelected, groupIndeterminate, policies, testResults, testingHostId, updatingHostId, onToggleGroup, onSelectGroup, onSelectHost, onMonitor, onTest, onToggleHost, onEdit, onDelete }: { groupName: string; hosts: Host[]; collapsed: boolean; selectionMode: boolean; selectedIds: ReadonlySet<string>; groupSelected: boolean; groupIndeterminate: boolean; policies: Policy[]; testResults: Record<string, { kind: "ok" | "error" | "pending"; text: string }>; testingHostId: string | null; updatingHostId: string | null; onToggleGroup(): void; onSelectGroup(selected: boolean): void; onSelectHost(hostId: string, selected: boolean): void; onMonitor(hostId: string): void; onTest(host: Host): Promise<void>; onToggleHost(host: Host): Promise<void>; onEdit(host: Host): void; onDelete(host: Host): Promise<void> }) {
+function GroupRows({ groupName, ungrouped, hosts, hostLogins, collapsed, selectionMode, selectedIds, groupSelected, groupIndeterminate, policies, testResults, testingHostId, updatingHostId, onToggleGroup, onRenameGroup, onSelectGroup, onSelectHost, onActivateLogin, onChangePolicy, onToggleSudo, onOpenTerminal, onMonitor, onTest, onToggleHost, onEdit, onDelete }: { groupName: string; ungrouped: boolean; hosts: Host[]; hostLogins: HostLogin[]; collapsed: boolean; selectionMode: boolean; selectedIds: ReadonlySet<string>; groupSelected: boolean; groupIndeterminate: boolean; policies: Policy[]; testResults: Record<string, { kind: "ok" | "error" | "pending"; text: string }>; testingHostId: string | null; updatingHostId: string | null; onToggleGroup(): void; onRenameGroup(): void; onSelectGroup(selected: boolean): void; onSelectHost(hostId: string, selected: boolean): void; onActivateLogin(host: Host, loginId: string): Promise<void>; onChangePolicy(host: Host, policyId: string): Promise<void>; onToggleSudo(host: Host, login: HostLogin): Promise<void>; onOpenTerminal(hostId: string): void; onMonitor(hostId: string): void; onTest(host: Host): Promise<void>; onToggleHost(host: Host): Promise<void>; onEdit(host: Host): void; onDelete(host: Host): void }) {
   return <>
-    <tr className="host-group-row">{selectionMode && <td className="host-select-cell"><SelectionCheckbox label={`选择${groupName}中的全部主机`} checked={groupSelected} indeterminate={groupIndeterminate} onChange={onSelectGroup} /></td>}<td colSpan={5}><button className="host-group-toggle" aria-expanded={!collapsed} onClick={onToggleGroup}><i className={collapsed ? "collapsed" : ""} aria-hidden="true" /><strong>{groupName}</strong><span>{hosts.length} 台</span>{selectionMode && hosts.some((host) => selectedIds.has(host.id)) && <em>{hosts.filter((host) => selectedIds.has(host.id)).length} 台已选</em>}</button></td></tr>
-    {!collapsed && hosts.map((host) => <tr key={host.id} className={`host-member-row ${selectedIds.has(host.id) ? "host-row-selected" : ""}`}>
-      {selectionMode && <td className="host-select-cell"><SelectionCheckbox label={`选择主机 ${host.name}`} checked={selectedIds.has(host.id)} onChange={(selected) => onSelectHost(host.id, selected)} /></td>}
-      <td className="host-member-cell"><div className="host-name-text"><strong>{host.name}</strong><small>{host.username}@{host.hostname}:{host.port}</small></div></td>
-      <td><Status value={host.enabled ? host.status : "DISABLED"} />{testResults[host.id] && <small className={`test-result ${testResults[host.id]!.kind}`}>{testResults[host.id]!.text}</small>}</td><td><span className={host.enabled && host.aiAccessEnabled ? "badge allow" : "badge"}>{!host.enabled ? "主机停用" : host.aiAccessEnabled ? "已开放" : "未开放"}</span></td>
-      <td>{policies.find((policy) => policy.id === host.policyId)?.name ?? "未配置"}</td>
-      <td className="actions"><button onClick={() => onMonitor(host.id)}>指令记录</button><button disabled={!host.enabled || testingHostId !== null || updatingHostId !== null} onClick={() => void onTest(host)}>{testingHostId === host.id ? "测试中…" : "测试"}</button><button className={host.enabled ? "danger-link" : ""} disabled={testingHostId !== null || updatingHostId !== null} onClick={() => void onToggleHost(host)}>{updatingHostId === host.id ? "处理中…" : host.enabled ? "停用" : "启用"}</button><button disabled={testingHostId === host.id || updatingHostId === host.id} onClick={() => onEdit(host)}>编辑</button><button className="danger-link" disabled={testingHostId === host.id || updatingHostId === host.id} onClick={() => void onDelete(host)}>删除</button></td>
-    </tr>)}
+    <tr className="host-group-row">{selectionMode && <td className="host-select-cell"><SelectionCheckbox label={`选择${groupName}中的全部主机`} checked={groupSelected} indeterminate={groupIndeterminate} onChange={onSelectGroup} /></td>}<td colSpan={5}><div className="host-group-line"><button className="host-group-toggle" aria-expanded={!collapsed} onClick={onToggleGroup}><i className={collapsed ? "collapsed" : ""} aria-hidden="true" /><strong>{groupName}</strong><span>{hosts.length} 台</span>{selectionMode && hosts.some((host) => selectedIds.has(host.id)) && <em>{hosts.filter((host) => selectedIds.has(host.id)).length} 台已选</em>}</button>{!ungrouped && !selectionMode && <button className="host-group-rename" onClick={onRenameGroup}>重命名</button>}</div></td></tr>
+    {!collapsed && hosts.map((host) => {
+      const availableLogins = hostLogins.filter((login) => login.hostId === host.id);
+      const activeLoginAvailable = availableLogins.some((login) => login.id === host.activeLoginId);
+      const activeLogin = availableLogins.find((login) => login.id === host.activeLoginId);
+      return <tr key={host.id} className={`host-member-row ${selectedIds.has(host.id) ? "host-row-selected" : ""}`}>
+        {selectionMode && <td className="host-select-cell"><SelectionCheckbox label={`选择主机 ${host.name}`} checked={selectedIds.has(host.id)} onChange={(selected) => onSelectHost(host.id, selected)} /></td>}
+        <td className="host-member-cell"><div className="host-name-text"><strong>{host.name}</strong><div className="host-identity-line"><div className="host-identity-control"><span>当前用户</span><select title="切换 AI 使用的 SSH 登录用户" aria-label={`${host.name} 当前登录用户`} value={activeLoginAvailable ? host.activeLoginId! : ""} disabled={updatingHostId !== null || availableLogins.length === 0} onChange={(event) => void onActivateLogin(host, event.target.value)}>{!activeLoginAvailable && <option value="" disabled>{availableLogins.length === 0 ? "暂无可用用户" : "请选择登录用户"}</option>}{availableLogins.map((login) => <option key={login.id} value={login.id}>{login.username}</option>)}</select>{activeLogin && activeLogin.username !== "root" && <button type="button" role="switch" aria-checked={activeLogin.sudoEnabled} aria-label={`${activeLogin.username} 的 sudo 权限`} className={`sudo-switch ${activeLogin.sudoEnabled ? "on" : ""}`} title={activeLogin.sudoEnabled ? `点击禁止 ${activeLogin.username} 使用 sudo` : `点击允许 ${activeLogin.username} 使用 sudo`} disabled={updatingHostId !== null} onClick={() => void onToggleSudo(host, activeLogin)}>sudo<i aria-hidden="true" /></button>}</div><small>{host.hostname}:{host.port}</small></div></div></td>
+        <td className="host-status-cell"><div className="host-status-line"><Status value={host.enabled ? host.status : "DISABLED"} /><button className="host-test-button" title={host.enabled ? "测试 SSH 连接" : "主机已停用"} disabled={!host.enabled || testingHostId !== null || updatingHostId !== null} onClick={() => void onTest(host)}>{testingHostId === host.id ? "测试中…" : "测试"}</button></div>{testResults[host.id] && <small className={`test-result ${testResults[host.id]!.kind}`}>{testResults[host.id]!.text}</small>}</td><td><span className={host.enabled && host.aiAccessEnabled ? "badge allow" : "badge"}>{!host.enabled ? "主机停用" : host.aiAccessEnabled ? "已开放" : "未开放"}</span></td>
+        <td className="host-policy-cell"><select className="host-inline-select" title="切换该主机的权限策略" aria-label={`${host.name} 权限策略`} value={host.policyId ?? ""} disabled={updatingHostId !== null} onChange={(event) => void onChangePolicy(host, event.target.value)}><option value="">未配置</option>{orderPolicies(policies).map((policy) => <option key={policy.id} value={policy.id}>{policy.name}</option>)}</select></td>
+        <td className="actions"><button disabled={!host.enabled} title={host.enabled ? "打开交互终端" : "主机已停用"} onClick={() => onOpenTerminal(host.id)}>终端</button><button onClick={() => onMonitor(host.id)}>指令记录</button><button className={host.enabled ? "danger-link" : ""} disabled={testingHostId !== null || updatingHostId !== null} onClick={() => void onToggleHost(host)}>{updatingHostId === host.id ? "处理中…" : host.enabled ? "停用" : "启用"}</button><button disabled={testingHostId === host.id || updatingHostId === host.id} onClick={() => onEdit(host)}>编辑</button><button className="danger-link" disabled={testingHostId === host.id || updatingHostId === host.id} onClick={() => onDelete(host)}>删除</button></td>
+      </tr>;
+    })}
   </>;
 }
 
@@ -259,8 +343,8 @@ function HostMonitorPage({ host, credential, onBack, onHostChanged, notify }: { 
   }, [history, events]);
 
   return <section className="monitor-page">
-    <PageHeader eyebrow="Live session monitor" title={host.name}>
-      <div className="header-actions"><span className={`monitor-state ${connection.toLowerCase()}`}><i />{connection === "LIVE" ? "实时连接" : connection === "CONNECTING" ? "正在连接" : "正在重连"}</span><button onClick={() => { setHistory([]); setEvents([]); }}>清空屏幕</button><button onClick={onBack}>返回主机</button></div>
+    <PageHeader breadcrumb={<Breadcrumb parentLabel="主机" current="指令记录" onBack={onBack} />} title={host.name}>
+      <div className="header-actions"><span className={`monitor-state ${connection.toLowerCase()}`}><i />{connection === "LIVE" ? "实时连接" : connection === "CONNECTING" ? "正在连接" : "正在重连"}</span><button onClick={() => { setHistory([]); setEvents([]); }}>清空屏幕</button></div>
     </PageHeader>
     <div className="monitor-summary">
       <div><span>远程节点</span><code>{host.username}@{host.hostname}:{host.port}</code></div>
@@ -339,7 +423,8 @@ function credentialTypeLabel(type: Credential["type"]): string {
 
 function credentialSummary(credential: Credential): string {
   const detail = credential.type === "PRIVATE_KEY" ? credential.metadata.privateKeyPath : credential.type === "SSH_AGENT" ? credential.metadata.agentSocket || "SSH_AUTH_SOCK" : "已保存在本地加密保险库";
-  return `主机专属 · ${detail ?? "已配置"}`;
+  const sudo = credential.sudoMode === "LOGIN_PASSWORD" ? "sudo 复用登录密码" : credential.sudoMode === "CUSTOM_PASSWORD" ? "已配置独立 sudo 密码" : "未配置 sudo 验证";
+  return `主机专属 · ${detail ?? "已配置"} · ${sudo}`;
 }
 
 function HistoricalTerminalEntry({ log }: { log: AuditLog }) {
@@ -361,21 +446,27 @@ function LiveTerminalEntry({ event }: { event: HostMonitorEvent }) {
 
 function terminalTime(value: string): string { return new Date(value).toLocaleTimeString([], { hour12: false }); }
 function terminalStatusClass(status?: string): string { return status === "SUCCEEDED" ? "success" : ["FAILED", "DENIED", "TIMED_OUT"].includes(status ?? "") ? "failure" : "muted"; }
-function operationLabel(value: string): string { return ({ EXECUTE_COMMAND: "执行命令", TEST_HOST: "连接测试", UPLOAD_FILE: "上传文件", DOWNLOAD_FILE: "下载文件", REVEAL_CREDENTIAL: "查看认证信息" } as Record<string, string>)[value] ?? value; }
+function operationLabel(value: string): string { return ({ EXECUTE_COMMAND: "执行命令", TEST_HOST: "连接测试", UPLOAD_FILE: "上传文件", DOWNLOAD_FILE: "下载文件", REVEAL_CREDENTIAL: "查看认证信息", TERMINAL_SESSION: "交互终端" } as Record<string, string>)[value] ?? value; }
 function statusText(status: string, value: Pick<AuditLog, "exitCode" | "durationMs" | "bytesTransferred" | "errorCode" | "errorMessage"> | HostMonitorEvent): string {
   const labels: Record<string, string> = { RECEIVED: "已接收", EXECUTING: "远端执行中", SUCCEEDED: "执行完成", DENIED: "策略拒绝", FAILED: "执行失败", TIMED_OUT: "执行超时", INTERRUPTED: "执行中断" };
   const details = [value.exitCode != null ? `退出码 ${value.exitCode}` : null, value.durationMs != null ? `${value.durationMs} ms` : null, value.bytesTransferred != null ? `${value.bytesTransferred} bytes` : null, value.errorCode ?? null, value.errorMessage ?? null].filter(Boolean);
   return `${labels[status] ?? status}${details.length ? ` · ${details.join(" · ")}` : ""}`;
 }
 
-function HostDialog({ host, credentials, policies, groupNames, onClose, onSaved }: { host: Host | null; credentials: Credential[]; policies: Policy[]; groupNames: string[]; onClose(): void; onSaved(): Promise<void> }) {
+function HostDialog({ host, credentials, policies, groupNames, onAccountsChanged, onClose, onSaved }: { host: Host | null; credentials: Credential[]; policies: Policy[]; groupNames: string[]; onAccountsChanged(): Promise<void>; onClose(): void; onSaved(saved: Host, created: boolean): Promise<void> }) {
   const currentCredential = host?.credentialId ? credentials.find((credential) => credential.id === host.credentialId) : undefined;
   const recommendedPolicyId = policies.find((policy) => policy.name === DEFAULT_POLICY_TEMPLATE.name)?.id ?? "";
   const [authMode, setAuthMode] = useState<"PASSWORD" | "PRIVATE_KEY" | "SSH_AGENT">(currentCredential?.type ?? "PASSWORD");
+  const [sudoMode, setSudoMode] = useState<"NONE" | "LOGIN_PASSWORD" | "CUSTOM_PASSWORD">(currentCredential?.sudoMode ?? "NONE");
+  const [sudoEnabled, setSudoEnabled] = useState(false);
+  const [newUsername, setNewUsername] = useState("root");
   const [busy, setBusy] = useState(false);
+  const [loginEditorActive, setLoginEditorActive] = useState(false);
   const [errorText, setErrorText] = useState("");
   async function submit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault(); setBusy(true); setErrorText("");
+    event.preventDefault();
+    if (loginEditorActive) { setErrorText("正在编辑登录用户，请先保存或取消用户编辑，再保存主机。"); return; }
+    setBusy(true); setErrorText("");
     const data = new FormData(event.currentTarget);
     const name = String(data.get("name") ?? "");
     const secret = String(data.get("secret") ?? "");
@@ -385,33 +476,50 @@ function HostDialog({ host, credentials, policies, groupNames, onClose, onSaved 
       name: `${name} 登录凭据`,
       type: authMode,
       ...(secret ? { secret } : {}),
+      sudoMode,
+      ...(data.get("sudoSecret") ? { sudoSecret: data.get("sudoSecret") } : {}),
       metadata: {
         ...(authMode === "PRIVATE_KEY" ? { privateKeyPath: data.get("privateKeyPath") } : {}),
         ...(authMode === "SSH_AGENT" && data.get("agentSocket") ? { agentSocket: data.get("agentSocket") } : {})
       }
     };
     const payload = {
-      name, hostname: data.get("hostname"), port: Number(data.get("port")), username: data.get("username"), credential,
+      name, hostname: data.get("hostname"), port: Number(data.get("port")),
+      ...(!host ? { username: data.get("username"), credential, sudoEnabled } : {}),
       policyId: data.get("policyId") || null, groupName: data.get("groupName") || null,
       tags: String(data.get("tags") ?? "").split(",").map(v => v.trim()).filter(Boolean), defaultDirectory: data.get("defaultDirectory") || null,
       enabled: data.get("enabled") === "on", aiAccessEnabled: data.get("aiAccessEnabled") === "on"
     };
-    try { host ? await patch(`/v1/hosts/${host.id}`, payload) : await post("/v1/hosts", payload); await onSaved(); }
+    try {
+      const saved = host ? await patch<Host>(`/v1/hosts/${host.id}`, payload) : await post<Host>("/v1/hosts", payload);
+      await onSaved(saved, !host);
+    }
     catch (error) { setErrorText(message(error)); }
     finally { setBusy(false); }
   }
-  return <Modal title={host ? "编辑主机" : "添加主机"} onClose={onClose}><form onSubmit={submit} className="form-grid">
+  function requestClose() {
+    if (busy) return;
+    if (loginEditorActive && !window.confirm("登录用户还在编辑中，关闭后未保存的修改会丢失。确定关闭吗？")) return;
+    onClose();
+  }
+  return <Modal title={host ? "编辑主机" : "添加主机"} onClose={requestClose}><div className="host-dialog-layout"><form id="host-settings-form" onSubmit={submit} className="form-grid">
     <label>显示名称<input name="name" required defaultValue={host?.name} /></label><label>分组<input name="groupName" list="host-group-options" defaultValue={host?.groupName ?? ""} placeholder="选择已有分组或输入新分组" /><datalist id="host-group-options">{groupNames.map((groupName) => <option key={groupName} value={groupName} />)}</datalist></label>
     <label className="span-2">主机地址<input name="hostname" required defaultValue={host?.hostname} placeholder="server.example.com" /></label>
-    <label>端口<input name="port" type="number" min="1" max="65535" required defaultValue={host?.port ?? 22} /></label><label>用户名<input name="username" required defaultValue={host?.username} /></label>
-    <div className="span-2 auth-section">
-      <div className="auth-section-head"><div><strong>认证方式</strong><small>认证信息只属于当前主机，并保存在本地加密保险库。</small></div><select aria-label="认证方式" value={authMode} onChange={event => setAuthMode(event.target.value as typeof authMode)}><option value="PASSWORD">密码</option><option value="PRIVATE_KEY">私钥</option><option value="SSH_AGENT">SSH Agent</option></select></div>
+    <label>端口<input name="port" type="number" min="1" max="65535" required defaultValue={host?.port ?? 22} /></label>{!host && <label>用户名<input name="username" required value={newUsername} onChange={(event) => setNewUsername(event.target.value)} /></label>}
+    {!host && <><div className="span-2 auth-section">
+      <div className="auth-section-head"><div><strong>认证方式</strong><small>认证信息只属于当前主机，并保存在本地加密保险库。</small></div><select aria-label="认证方式" value={authMode} onChange={event => { const next = event.target.value as typeof authMode; setAuthMode(next); if (next !== "PASSWORD" && sudoMode === "LOGIN_PASSWORD") setSudoMode("NONE"); }}><option value="PASSWORD">密码</option><option value="PRIVATE_KEY">私钥</option><option value="SSH_AGENT">SSH Agent</option></select></div>
       <div className="auth-fields">
         {authMode === "PRIVATE_KEY" && <label>私钥路径<input name="privateKeyPath" required defaultValue={currentCredential?.type === "PRIVATE_KEY" ? currentCredential.metadata.privateKeyPath : ""} placeholder="~/.ssh/id_ed25519" /></label>}
         {authMode === "SSH_AGENT" && <label>Agent Socket（留空使用 SSH_AUTH_SOCK）<input name="agentSocket" defaultValue={currentCredential?.type === "SSH_AGENT" ? currentCredential.metadata.agentSocket : ""} /></label>}
         {authMode !== "SSH_AGENT" && <label>{authMode === "PASSWORD" ? "登录密码" : "私钥口令（可选）"}<input name="secret" type="password" required={authMode === "PASSWORD" && !(currentCredential?.type === "PASSWORD" && currentCredential.hasSecret)} autoComplete="new-password" placeholder={currentCredential?.type === authMode && currentCredential.hasSecret ? "留空表示保持不变" : ""} /></label>}
       </div>
     </div>
+    {newUsername.trim() !== "root" && <div className="span-2 auth-section sudo-auth-section">
+      <label className="check"><input type="checkbox" checked={sudoEnabled} onChange={(event) => { setSudoEnabled(event.target.checked); if (!event.target.checked) setSudoMode("NONE"); else if (authMode === "PASSWORD") setSudoMode("LOGIN_PASSWORD"); }} />允许该非 root 用户执行 sudo</label>
+      <div className="auth-section-head"><div><strong>sudo 验证</strong><small>AI 只发送 sudo 命令，Hoplane 在远端提示时安全写入密码，密码不会返回给 AI。</small></div><select aria-label="sudo 验证方式" value={sudoMode} onChange={event => setSudoMode(event.target.value as typeof sudoMode)}><option value="NONE">不提供密码（仅 NOPASSWD）</option>{authMode === "PASSWORD" && <option value="LOGIN_PASSWORD">复用登录密码</option>}<option value="CUSTOM_PASSWORD">使用独立 sudo 密码</option></select></div>
+      {sudoMode === "CUSTOM_PASSWORD" && <div className="auth-fields"><label>sudo 密码<input name="sudoSecret" type="password" required={!(currentCredential?.sudoMode === "CUSTOM_PASSWORD" && currentCredential.hasSudoSecret)} autoComplete="new-password" placeholder={currentCredential?.sudoMode === "CUSTOM_PASSWORD" && currentCredential.hasSudoSecret ? "留空表示保持不变" : "输入远端用户的 sudo 密码"} /></label></div>}
+      <p className="form-hint">仅处理以 <code>sudo</code> 开头的非交互命令。未配置密码时 Hoplane 使用 <code>sudo -n</code>，避免等待输入；主机策略仍需允许该 sudo 命令。</p>
+    </div>}</>}
     <label>权限策略<select name="policyId" defaultValue={host?.policyId ?? recommendedPolicyId}><option value="">请选择</option>{orderPolicies(policies).map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</select><span className="field-recommendation">新主机默认推荐“{DEFAULT_POLICY_TEMPLATE.name}”</span></label>
     <label className="span-2">默认工作目录<input name="defaultDirectory" defaultValue={host?.defaultDirectory ?? ""} placeholder="/opt/app" /></label>
     <label className="span-2">标签<input name="tags" defaultValue={host?.tags.join(", ")} placeholder="production, api" /></label>
@@ -419,8 +527,101 @@ function HostDialog({ host, credentials, policies, groupNames, onClose, onSaved 
     <label className="check"><input name="aiAccessEnabled" type="checkbox" defaultChecked={host?.aiAccessEnabled ?? false} />允许 AI 访问</label>
     <p className="form-hint span-2">AI 和 MCP 只会收到主机 ID，不会得到密码、私钥、口令或保险库内容。</p>
     {errorText && <div className="form-error span-2" role="alert">{errorText}</div>}
-    <div className="form-actions span-2"><button type="button" onClick={onClose} disabled={busy}>取消</button><button className="primary" disabled={busy}>{busy ? "保存中…" : "保存"}</button></div>
-  </form></Modal>;
+  </form>{host && <HostLoginsEditor host={host} onChanged={onAccountsChanged} onEditingChange={setLoginEditorActive} />}
+    <div className="form-actions host-dialog-actions"><button type="button" onClick={requestClose} disabled={busy}>取消</button><button type="submit" form="host-settings-form" className="primary" disabled={busy || loginEditorActive}>{busy ? "保存中…" : loginEditorActive ? "请先保存或取消用户编辑" : "保存主机"}</button></div>
+  </div></Modal>;
+}
+
+function HostLoginsEditor({ host, onChanged, onEditingChange }: { host: Host; onChanged(): Promise<void>; onEditingChange(editing: boolean): void }) {
+  const [logins, setLogins] = useState<HostLogin[]>([]);
+  const [credentials, setCredentials] = useState<Credential[]>([]);
+  const [editing, setEditing] = useState<HostLogin | "new" | null>(null);
+  const [errorText, setErrorText] = useState("");
+  const load = useCallback(async () => {
+    const [items, allCredentials] = await Promise.all([
+      api<HostLogin[]>(`/v1/hosts/${host.id}/logins`),
+      api<Credential[]>("/v1/credentials")
+    ]);
+    setLogins(items); setCredentials(allCredentials);
+  }, [host.id]);
+  useEffect(() => { void load().catch((error) => setErrorText(message(error))); }, [load]);
+  useEffect(() => { onEditingChange(editing !== null); }, [editing, onEditingChange]);
+  async function changed() {
+    await Promise.all([load(), onChanged()]);
+  }
+  async function activate(login: HostLogin) {
+    try {
+      await post(`/v1/hosts/${host.id}/logins/${login.id}/activate`);
+      await changed();
+    } catch (error) { setErrorText(message(error)); }
+  }
+  async function deleteLogin(login: HostLogin) {
+    if (!window.confirm(`删除用户“${login.username}”及其专属认证信息？`)) return;
+    try {
+      await remove(`/v1/hosts/${host.id}/logins/${login.id}`);
+      await changed();
+    } catch (error) { setErrorText(message(error)); }
+  }
+  return <section className="host-logins-editor">
+    <header><div><strong>登录用户</strong><small>切换后的用户是 AI 唯一可用的 SSH 身份；每套密码独立保存在本地加密保险库。</small></div><button type="button" onClick={() => setEditing("new")}>添加用户</button></header>
+    <div className="host-login-list">{logins.map((login) => <div key={login.id} className={login.active ? "active" : ""}>
+      <div className="host-login-avatar">{login.username.slice(0, 1).toUpperCase()}</div>
+      <div><strong>{login.username}</strong><small>{login.active ? "当前 AI 身份" : "备用身份"}{login.username !== "root" ? login.sudoEnabled ? " · 已允许 sudo" : " · 禁止 sudo" : " · root"}</small></div>
+      <div className="host-login-actions">{!login.active && <button type="button" onClick={() => void activate(login)}>切换到此用户</button>}<button type="button" onClick={() => setEditing(login)}>编辑</button>{!login.active && <button type="button" className="danger-link" onClick={() => void deleteLogin(login)}>删除</button>}</div>
+    </div>)}</div>
+    {editing && <HostLoginForm host={host} login={editing === "new" ? null : editing} credential={editing === "new" || !editing.credentialId ? undefined : credentials.find((item) => item.id === editing.credentialId)} onCancel={() => setEditing(null)} onSaved={async () => { setEditing(null); await changed(); }} />}
+    {errorText && <div className="form-error" role="alert">{errorText}</div>}
+  </section>;
+}
+
+function HostLoginForm({ host, login, credential, onCancel, onSaved }: { host: Host; login: HostLogin | null; credential?: Credential; onCancel(): void; onSaved(): Promise<void> }) {
+  const [authMode, setAuthMode] = useState<Credential["type"]>(credential?.type ?? "PASSWORD");
+  const [sudoEnabled, setSudoEnabled] = useState(login?.sudoEnabled ?? false);
+  const [sudoMode, setSudoMode] = useState<Credential["sudoMode"]>(credential?.sudoMode ?? "LOGIN_PASSWORD");
+  const [username, setUsername] = useState(login?.username ?? "");
+  const [busy, setBusy] = useState(false);
+  const [errorText, setErrorText] = useState("");
+  const root = username.trim() === "root";
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setErrorText("");
+    const data = new FormData(event.currentTarget);
+    const secret = String(data.get("secret") ?? "");
+    const effectiveSudoEnabled = root ? true : sudoEnabled;
+    const effectiveSudoMode = root || !effectiveSudoEnabled ? "NONE" : sudoMode;
+    const payload = {
+      username,
+      sudoEnabled: effectiveSudoEnabled,
+      credential: {
+        mode: "INLINE",
+        ...(credential ? { credentialId: credential.id } : {}),
+        name: `${host.name} ${username} 登录凭据`,
+        type: authMode,
+        ...(secret ? { secret } : {}),
+        sudoMode: effectiveSudoMode,
+        ...(data.get("sudoSecret") ? { sudoSecret: data.get("sudoSecret") } : {}),
+        metadata: {
+          ...(authMode === "PRIVATE_KEY" ? { privateKeyPath: data.get("privateKeyPath") } : {}),
+          ...(authMode === "SSH_AGENT" && data.get("agentSocket") ? { agentSocket: data.get("agentSocket") } : {})
+        }
+      }
+    };
+    try {
+      if (login) await patch(`/v1/hosts/${host.id}/logins/${login.id}`, payload);
+      else await post(`/v1/hosts/${host.id}/logins`, payload);
+      await onSaved();
+    } catch (error) { setErrorText(message(error)); }
+    finally { setBusy(false); }
+  }
+  return <form onSubmit={submit} className="host-login-form">
+    <div className="host-login-form-head"><strong>{login ? `编辑 ${login.username}` : "添加登录用户"}</strong><button type="button" onClick={onCancel}>取消</button></div>
+    <div className="host-login-fields"><label>用户名<input required value={username} onChange={(event) => setUsername(event.target.value)} /></label><label>认证方式<select value={authMode} onChange={(event) => { const next = event.target.value as Credential["type"]; setAuthMode(next); if (next !== "PASSWORD" && sudoMode === "LOGIN_PASSWORD") setSudoMode("CUSTOM_PASSWORD"); }}><option value="PASSWORD">密码</option><option value="PRIVATE_KEY">私钥</option><option value="SSH_AGENT">SSH Agent</option></select></label></div>
+    {authMode === "PRIVATE_KEY" && <label>私钥路径<input name="privateKeyPath" required defaultValue={credential?.type === "PRIVATE_KEY" ? credential.metadata.privateKeyPath : ""} placeholder="~/.ssh/id_ed25519" /></label>}
+    {authMode === "SSH_AGENT" && <label>Agent Socket（留空使用 SSH_AUTH_SOCK）<input name="agentSocket" defaultValue={credential?.type === "SSH_AGENT" ? credential.metadata.agentSocket : ""} /></label>}
+    {authMode !== "SSH_AGENT" && <label>{authMode === "PASSWORD" ? "登录密码" : "私钥口令（可选）"}<input name="secret" type="password" required={authMode === "PASSWORD" && !(credential?.type === "PASSWORD" && credential.hasSecret)} autoComplete="new-password" placeholder={credential?.type === authMode && credential.hasSecret ? "留空表示保持不变" : ""} /></label>}
+    {!root && <div className="host-login-sudo"><label className="check"><input type="checkbox" checked={sudoEnabled} onChange={(event) => setSudoEnabled(event.target.checked)} />允许 AI 使用 sudo</label>{sudoEnabled && <><label>sudo 验证方式<select value={sudoMode} onChange={(event) => setSudoMode(event.target.value as Credential["sudoMode"])}><option value="NONE">仅允许 NOPASSWD</option>{authMode === "PASSWORD" && <option value="LOGIN_PASSWORD">复用登录密码</option>}<option value="CUSTOM_PASSWORD">独立 sudo 密码</option></select></label>{sudoMode === "CUSTOM_PASSWORD" && <label>sudo 密码<input name="sudoSecret" type="password" required={!(credential?.sudoMode === "CUSTOM_PASSWORD" && credential.hasSudoSecret)} placeholder={credential?.hasSudoSecret ? "留空表示保持不变" : ""} /></label>}</>}</div>}
+    {errorText && <div className="form-error" role="alert">{errorText}</div>}
+    <div className="form-actions"><button type="button" onClick={onCancel} disabled={busy}>取消</button><button className="primary" disabled={busy}>{busy ? "保存中…" : "保存用户"}</button></div>
+  </form>;
 }
 
 function PoliciesPage({ notify }: { notify: Notify }) {
@@ -639,8 +840,8 @@ function AuditPage({ notify }: { notify: Notify }) {
   const [items, setItems] = useState<AuditLog[]>([]); const [status, setStatus] = useState("");
   const load = useCallback(async () => { try { setItems(await api(`/v1/audit-logs?limit=200${status ? `&status=${status}` : ""}`)); } catch(e) { notify("error", message(e)); } }, [notify, status]);
   useEffect(() => { void load(); const timer = setInterval(() => void load(), 5000); return () => clearInterval(timer); }, [load]);
-  return <section><PageHeader eyebrow="Traceability" title="操作审计"><select className="filter" value={status} onChange={e => setStatus(e.target.value)}><option value="">全部结果</option><option>SUCCEEDED</option><option>DENIED</option><option>FAILED</option><option>TIMED_OUT</option></select></PageHeader>
-    <div className="panel table-panel"><table><thead><tr><th>时间</th><th>来源</th><th>主机 / 操作</th><th>请求摘要</th><th>策略</th><th>结果</th><th>耗时</th></tr></thead><tbody>{items.map(log => <tr key={log.id}><td>{new Date(log.createdAt).toLocaleString()}</td><td>{log.clientType}</td><td><strong>{log.hostNameSnapshot ?? "—"}</strong><small>{log.operationType}</small></td><td className="summary">{log.requestSummary ?? "—"}</td><td>{log.policyDecision ?? "—"}</td><td><Status value={log.status} detail={log.errorCode} /></td><td>{log.durationMs == null ? "—" : `${log.durationMs} ms`}</td></tr>)}</tbody></table>{items.length === 0 && <Empty text="暂无操作记录。拒绝和失败的请求也会显示在这里。" />}</div>
+  return <section><PageHeader eyebrow="Traceability" title="操作审计"><select className="filter" aria-label="筛选审计结果" value={status} onChange={e => setStatus(e.target.value)}><option value="">全部结果</option><option>SUCCEEDED</option><option>DENIED</option><option>FAILED</option><option>TIMED_OUT</option></select></PageHeader>
+    <div className="panel table-panel audit-table-panel"><table><thead><tr><th>时间</th><th>来源</th><th>主机 / 操作</th><th>请求摘要</th><th>策略</th><th>结果</th><th>耗时</th></tr></thead><tbody>{items.map(log => <tr key={log.id}><td>{new Date(log.createdAt).toLocaleString()}</td><td>{log.clientType}</td><td><strong>{log.hostNameSnapshot ?? "—"}</strong><small>{log.operationType}</small></td><td className="summary">{log.requestSummary ?? "—"}</td><td>{log.policyDecision ?? "—"}</td><td><Status value={log.status} detail={log.errorCode} /></td><td>{log.durationMs == null ? "—" : `${log.durationMs} ms`}</td></tr>)}</tbody></table>{items.length === 0 && <Empty text="暂无操作记录。拒绝和失败的请求也会显示在这里。" />}</div>
   </section>;
 }
 
@@ -657,11 +858,11 @@ interface CodexHomeCandidate {
 }
 interface CodexDiagnostic { ok: boolean; toolNames: string[]; checks: Array<{ name: string; ok: boolean; detail: string }> }
 interface JsonAgentIntegrationState {
-  agent: "cursor" | "claude-code"; installed: boolean; skillInstalled: boolean; mcpConfigured: boolean; restartRequired: boolean;
+  agent: JsonAgentChannel; installed: boolean; skillInstalled: boolean; mcpConfigured: boolean; restartRequired: boolean;
   configDirectory: string; agentHome: string; skillPath: string; configPath: string; runtimeCommand: string; configSnippet: string;
   canInstall: boolean; configError: string | null; candidates: CodexHomeCandidate[];
 }
-interface AgentIntegrationsState { cursor: JsonAgentIntegrationState; claudeCode: JsonAgentIntegrationState }
+interface AgentIntegrationsState { cursor: JsonAgentIntegrationState; claudeCode: JsonAgentIntegrationState; workbuddy: JsonAgentIntegrationState }
 
 function VaultGate({ state, notify, onReady }: { state: VaultState; notify: Notify; onReady(state: VaultState): void }) {
   const [busy, setBusy] = useState(false);
@@ -694,13 +895,13 @@ function SettingsPage({ notify, vaultState, onVaultChanged }: { notify: Notify; 
   const [integrationBusy, setIntegrationBusy] = useState(false);
   const [showToken, setShowToken] = useState(false);
   const [manualCodexHome, setManualCodexHome] = useState("");
-  const [manualAgentDirectories, setManualAgentDirectories] = useState<Record<"cursor" | "claude-code", string>>({ cursor: "", "claude-code": "" });
+  const [manualAgentDirectories, setManualAgentDirectories] = useState<Record<JsonAgentChannel, string>>({ cursor: "", "claude-code": "", workbuddy: "" });
   const [integrationChannel, setIntegrationChannel] = useState<IntegrationChannel>("codex");
   const load = useCallback(async () => {
     try {
       const [mcpState, codexState, agentStates] = await Promise.all([api<McpSettings>("/v1/mcp-settings"), api<CodexIntegrationState>("/v1/codex-integration"), api<AgentIntegrationsState>("/v1/agent-integrations")]);
       setSettings(mcpState); setCodex(codexState); setAgentIntegrations(agentStates); setManualCodexHome(codexState.codexHome);
-      setManualAgentDirectories({ cursor: agentStates.cursor.configDirectory, "claude-code": agentStates.claudeCode.configDirectory });
+      setManualAgentDirectories({ cursor: agentStates.cursor.configDirectory, "claude-code": agentStates.claudeCode.configDirectory, workbuddy: agentStates.workbuddy.configDirectory });
     }
     catch (error) { notify("error", message(error)); }
   }, [notify]);
@@ -756,7 +957,7 @@ function SettingsPage({ notify, vaultState, onVaultChanged }: { notify: Notify; 
     try {
       const next = await post<CodexIntegrationState>("/v1/codex-integration/install", {});
       setCodex(next);
-      notify("ok", "Codex Skill 与 stdio MCP 已安装，请重启 Codex");
+      notify("ok", "Codex Skill 与 stdio MCP 已安装，请完全退出并重启 Codex 客户端后生效");
     } catch (error) { notify("error", `Codex 集成安装失败：${message(error)}`); }
     finally { setIntegrationBusy(false); }
   }
@@ -794,24 +995,25 @@ function SettingsPage({ notify, vaultState, onVaultChanged }: { notify: Notify; 
     finally { setIntegrationBusy(false); }
   }
 
-  async function installJsonAgent(agent: "cursor" | "claude-code") {
+  async function installJsonAgent(agent: JsonAgentChannel) {
     if (integrationBusy) return;
+    const name = JSON_AGENT_NAMES[agent];
     setIntegrationBusy(true);
     try {
       const next = await post<JsonAgentIntegrationState>(`/v1/agent-integrations/${agent}/install`, {});
-      setAgentIntegrations(current => current ? { ...current, [agent === "cursor" ? "cursor" : "claudeCode"]: next } : current);
-      notify("ok", `${agent === "cursor" ? "Cursor" : "Claude Code"} Skill 与 stdio MCP 已安装，请重新加载客户端`);
+      setAgentIntegrations(current => current ? { ...current, [agentStateKey(agent)]: next } : current);
+      notify("ok", `${name} Skill 与 stdio MCP 已安装，请完全退出并重启 ${name} 客户端后生效`);
     } catch (error) { notify("error", `一键集成失败：${message(error)}`); }
     finally { setIntegrationBusy(false); }
   }
 
-  async function selectJsonAgentDirectory(agent: "cursor" | "claude-code", path: string) {
+  async function selectJsonAgentDirectory(agent: JsonAgentChannel, path: string) {
     if (integrationBusy) return;
-    const name = agent === "cursor" ? "Cursor" : "Claude Code";
+    const name = JSON_AGENT_NAMES[agent];
     setIntegrationBusy(true);
     try {
       const next = await post<JsonAgentIntegrationState>(`/v1/agent-integrations/${agent}/select`, { path });
-      setAgentIntegrations(current => current ? { ...current, [agent === "cursor" ? "cursor" : "claudeCode"]: next } : current);
+      setAgentIntegrations(current => current ? { ...current, [agentStateKey(agent)]: next } : current);
       setManualAgentDirectories(current => ({ ...current, [agent]: next.configDirectory }));
       notify("ok", `已选择 ${name} 配置目录：${next.configDirectory}`);
     } catch (error) { notify("error", `${name} 配置目录不可用：${message(error)}`); }
@@ -824,7 +1026,7 @@ function SettingsPage({ notify, vaultState, onVaultChanged }: { notify: Notify; 
     try {
       const next = await api<AgentIntegrationsState>("/v1/agent-integrations");
       setAgentIntegrations(next);
-      setManualAgentDirectories({ cursor: next.cursor.configDirectory, "claude-code": next.claudeCode.configDirectory });
+      setManualAgentDirectories({ cursor: next.cursor.configDirectory, "claude-code": next.claudeCode.configDirectory, workbuddy: next.workbuddy.configDirectory });
       notify("ok", "常见配置目录已重新扫描");
     } catch (error) { notify("error", `目录扫描失败：${message(error)}`); }
     finally { setIntegrationBusy(false); }
@@ -834,10 +1036,12 @@ function SettingsPage({ notify, vaultState, onVaultChanged }: { notify: Notify; 
     { id: "codex", label: "Codex", detail: "一键集成" },
     { id: "cursor", label: "Cursor", detail: "一键集成" },
     { id: "claude-code", label: "Claude Code", detail: "一键集成" },
+    { id: "workbuddy", label: "WorkBuddy", detail: "一键集成" },
     { id: "other", label: "其他 Agent", detail: "通用配置" }
   ];
 
-  const selectedAgentInstalled = integrationChannel === "cursor" ? agentIntegrations?.cursor.installed : integrationChannel === "claude-code" ? agentIntegrations?.claudeCode.installed : false;
+  const jsonChannel: JsonAgentChannel | null = integrationChannel === "cursor" || integrationChannel === "claude-code" || integrationChannel === "workbuddy" ? integrationChannel : null;
+  const selectedAgentInstalled = jsonChannel ? agentIntegrations?.[agentStateKey(jsonChannel)]?.installed ?? false : false;
 
   return <section><PageHeader eyebrow="Integrations" title="Agent 接入">
     <span className={`service-state ${(integrationChannel === "codex" ? codex?.installed : integrationChannel === "other" ? settings?.enabled : selectedAgentInstalled) ? "on" : "off"}`}><i />{integrationChannel === "codex" ? codex?.installed ? "Codex 已配置" : "Codex 未配置" : integrationChannel === "other" ? settings?.enabled ? "本地 MCP 已开启" : "本地 MCP 未开启" : selectedAgentInstalled ? "一键集成已安装" : "一键集成未安装"}</span>
@@ -855,19 +1059,19 @@ function SettingsPage({ notify, vaultState, onVaultChanged }: { notify: Notify; 
       </div>
       <pre>{codex?.configSnippet ?? "正在读取 Codex 配置…"}</pre>
       <div className="config-actions"><button className="primary" disabled={!codex?.canInstall || integrationBusy} onClick={() => void installCodex()}>{integrationBusy ? "处理中…" : codex?.installed ? "重新安装 / 刷新路径" : "安装 Codex 集成"}</button><button disabled={!codex || integrationBusy} onClick={() => void diagnoseCodex()}>运行诊断</button><button disabled={!codex} onClick={() => codex && void copy(codex.configSnippet, "Codex 配置")}>复制配置</button></div>
-      {codex?.restartRequired && <div className="restart-notice">安装已完成。请完全退出并重新打开 Codex，使 Skill 和 MCP 配置生效。</div>}
+      {codex?.restartRequired && <div className="restart-notice">安装已完成。请完全退出 Codex 客户端（包括后台进程）并重新启动，新的 Skill 和 MCP 配置才会生效。</div>}
       {diagnostic && <div className="diagnostic-list">{diagnostic.checks.map(check => <div key={check.name} className={check.ok ? "ok" : "failed"}><i /> <strong>{check.name}</strong><span>{check.detail}</span></div>)}</div>}
       <p>安装位置：<code>{codex?.skillPath ?? "—"}</code>。如果移动或重新安装 Hoplane App，再点击一次“刷新路径”。</p>
     </article>}
-    {(integrationChannel === "cursor" || integrationChannel === "claude-code") && <AgentOneClickIntegration
-      channel={integrationChannel}
-      integration={integrationChannel === "cursor" ? agentIntegrations?.cursor ?? null : agentIntegrations?.claudeCode ?? null}
+    {jsonChannel && <AgentOneClickIntegration
+      channel={jsonChannel}
+      integration={agentIntegrations?.[agentStateKey(jsonChannel)] ?? null}
       busy={integrationBusy}
-      manualDirectory={manualAgentDirectories[integrationChannel]}
-      onInstall={() => void installJsonAgent(integrationChannel)}
+      manualDirectory={manualAgentDirectories[jsonChannel]}
+      onInstall={() => void installJsonAgent(jsonChannel)}
       onRefresh={() => void refreshJsonAgentDirectories()}
-      onSelect={(path) => void selectJsonAgentDirectory(integrationChannel, path)}
-      onManualDirectoryChange={(path) => setManualAgentDirectories(current => ({ ...current, [integrationChannel]: path }))}
+      onSelect={(path) => void selectJsonAgentDirectory(jsonChannel, path)}
+      onManualDirectoryChange={(path) => setManualAgentDirectories(current => ({ ...current, [jsonChannel]: path }))}
       onCopy={(value, label) => void copy(value, label)}
     />}
     {integrationChannel === "other" && <><div className="mcp-hero panel" id="integration-panel-other" role="tabpanel" aria-labelledby="integration-tab-other">
@@ -883,7 +1087,7 @@ function SettingsPage({ notify, vaultState, onVaultChanged }: { notify: Notify; 
 }
 
 function AgentOneClickIntegration({ channel, integration, busy, manualDirectory, onInstall, onRefresh, onSelect, onManualDirectoryChange, onCopy }: {
-  channel: "cursor" | "claude-code";
+  channel: JsonAgentChannel;
   integration: JsonAgentIntegrationState | null;
   busy: boolean;
   manualDirectory: string;
@@ -893,8 +1097,8 @@ function AgentOneClickIntegration({ channel, integration, busy, manualDirectory,
   onManualDirectoryChange(path: string): void;
   onCopy(value: string, label: string): void;
 }) {
-  const isCursor = channel === "cursor";
-  const name = isCursor ? "Cursor" : "Claude Code";
+  const name = JSON_AGENT_NAMES[channel];
+  const directoryPlaceholder = channel === "cursor" ? "/Users/name/.cursor" : channel === "workbuddy" ? "/Users/name/.workbuddy" : "/Users/name";
   return <article className="panel codex-integration agent-native-integration" id={`integration-panel-${channel}`} role="tabpanel" aria-labelledby={`integration-tab-${channel}`}>
     <div className="codex-integration-head"><div><span className="eyebrow">Recommended · stdio</span><h2>{name} 一键集成</h2><p>自动安装 Hoplane Skill，并把 App 内置 stdio MCP 写入 {name} 的用户级配置。不依赖系统 Node、本地 HTTP 服务或访问 Token。</p></div><span className={`badge integration-status-badge ${integration?.installed ? "allow" : ""}`}>{integration?.installed ? "已安装" : "未安装"}</span></div>
     <div className="codex-home-discovery">
@@ -902,19 +1106,27 @@ function AgentOneClickIntegration({ channel, integration, busy, manualDirectory,
       <div className="codex-home-list">{integration?.candidates.map((candidate) => <button type="button" key={candidate.path} className={candidate.selected ? "selected" : ""} disabled={busy || candidate.configStatus === "INVALID" || !candidate.writable} onClick={() => onSelect(candidate.path)}>
         <span className="codex-home-radio"><i /></span><span className="codex-home-info"><strong>{candidate.label}</strong><code>{candidate.path}</code><small>{candidate.configDetail}</small></span><span className="codex-home-badges"><em className={`config-${candidate.configStatus.toLowerCase()}`}>{candidate.configStatus === "VALID" ? "配置有效" : candidate.configStatus === "MISSING" ? "将新建配置" : "配置异常"}</em><em className={candidate.writable ? "writable" : "blocked"}>{candidate.writable ? "可写" : "不可写"}</em></span>
       </button>)}</div>
-      <form className="codex-home-manual" onSubmit={(event) => { event.preventDefault(); onSelect(manualDirectory); }}><label>手动选择目录<input value={manualDirectory} onChange={(event) => onManualDirectoryChange(event.target.value)} required maxLength={4096} placeholder={isCursor ? "/Users/name/.cursor" : "/Users/name"} /></label><button type="submit" disabled={busy || !manualDirectory.trim()}>使用此目录</button></form>
+      <form className="codex-home-manual" onSubmit={(event) => { event.preventDefault(); onSelect(manualDirectory); }}><label>手动选择目录<input value={manualDirectory} onChange={(event) => onManualDirectoryChange(event.target.value)} required maxLength={4096} placeholder={directoryPlaceholder} /></label><button type="submit" disabled={busy || !manualDirectory.trim()}>使用此目录</button></form>
     </div>
     <div className="agent-install-summary"><div><span>Skill 安装位置</span><code>{integration?.skillPath ?? "正在检测…"}</code></div><div><span>MCP 配置文件</span><code>{integration?.configPath ?? "正在检测…"}</code></div></div>
     {integration?.configError && <div className="form-error" role="alert">配置文件暂不可自动修改：{integration.configError}</div>}
     <pre>{integration?.configSnippet ?? "正在生成 stdio MCP 配置…"}</pre>
     <div className="config-actions"><button className="primary" disabled={!integration?.canInstall || busy} onClick={onInstall}>{busy ? "处理中…" : integration?.installed ? "重新安装 / 刷新路径" : `安装 ${name} 集成`}</button><button disabled={!integration} onClick={() => integration && onCopy(integration.configSnippet, `${name} MCP 配置`)}>复制配置</button></div>
-    {integration?.restartRequired && <div className="restart-notice">安装已完成。请重新加载或重新打开 {name}，使 Skill 和 MCP 配置生效。</div>}
+    {integration?.restartRequired && <div className="restart-notice">安装已完成。请完全退出 {name} 客户端（包括后台/托盘进程）并重新启动，新的 Skill 和 MCP 配置才会生效。</div>}
     <p>安装会保留现有配置，仅更新 <code>mcpServers.hoplane</code>；首次修改已有配置前会创建 <code>.hoplane-backup</code> 备份。</p>
   </article>;
 }
 
-function Modal({ title, onClose, children }: { title: string; onClose(): void; children: React.ReactNode }) { return <div className="modal-backdrop" onMouseDown={e => e.target === e.currentTarget && onClose()}><div className="modal"><div className="modal-head"><h2>{title}</h2><button onClick={onClose}>×</button></div>{children}</div></div>; }
-function Metric({ label, value }: { label: string; value: number }) { return <div className="metric"><span>{label}</span><strong>{String(value).padStart(2, "0")}</strong></div>; }
+function Modal({ title, onClose, children }: { title: string; onClose(): void; children: React.ReactNode }) {
+  const titleId = useId();
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+  return <div className="modal-backdrop" onMouseDown={e => e.target === e.currentTarget && onClose()}><div className="modal" role="dialog" aria-modal="true" aria-labelledby={titleId}><div className="modal-head"><h2 id={titleId}>{title}</h2><button type="button" aria-label="关闭" onClick={onClose}>×</button></div>{children}</div></div>;
+}
+function Metric({ label, value }: { label: string; value: number }) { return <div className="metric"><span>{label}</span><strong>{value}</strong></div>; }
 function Empty({ text }: { text: string }) { return <div className="empty">{text}</div>; }
 function Status({ value, detail }: { value: string; detail?: string | null }) { const good = value === "CONNECTED" || value === "SUCCEEDED"; const bad = ["FAILED", "DENIED", "TIMED_OUT", "AUTH_FAILED", "HOST_KEY_BLOCKED", "DISABLED"].includes(value); return <span className={`status ${good ? "good" : bad ? "bad" : "idle"}`}><i />{value === "DISABLED" ? "已停用" : value}{detail ? ` · ${detail}` : ""}</span>; }
 type Notify = (kind: "ok" | "error", text: string) => void;
@@ -925,6 +1137,10 @@ function friendlyConnectionError(error: unknown): string {
     CREDENTIAL_NOT_FOUND: "未绑定可用凭据",
     VAULT_LOCKED: "本地保险库已锁定",
     SSH_AUTH_FAILED: "SSH 认证失败，请检查用户名和凭据",
+    SSH_HOST_UNREACHABLE: "本机无法到达该服务器。请在系统设置中允许 Hoplane 访问本地网络，并检查当前网络或 VPN",
+    SSH_CONNECTION_REFUSED: "服务器拒绝了连接，请确认 SSH 服务已启动且端口填写正确",
+    SSH_CONNECTION_TIMEOUT: "连接服务器超时，请检查网络、防火墙和 SSH 端口",
+    SSH_HOST_NOT_FOUND: "无法解析主机地址，请检查域名或 DNS 配置",
     SSH_CONNECTION_FAILED: "无法连接服务器，请检查地址、端口和网络",
     SSH_HOST_KEY_UNTRUSTED: "需要确认服务器指纹",
     SSH_HOST_KEY_CHANGED: "服务器指纹已变化，连接被阻止",

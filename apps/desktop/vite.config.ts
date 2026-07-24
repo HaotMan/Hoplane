@@ -8,6 +8,14 @@ export default defineConfig({
   build: { outDir: "dist", emptyOutDir: true },
   server: {
     port: 5173,
-    proxy: { "/v1": { target: "http://127.0.0.1:21722", changeOrigin: true } }
+    proxy: {
+      "/v1": {
+        target: "http://127.0.0.1:21722",
+        changeOrigin: true,
+        ws: true,
+        // Core 通过 Origin 判定同源 UI 请求；开发模式下统一重写为 Core 地址。
+        headers: { origin: "http://127.0.0.1:21722" }
+      }
+    }
   }
 });

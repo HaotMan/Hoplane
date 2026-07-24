@@ -17,10 +17,17 @@ export const hostInputSchema = z.object({
 
 export const hostPatchSchema = hostInputSchema.partial();
 
+export const hostLoginInputSchema = z.object({
+  username: z.string().trim().min(1).max(128),
+  sudoEnabled: z.boolean().default(false)
+});
+
 export const credentialInputSchema = z.object({
   name: z.string().trim().min(1).max(120),
   type: z.enum(["PASSWORD", "PRIVATE_KEY", "SSH_AGENT"]),
   secret: z.string().max(16_384).optional(),
+  sudoMode: z.enum(["NONE", "LOGIN_PASSWORD", "CUSTOM_PASSWORD"]).default("NONE"),
+  sudoSecret: z.string().max(16_384).optional(),
   metadata: z.object({
     privateKeyPath: z.string().max(4096).optional(),
     agentSocket: z.string().max(4096).optional()
@@ -31,6 +38,12 @@ export const credentialInputSchema = z.object({
   }
   if (value.type === "PRIVATE_KEY" && !value.metadata.privateKeyPath) {
     context.addIssue({ code: z.ZodIssueCode.custom, path: ["metadata", "privateKeyPath"], message: "Private key path is required" });
+  }
+  if (value.sudoMode === "LOGIN_PASSWORD" && value.type !== "PASSWORD") {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["sudoMode"], message: "Login password can only be reused with password authentication" });
+  }
+  if (value.sudoMode === "CUSTOM_PASSWORD" && !value.sudoSecret) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["sudoSecret"], message: "Sudo password is required" });
   }
 });
 

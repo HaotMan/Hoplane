@@ -47,7 +47,7 @@ describe("host-owned credential flow", () => {
         method: "POST", headers: authorizedHeaders, body: JSON.stringify({
           name: "dev", hostname: "server.example.test", port: 22, username: "deploy",
           policyId: null, groupName: null, tags: [], defaultDirectory: null, enabled: true, aiAccessEnabled: true,
-          credential: { mode: "INLINE", name: "dev login", type: "PASSWORD", secret: "server-password", metadata: {} }
+          credential: { mode: "INLINE", name: "dev login", type: "PASSWORD", secret: "server-password", sudoMode: "CUSTOM_PASSWORD", sudoSecret: "sudo-password", metadata: {} }
         })
       });
       expect(createdResponse.status).toBe(201);
@@ -55,8 +55,10 @@ describe("host-owned credential flow", () => {
 
       const credentialsResponse = await fetch(`${runtime.url}/v1/credentials`, { headers: { authorization: `Bearer ${token}` } });
       const credentials = await credentialsResponse.json() as Array<Record<string, unknown>>;
-      expect(credentials).toMatchObject([{ id: host.credentialId, hasSecret: true }]);
+      expect(credentials).toMatchObject([{ id: host.credentialId, hasSecret: true, sudoMode: "CUSTOM_PASSWORD", hasSudoSecret: true }]);
       expect(credentials[0]).not.toHaveProperty("secretRef");
+      expect(credentials[0]).not.toHaveProperty("sudoSecretRef");
+      expect(await readFile(join(dataDir, "vault.enc"), "utf8")).not.toContain("sudo-password");
 
       const aiHostsBeforeDisable = await fetch(`${runtime.url}/v1/hosts?aiOnly=true`, { headers: { authorization: `Bearer ${token}` } });
       expect(await aiHostsBeforeDisable.json()).toMatchObject([{ id: host.id, enabled: true, aiAccessEnabled: true }]);
@@ -110,6 +112,43 @@ describe("host-owned credential flow", () => {
       });
       expect(keyReveal.status).toBe(200);
       expect(await keyReveal.json()).toMatchObject({ secret: "key-passphrase", privateKey: privateKeyContent });
+
+      const initialLoginsResponse = await fetch(`${runtime.url}/v1/hosts/${host.id}/logins`, {
+        headers: { authorization: `Bearer ${token}` }
+      });
+      const initialLogins = await initialLoginsResponse.json() as Array<{ id: string; username: string; active: boolean }>;
+      expect(initialLogins).toMatchObject([{ username: "deploy", active: true }]);
+      const backupLoginResponse = await fetch(`${runtime.url}/v1/hosts/${host.id}/logins`, {
+        method: "POST", headers: authorizedHeaders, body: JSON.stringify({
+          username: "observer", sudoEnabled: false,
+          credential: { mode: "INLINE", name: "observer login", type: "PASSWORD", secret: "observer-password", sudoMode: "NONE", metadata: {} }
+        })
+      });
+      expect(backupLoginResponse.status).toBe(201);
+      const backupLogin = await backupLoginResponse.json() as { id: string };
+      const activated = await fetch(`${runtime.url}/v1/hosts/${host.id}/logins/${backupLogin.id}/activate`, {
+        method: "POST", headers: authorizedHeaders
+      });
+      expect(activated.status).toBe(200);
+      expect(await activated.json()).toMatchObject({ username: "observer", activeLoginId: backupLogin.id });
+      const allLogins = await fetch(`${runtime.url}/v1/host-logins`, { headers: { authorization: `Bearer ${token}` } });
+      expect(await allLogins.json()).toEqual(expect.arrayContaining([
+        expect.objectContaining({ hostId: host.id, username: "deploy", active: false }),
+        expect.objectContaining({ hostId: host.id, username: "observer", sudoEnabled: false, active: true })
+      ]));
+      const policiesResponse = await fetch(`${runtime.url}/v1/policies`, { headers: { authorization: `Bearer ${token}` } });
+      const policies = await policiesResponse.json() as Array<{ id: string; name: string }>;
+      const fullAccessPolicy = policies.find((policy) => policy.name === "全权限（高风险）")!;
+      const assigned = await fetch(`${runtime.url}/v1/hosts/${host.id}`, {
+        method: "PATCH", headers: authorizedHeaders, body: JSON.stringify({ policyId: fullAccessPolicy.id })
+      });
+      expect(assigned.status).toBe(200);
+      const blockedSudo = await fetch(`${runtime.url}/v1/operations/execute`, {
+        method: "POST", headers: authorizedHeaders,
+        body: JSON.stringify({ hostId: host.id, command: "sudo systemctl restart demo", clientType: "MCP", clientId: "test-agent" })
+      });
+      expect(blockedSudo.status).toBe(403);
+      expect(await blockedSudo.json()).toMatchObject({ code: "SUDO_DISABLED", details: { username: "observer" } });
 
       const deleted = await fetch(`${runtime.url}/v1/hosts/${host.id}`, { method: "DELETE", headers: { authorization: `Bearer ${token}` } });
       expect(deleted.status).toBe(200);

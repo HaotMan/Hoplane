@@ -1,12 +1,13 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { timingSafeEqual, randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { readFile, stat, writeFile, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
-import { extname, join, normalize } from "node:path";
-import { pathToFileURL } from "node:url";
+import { dirname, extname, join, normalize, resolve as resolvePath } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { z, ZodError } from "zod";
 import {
-  AppError, asAppError, commandRequestSchema, credentialInputSchema, DEFAULT_POLICY_TEMPLATE, hostInputSchema, hostPatchSchema,
+  AppError, asAppError, commandRequestSchema, credentialInputSchema, DEFAULT_POLICY_TEMPLATE, hostInputSchema, hostLoginInputSchema, hostPatchSchema,
   policyInputSchema, transferRequestSchema
 } from "../../shared/src/index.js";
 import type { Credential, Host } from "../../shared/src/index.js";
@@ -21,6 +22,7 @@ import { McpServiceManager } from "./mcp-service.js";
 import { HostMonitor } from "./host-monitor.js";
 import { CodexIntegrationService, JsonAgentIntegrationService } from "./codex-integration.js";
 import { PolicySourceService } from "./policy-source.js";
+import { attachTerminalGateway } from "./terminal-service.js";
 
 const credentialBindingSchema = z.discriminatedUnion("mode", [
   z.object({ mode: z.literal("NONE") }),
@@ -30,6 +32,8 @@ const credentialBindingSchema = z.discriminatedUnion("mode", [
     name: z.string().trim().min(1).max(120),
     type: z.enum(["PASSWORD", "PRIVATE_KEY", "SSH_AGENT"]),
     secret: z.string().max(16_384).optional(),
+    sudoMode: z.enum(["NONE", "LOGIN_PASSWORD", "CUSTOM_PASSWORD"]).optional(),
+    sudoSecret: z.string().max(16_384).optional(),
     metadata: z.object({
       privateKeyPath: z.string().trim().max(4096).optional(),
       agentSocket: z.string().trim().max(4096).optional()
@@ -43,6 +47,24 @@ export interface CoreRuntime {
   url: string;
   server: Server;
   close(): Promise<void>;
+}
+
+/*
+ * Core 可能被三种方式启动：项目根目录下的 dev/CLI、编译产物 node dist/...、以及被
+ * MCP 适配器以任意 cwd 直接拉起（打包 app 内也是如此）。因此静态 UI 目录不能只依赖
+ * process.cwd()，还要按模块自身位置向上找。
+ */
+function resolveDefaultStaticRoot(): string {
+  const moduleDir = dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    join(process.cwd(), "apps", "desktop", "dist"),
+    resolvePath(moduleDir, "..", "..", "..", "apps", "desktop", "dist"),
+    resolvePath(moduleDir, "..", "..", "..", "..", "apps", "desktop", "dist")
+  ];
+  for (const candidate of candidates) {
+    if (existsSync(join(candidate, "index.html"))) return candidate;
+  }
+  return candidates[0]!;
 }
 
 export async function startCore(options: { staticRoot?: string; registerProcessSignals?: boolean } = {}): Promise<CoreRuntime> {
@@ -62,9 +84,12 @@ const savedCodexHome = database.getSetting<string | null>("codex.home", null);
 const codexIntegration = new CodexIntegrationService(savedCodexHome ? { codexHome: savedCodexHome } : {});
 const savedCursorDirectory = database.getSetting<string | null>("integration.cursor.directory", null);
 const savedClaudeCodeDirectory = database.getSetting<string | null>("integration.claude-code.directory", null);
+const savedWorkbuddyDirectory = database.getSetting<string | null>("integration.workbuddy.directory", null);
 const cursorIntegration = new JsonAgentIntegrationService("cursor", savedCursorDirectory ? { configDirectory: savedCursorDirectory } : {});
 const claudeCodeIntegration = new JsonAgentIntegrationService("claude-code", savedClaudeCodeDirectory ? { configDirectory: savedClaudeCodeDirectory } : {});
-const staticRoot = options.staticRoot ?? join(process.cwd(), "apps", "desktop", "dist");
+const workbuddyIntegration = new JsonAgentIntegrationService("workbuddy", savedWorkbuddyDirectory ? { configDirectory: savedWorkbuddyDirectory } : {});
+const jsonAgentIntegrations = { cursor: cursorIntegration, "claude-code": claudeCodeIntegration, workbuddy: workbuddyIntegration } as const;
+const staticRoot = options.staticRoot ?? resolveDefaultStaticRoot();
 
 const server = createServer(async (request, response) => {
   try {
@@ -88,6 +113,7 @@ const server = createServer(async (request, response) => {
 });
 
 server.on("clientError", (_error, socket) => socket.end("HTTP/1.1 400 Bad Request\r\n\r\n"));
+const terminalGateway = attachTerminalGateway(server, { database, ssh, isSameOriginUiRequest });
 await new Promise<void>((resolve, reject) => {
   server.once("error", reject);
   server.listen(config.port, config.host, resolve);
@@ -108,6 +134,7 @@ function shutdown(): Promise<void> {
 }
 
 async function performShutdown(): Promise<void> {
+  terminalGateway.closeAll();
   const closed = new Promise<void>((resolve) => server.close(() => resolve()));
   server.closeAllConnections();
   await closed;
@@ -118,16 +145,17 @@ async function performShutdown(): Promise<void> {
   await unlink(config.pidPath).catch(() => undefined);
 }
 
-async function prepareCredentialBinding(host: Host | null, binding: CredentialBinding, hostName: string): Promise<{ credentialId: string | null; createdCredentialId: string | null }> {
+async function prepareCredentialBinding(host: Host | null, binding: CredentialBinding, hostName: string, editableCredentialId = host?.credentialId ?? null): Promise<{ credentialId: string | null; createdCredentialId: string | null }> {
   if (binding.mode === "NONE") return { credentialId: null, createdCredentialId: null };
 
   const current = binding.credentialId ? database.getCredential(binding.credentialId) : null;
-  const belongsToHost = Boolean(host && current && current.id === host.credentialId);
+  const belongsToHost = Boolean(host && current && current.id === editableCredentialId && database.hostOwnsCredential(host.id, current.id));
   if (binding.credentialId && !belongsToHost) {
     throw new AppError("CREDENTIAL_NOT_EDITABLE", "This credential does not belong to the host", false, undefined, undefined, 409);
   }
   const updateCurrent = Boolean(current && belongsToHost && database.credentialUsageCount(current.id) <= 1);
   validateInlineCredential(binding, belongsToHost ? current : null);
+  const sudoMode = binding.sudoMode ?? current?.sudoMode ?? "NONE";
   const metadata = binding.type === "PRIVATE_KEY"
     ? { privateKeyPath: binding.metadata.privateKeyPath }
     : binding.type === "SSH_AGENT" && binding.metadata.agentSocket
@@ -137,24 +165,37 @@ async function prepareCredentialBinding(host: Host | null, binding: CredentialBi
 
   if (updateCurrent && current) {
     const previousRef = current.secretRef;
+    const previousSudoRef = current.sudoSecretRef;
     const retainsSecret = binding.secret === undefined && binding.type === current.type && binding.type !== "SSH_AGENT";
     let nextRef = retainsSecret ? previousRef : null;
+    let nextSudoRef = sudoMode === "CUSTOM_PASSWORD" && binding.sudoSecret === undefined ? previousSudoRef : null;
     let previousSecret: string | null = null;
+    let previousSudoSecret: string | null = null;
     if (binding.secret !== undefined) {
       nextRef = previousRef ?? randomUUID();
       if (previousRef) previousSecret = await vault.resolve(previousRef);
       await vault.save(nextRef, binding.secret);
     }
+    if (sudoMode === "CUSTOM_PASSWORD" && binding.sudoSecret !== undefined) {
+      nextSudoRef = previousSudoRef ?? randomUUID();
+      if (previousSudoRef) previousSudoSecret = await vault.resolve(previousSudoRef);
+      await vault.save(nextSudoRef, binding.sudoSecret);
+    }
     try {
-      database.updateCredential(current.id, name, binding.type, nextRef, metadata);
+      database.updateCredential(current.id, name, binding.type, nextRef, metadata, sudoMode, nextSudoRef);
     } catch (error) {
       if (binding.secret !== undefined && nextRef) {
         if (previousRef && previousSecret !== null) await vault.save(previousRef, previousSecret);
         else await vault.delete(nextRef);
       }
+      if (binding.sudoSecret !== undefined && nextSudoRef) {
+        if (previousSudoRef && previousSudoSecret !== null) await vault.save(previousSudoRef, previousSudoSecret);
+        else await vault.delete(nextSudoRef);
+      }
       throw error;
     }
     if (previousRef && previousRef !== nextRef) await vault.delete(previousRef);
+    if (previousSudoRef && previousSudoRef !== nextSudoRef) await vault.delete(previousSudoRef);
     return { credentialId: current.id, createdCredentialId: null };
   }
 
@@ -162,12 +203,15 @@ async function prepareCredentialBinding(host: Host | null, binding: CredentialBi
     ? await vault.resolve(current.secretRef)
     : binding.secret;
   const secretRef = clonedSecret !== undefined ? randomUUID() : null;
+  const sudoSecretRef = sudoMode === "CUSTOM_PASSWORD" && binding.sudoSecret !== undefined ? randomUUID() : null;
   if (secretRef) await vault.save(secretRef, clonedSecret!);
+  if (sudoSecretRef) await vault.save(sudoSecretRef, binding.sudoSecret!);
   try {
-    const credential = database.createCredential(name, binding.type, secretRef, metadata);
+    const credential = database.createCredential(name, binding.type, secretRef, metadata, sudoMode, sudoSecretRef);
     return { credentialId: credential.id, createdCredentialId: credential.id };
   } catch (error) {
     if (secretRef) await vault.delete(secretRef);
+    if (sudoSecretRef) await vault.delete(sudoSecretRef);
     throw error;
   }
 }
@@ -180,12 +224,21 @@ function validateInlineCredential(binding: Extract<CredentialBinding, { mode: "I
   if (binding.type === "PRIVATE_KEY" && !binding.metadata.privateKeyPath) {
     throw new AppError("INVALID_ARGUMENT", "Private key path is required for private key authentication");
   }
+  const sudoMode = binding.sudoMode ?? current?.sudoMode ?? "NONE";
+  if (sudoMode === "LOGIN_PASSWORD" && binding.type !== "PASSWORD") {
+    throw new AppError("INVALID_ARGUMENT", "Only password-authenticated hosts can reuse the login password for sudo");
+  }
+  const canRetainSudoSecret = current?.sudoMode === "CUSTOM_PASSWORD" && current.hasSudoSecret;
+  if (sudoMode === "CUSTOM_PASSWORD" && binding.sudoSecret === undefined && !canRetainSudoSecret) {
+    throw new AppError("INVALID_ARGUMENT", "Sudo password is required when managed sudo authentication is enabled");
+  }
 }
 
 async function removeUnusedCredential(credentialId: string): Promise<void> {
   const credential = database.getCredential(credentialId);
   if (!credential || database.credentialUsageCount(credentialId) > 0) return;
   if (credential.secretRef) await vault.delete(credential.secretRef);
+  if (credential.sudoSecretRef) await vault.delete(credential.sudoSecretRef);
   database.deleteCredential(credentialId);
 }
 
@@ -239,25 +292,35 @@ async function routeApi(request: IncomingMessage, response: ServerResponse, url:
     return json(response, 200, await codexIntegration.diagnose());
   }
   if (method === "GET" && url.pathname === "/v1/agent-integrations") {
-    const [cursor, claudeCode] = await Promise.all([cursorIntegration.getState(), claudeCodeIntegration.getState()]);
-    return json(response, 200, { cursor, claudeCode });
+    const [cursor, claudeCode, workbuddy] = await Promise.all([cursorIntegration.getState(), claudeCodeIntegration.getState(), workbuddyIntegration.getState()]);
+    return json(response, 200, { cursor, claudeCode, workbuddy });
   }
   if (method === "POST" && url.pathname.startsWith("/v1/agent-integrations/") && url.pathname.endsWith("/select")) {
-    const agent = z.enum(["cursor", "claude-code"]).parse(url.pathname.split("/")[3]);
+    const agent = z.enum(["cursor", "claude-code", "workbuddy"]).parse(url.pathname.split("/")[3]);
     const input = z.object({ path: z.string().trim().min(1).max(4096) }).parse(await body(request));
-    const state = await (agent === "cursor" ? cursorIntegration : claudeCodeIntegration).selectConfigDirectory(input.path);
+    const state = await jsonAgentIntegrations[agent].selectConfigDirectory(input.path);
     database.setSetting(`integration.${agent}.directory`, state.configDirectory);
     return json(response, 200, state);
   }
   if (method === "POST" && url.pathname.startsWith("/v1/agent-integrations/") && url.pathname.endsWith("/install")) {
-    const agent = z.enum(["cursor", "claude-code"]).parse(url.pathname.split("/")[3]);
-    return json(response, 200, await (agent === "cursor" ? cursorIntegration : claudeCodeIntegration).install());
+    const agent = z.enum(["cursor", "claude-code", "workbuddy"]).parse(url.pathname.split("/")[3]);
+    return json(response, 200, await jsonAgentIntegrations[agent].install());
   }
   if (method === "GET" && url.pathname === "/v1/hosts") {
     return json(response, 200, operations.listHosts(url.searchParams.get("aiOnly") === "true"));
   }
+  if (method === "GET" && url.pathname === "/v1/host-logins") {
+    return json(response, 200, database.listHostLogins());
+  }
+  if (method === "PATCH" && url.pathname === "/v1/host-groups") {
+    const input = z.object({
+      oldName: z.string().trim().min(1).max(120),
+      newName: z.string().trim().min(1).max(120)
+    }).parse(await body(request));
+    return json(response, 200, { updated: database.renameHostGroup(input.oldName, input.newName) });
+  }
   if (method === "POST" && url.pathname === "/v1/hosts") {
-    const raw = z.object({ credential: credentialBindingSchema.optional() }).passthrough().parse(await body(request));
+    const raw = z.object({ credential: credentialBindingSchema.optional(), sudoEnabled: z.boolean().optional() }).passthrough().parse(await body(request));
     const input = hostInputSchema.parse(raw);
     if (!raw.credential && input.credentialId) {
       throw new AppError("CREDENTIAL_REUSE_DISABLED", "Configure authentication directly on the host", false, undefined, undefined, 409);
@@ -269,7 +332,8 @@ async function routeApi(request: IncomingMessage, response: ServerResponse, url:
       return json(response, 201, database.createHost({
         ...input,
         credentialId: bindingResult.credentialId, policyId: input.policyId ?? null, groupName: input.groupName ?? null,
-        defaultDirectory: input.defaultDirectory ?? null
+        defaultDirectory: input.defaultDirectory ?? null,
+        sudoEnabled: input.username === "root" ? true : raw.sudoEnabled ?? false
       }));
     } catch (error) {
       if (bindingResult.createdCredentialId) await removeUnusedCredential(bindingResult.createdCredentialId);
@@ -331,10 +395,77 @@ async function routeApi(request: IncomingMessage, response: ServerResponse, url:
   if (hostMatch && method === "DELETE") {
     const existing = database.getHost(hostMatch[1]!);
     if (!existing) throw new AppError("HOST_NOT_FOUND", "Host not found", false, undefined, undefined, 404);
+    const credentialIds = database.listHostLogins(existing.id).flatMap((login) => login.credentialId ? [login.credentialId] : []);
     await ssh.disconnect(hostMatch[1]!);
     database.deleteHost(hostMatch[1]!);
-    if (existing.credentialId) await removeUnusedCredential(existing.credentialId);
+    for (const credentialId of new Set(credentialIds)) await removeUnusedCredential(credentialId);
     return json(response, 200, { deleted: true });
+  }
+  const hostLoginsMatch = url.pathname.match(/^\/v1\/hosts\/([0-9a-f-]+)\/logins$/u);
+  if (hostLoginsMatch && method === "GET") {
+    if (!database.getHost(hostLoginsMatch[1]!)) throw new AppError("HOST_NOT_FOUND", "Host not found", false, undefined, undefined, 404);
+    return json(response, 200, database.listHostLogins(hostLoginsMatch[1]!));
+  }
+  if (hostLoginsMatch && method === "POST") {
+    const host = database.getHost(hostLoginsMatch[1]!);
+    if (!host) throw new AppError("HOST_NOT_FOUND", "Host not found", false, undefined, undefined, 404);
+    const raw = z.object({ credential: credentialBindingSchema, username: z.string(), sudoEnabled: z.boolean().optional() }).parse(await body(request));
+    const input = hostLoginInputSchema.parse(raw);
+    const binding = await prepareCredentialBinding(host, raw.credential, `${host.name} ${input.username}`, null);
+    try {
+      const login = database.createHostLogin(host.id, input.username, binding.credentialId, input.username === "root" ? true : input.sudoEnabled);
+      return json(response, 201, login);
+    } catch (error) {
+      if (binding.createdCredentialId) await removeUnusedCredential(binding.createdCredentialId);
+      throw error;
+    }
+  }
+  const hostLoginMatch = url.pathname.match(/^\/v1\/hosts\/([0-9a-f-]+)\/logins\/([0-9a-f-]+)$/u);
+  if (hostLoginMatch && method === "PATCH") {
+    const host = database.getHost(hostLoginMatch[1]!);
+    const login = database.getHostLogin(hostLoginMatch[2]!);
+    if (!host) throw new AppError("HOST_NOT_FOUND", "Host not found", false, undefined, undefined, 404);
+    if (!login || login.hostId !== host.id) throw new AppError("HOST_LOGIN_NOT_FOUND", "Host login not found", false, undefined, undefined, 404);
+    const raw = z.object({ credential: credentialBindingSchema, username: z.string(), sudoEnabled: z.boolean().optional() }).parse(await body(request));
+    const input = hostLoginInputSchema.parse(raw);
+    const previousCredentialId = login.credentialId;
+    const binding = await prepareCredentialBinding(host, raw.credential, `${host.name} ${input.username}`, login.credentialId);
+    let updated;
+    try {
+      updated = database.updateHostLogin(login.id, {
+        username: input.username,
+        credentialId: binding.credentialId,
+        sudoEnabled: input.username === "root" ? true : input.sudoEnabled
+      });
+    } catch (error) {
+      if (binding.createdCredentialId) await removeUnusedCredential(binding.createdCredentialId);
+      throw error;
+    }
+    if (login.active) await ssh.disconnect(host.id);
+    if (previousCredentialId && previousCredentialId !== updated.credentialId) await removeUnusedCredential(previousCredentialId);
+    return json(response, 200, updated);
+  }
+  if (hostLoginMatch && method === "DELETE") {
+    const login = database.deleteHostLogin(hostLoginMatch[1]!, hostLoginMatch[2]!);
+    if (login.credentialId) await removeUnusedCredential(login.credentialId);
+    return json(response, 200, { deleted: true });
+  }
+  const loginSudoMatch = url.pathname.match(/^\/v1\/hosts\/([0-9a-f-]+)\/logins\/([0-9a-f-]+)\/sudo$/u);
+  if (loginSudoMatch && method === "PATCH") {
+    const host = database.getHost(loginSudoMatch[1]!);
+    const login = database.getHostLogin(loginSudoMatch[2]!);
+    if (!host) throw new AppError("HOST_NOT_FOUND", "Host not found", false, undefined, undefined, 404);
+    if (!login || login.hostId !== host.id) throw new AppError("HOST_LOGIN_NOT_FOUND", "Host login not found", false, undefined, undefined, 404);
+    if (login.username === "root") throw new AppError("ROOT_SUDO_FIXED", "The root login always has full privileges", false, undefined, undefined, 409);
+    const input = z.object({ sudoEnabled: z.boolean() }).parse(await body(request));
+    const updated = database.updateHostLogin(login.id, { sudoEnabled: input.sudoEnabled });
+    return json(response, 200, updated);
+  }
+  const activateLoginMatch = url.pathname.match(/^\/v1\/hosts\/([0-9a-f-]+)\/logins\/([0-9a-f-]+)\/activate$/u);
+  if (activateLoginMatch && method === "POST") {
+    const updated = database.activateHostLogin(activateLoginMatch[1]!, activateLoginMatch[2]!);
+    await ssh.disconnect(updated.id);
+    return json(response, 200, updated);
   }
   const testMatch = url.pathname.match(/^\/v1\/hosts\/([0-9a-f-]+)\/test$/u);
   if (testMatch && method === "POST") {
@@ -393,11 +524,14 @@ async function routeApi(request: IncomingMessage, response: ServerResponse, url:
   if (method === "POST" && url.pathname === "/v1/credentials") {
     const input = credentialInputSchema.parse(await body(request));
     const secretRef = input.secret ? randomUUID() : null;
+    const sudoSecretRef = input.sudoMode === "CUSTOM_PASSWORD" && input.sudoSecret ? randomUUID() : null;
     if (secretRef) await vault.save(secretRef, input.secret!);
+    if (sudoSecretRef) await vault.save(sudoSecretRef, input.sudoSecret!);
     try {
-      return json(response, 201, publicCredential(database.createCredential(input.name, input.type, secretRef, input.metadata)));
+      return json(response, 201, publicCredential(database.createCredential(input.name, input.type, secretRef, input.metadata, input.sudoMode, sudoSecretRef)));
     } catch (error) {
       if (secretRef) await vault.delete(secretRef);
+      if (sudoSecretRef) await vault.delete(sudoSecretRef);
       throw error;
     }
   }
@@ -409,6 +543,8 @@ async function routeApi(request: IncomingMessage, response: ServerResponse, url:
       name: z.string().trim().min(1).max(120).optional(),
       type: z.enum(["PASSWORD", "PRIVATE_KEY", "SSH_AGENT"]).optional(),
       secret: z.string().max(16_384).optional(),
+      sudoMode: z.enum(["NONE", "LOGIN_PASSWORD", "CUSTOM_PASSWORD"]).optional(),
+      sudoSecret: z.string().max(16_384).optional(),
       metadata: z.object({ privateKeyPath: z.string().max(4096).optional(), agentSocket: z.string().max(4096).optional() }).optional()
     }).parse(await body(request));
     let secretRef = current.secretRef;
@@ -416,13 +552,23 @@ async function routeApi(request: IncomingMessage, response: ServerResponse, url:
       secretRef ??= randomUUID();
       await vault.save(secretRef, input.secret);
     }
-    const updated = database.updateCredential(current.id, input.name ?? current.name, input.type ?? current.type, secretRef, input.metadata ?? current.metadata);
+    const sudoMode = input.sudoMode ?? current.sudoMode;
+    let sudoSecretRef = sudoMode === "CUSTOM_PASSWORD" ? current.sudoSecretRef : null;
+    if (input.sudoSecret !== undefined) {
+      sudoSecretRef ??= randomUUID();
+      await vault.save(sudoSecretRef, input.sudoSecret);
+    }
+    if (sudoMode === "LOGIN_PASSWORD" && (input.type ?? current.type) !== "PASSWORD") throw new AppError("INVALID_ARGUMENT", "Only password-authenticated hosts can reuse the login password for sudo");
+    if (sudoMode === "CUSTOM_PASSWORD" && !sudoSecretRef) throw new AppError("INVALID_ARGUMENT", "Sudo password is required");
+    const updated = database.updateCredential(current.id, input.name ?? current.name, input.type ?? current.type, secretRef, input.metadata ?? current.metadata, sudoMode, sudoSecretRef);
+    if (current.sudoSecretRef && current.sudoSecretRef !== sudoSecretRef) await vault.delete(current.sudoSecretRef);
     for (const host of database.listHosts().filter((candidate) => candidate.credentialId === current.id)) await ssh.disconnect(host.id);
     return json(response, 200, publicCredential(updated));
   }
   if (credentialMatch && method === "DELETE") {
     const deleted = database.deleteCredential(credentialMatch[1]!);
     if (deleted.secretRef) await vault.delete(deleted.secretRef);
+    if (deleted.sudoSecretRef) await vault.delete(deleted.sudoSecretRef);
     return json(response, 200, { deleted: true });
   }
 
@@ -592,8 +738,8 @@ function mime(extension: string): string {
   return ({ ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png" } as Record<string, string>)[extension] ?? "application/octet-stream";
 }
 
-function publicCredential(credential: Credential): Omit<Credential, "secretRef"> {
-  const { secretRef: _secretRef, ...value } = credential;
+function publicCredential(credential: Credential): Omit<Credential, "secretRef" | "sudoSecretRef"> {
+  const { secretRef: _secretRef, sudoSecretRef: _sudoSecretRef, ...value } = credential;
   return value;
 }
 

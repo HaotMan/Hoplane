@@ -53,6 +53,14 @@ export class OperationService {
     });
     try {
       const { policy } = this.requireOperationalContext(host, request.clientType, operationId);
+      const activeLogin = this.database.getActiveHostLogin(request.hostId);
+      if (/^\s*sudo(?=\s|$)/u.test(request.command) && host!.username !== "root" && activeLogin && !activeLogin.sudoEnabled) {
+        this.updateAudit(operationId, request.hostId, {
+          policyId: policy.id, policyVersion: policy.version, policyDecision: "DENY",
+          decisionReasonCode: "SUDO_DISABLED_FOR_LOGIN", status: "DENIED"
+        });
+        throw new AppError("SUDO_DISABLED", `sudo is disabled for the active login "${host!.username}"`, false, operationId, { username: host!.username }, 403);
+      }
       const directory = request.directory ?? host!.defaultDirectory ?? undefined;
       const decision = this.policy.evaluateCommand(policy.document, request.command, directory);
       this.recordDecision(operationId, request.hostId, policy, decision);
@@ -173,7 +181,7 @@ export class OperationService {
 
   private finishError(operationId: string, hostId: string, started: number, error: unknown): AppError {
     const appError = asAppError(error);
-    const deniedCodes = new Set(["POLICY_DENIED", "PATH_NOT_ALLOWED", "HOST_NOT_ALLOWED_FOR_AI", "FILE_TOO_LARGE"]);
+    const deniedCodes = new Set(["POLICY_DENIED", "PATH_NOT_ALLOWED", "HOST_NOT_ALLOWED_FOR_AI", "FILE_TOO_LARGE", "SUDO_DISABLED"]);
     const status = appError.code === "COMMAND_TIMEOUT" ? "TIMED_OUT" : deniedCodes.has(appError.code) ? "DENIED" : "FAILED";
     this.updateAudit(operationId, hostId, {
       status, durationMs: Date.now() - started, errorCode: appError.code,

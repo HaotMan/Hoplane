@@ -106,6 +106,8 @@ describe("HoplaneDatabase", () => {
     expect(columns).toEqual(expect.arrayContaining(["schema_version", "enabled", "source_path", "source_status", "source_error", "source_hash"]));
     const hostColumns = db.db.prepare("PRAGMA table_info(hosts)").all().map((row) => String((row as { name: unknown }).name));
     expect(hostColumns).toContain("monitor_output_enabled");
+    const credentialColumns = db.db.prepare("PRAGMA table_info(credentials)").all().map((row) => String((row as { name: unknown }).name));
+    expect(credentialColumns).toEqual(expect.arrayContaining(["sudo_mode", "sudo_secret_ref"]));
     db.close();
   });
   it("does not rotate connection revision for label-only changes", async () => {
@@ -143,7 +145,8 @@ describe("HoplaneDatabase", () => {
   });
   it("tracks host-owned credential usage", async () => {
     const db = await database();
-    const exclusive = db.createCredential("dev login", "PASSWORD", "secret-ref", {});
+    const exclusive = db.createCredential("dev login", "PASSWORD", "secret-ref", {}, "CUSTOM_PASSWORD", "sudo-ref");
+    expect(exclusive).toMatchObject({ sudoMode: "CUSTOM_PASSWORD", sudoSecretRef: "sudo-ref", hasSudoSecret: true });
 
     const host = db.createHost({
       name: "dev", hostname: "host", port: 22, username: "dev", credentialId: exclusive.id,
@@ -154,6 +157,29 @@ describe("HoplaneDatabase", () => {
     db.deleteHost(host.id);
     expect(db.credentialUsageCount(exclusive.id)).toBe(0);
     expect(db.deleteCredential(exclusive.id).id).toBe(exclusive.id);
+    db.close();
+  });
+  it("manages multiple host logins, switches the active identity, and renames groups", async () => {
+    const db = await database();
+    const first = db.createCredential("root login", "PASSWORD", "root-secret", {});
+    const host = db.createHost({
+      name: "node", hostname: "host", port: 22, username: "root", credentialId: first.id,
+      policyId: db.listPolicies()[0]!.id, groupName: "旧分组", tags: [], defaultDirectory: null,
+      enabled: true, aiAccessEnabled: true
+    });
+    const initial = db.listHostLogins(host.id);
+    expect(initial).toMatchObject([{ username: "root", credentialId: first.id, sudoEnabled: true, active: true }]);
+
+    const secondCredential = db.createCredential("deploy login", "PASSWORD", "deploy-secret", {}, "LOGIN_PASSWORD");
+    const deploy = db.createHostLogin(host.id, "deploy", secondCredential.id, false);
+    expect(db.credentialUsageCount(secondCredential.id)).toBe(1);
+    const switched = db.activateHostLogin(host.id, deploy.id);
+    expect(switched).toMatchObject({ username: "deploy", credentialId: secondCredential.id, activeLoginId: deploy.id });
+    expect(db.getActiveHostLogin(host.id)).toMatchObject({ username: "deploy", sudoEnabled: false, active: true });
+    expect(() => db.deleteHostLogin(host.id, deploy.id)).toThrowError(/active login/u);
+
+    expect(db.renameHostGroup("旧分组", "生产节点")).toBe(1);
+    expect(db.getHost(host.id)?.groupName).toBe("生产节点");
     db.close();
   });
 });
