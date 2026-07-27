@@ -80,8 +80,8 @@ function createWindow(): void {
 }
 
 function createTray(): void {
-  const trayImage = nativeImage.createFromPath(join(app.getAppPath(), "apps", "desktop", "electron", "tray.svg")).resize({ width: 18, height: 18 });
-  trayImage.setTemplateImage(true);
+  // Colored logo icon; the @2x sibling file is picked up automatically for retina.
+  const trayImage = nativeImage.createFromPath(join(app.getAppPath(), "apps", "desktop", "electron", "tray.png"));
   tray = new Tray(trayImage);
   tray.setToolTip("Hoplane AI SSH Gateway");
   tray.on("click", () => showWindow());

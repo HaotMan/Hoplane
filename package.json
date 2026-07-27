@@ -52,6 +52,7 @@
     "concurrently": "^9.2.1",
     "electron": "^43.1.1",
     "electron-builder": "^26.15.3",
+    "pngjs": "^7.0.0",
     "tsx": "^4.20.5",
     "typescript": "^5.9.2",
     "vite": "^7.1.3",
@@ -65,7 +66,8 @@
     "files": [
       "dist/**",
       "apps/desktop/dist/**",
-      "apps/desktop/electron/tray.svg",
+      "apps/desktop/electron/tray.png",
+      "apps/desktop/electron/tray@2x.png",
       "package.json"
     ],
     "extraResources": [
@@ -81,6 +83,7 @@
       "output": "release"
     },
     "mac": {
+      "icon": "build/icon.png",
       "category": "public.app-category.developer-tools",
       "extendInfo": {
         "NSLocalNetworkUsageDescription": "Hoplane 需要访问本地网络，以连接您配置的 SSH 主机。"
@@ -95,6 +98,7 @@
       "artifactName": "${productName}-${version}-macos-${arch}-installer.${ext}"
     },
     "win": {
+      "icon": "build/icon-win.png",
       "target": [
         {
           "target": "nsis",
