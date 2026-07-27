@@ -495,3 +495,17 @@ test/                 单元、集成与 SSH 端到端测试
 - [实现说明与后续计划](docs/MVP实现说明.md)
 
 这些文档记录了项目演进过程；当前功能与安全边界以本 README 和现有代码为准。
+
+## 许可证
+
+除下述品牌素材外，本仓库中的源代码和文档采用 [Mozilla Public License 2.0](LICENSE) 授权。
+
+`Hoplane` 名称及以下品牌素材不属于 MPL-2.0 授权范围，相关权利保留：
+
+- `logo.png`
+- `build/icon.png`
+- `build/icon-win.png`
+- `apps/desktop/electron/tray.png`
+- `apps/desktop/electron/tray@2x.png`
+
+MPL-2.0 不授予 Hoplane 名称、商标、服务标志或 Logo 的使用权。

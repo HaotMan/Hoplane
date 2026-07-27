@@ -3,6 +3,7 @@
   "version": "0.1.2",
   "description": "Local-first MCP gateway for policy-controlled SSH access",
   "author": "Hoplane",
+  "license": "MPL-2.0",
   "private": true,
   "type": "module",
   "main": "dist/apps/desktop/electron/main.js",
@@ -68,6 +69,7 @@
       "apps/desktop/dist/**",
       "apps/desktop/electron/tray.png",
       "apps/desktop/electron/tray@2x.png",
+      "LICENSE",
       "package.json"
     ],
     "extraResources": [
