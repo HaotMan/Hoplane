@@ -1,178 +1,299 @@
 # Hoplane
 
-> 让 AI 安全地操作你的 SSH 主机，而不把密码、私钥和无限制 Shell 交给 AI。
+<p align="center">
+  <img src="logo.png" width="132" alt="Hoplane Logo">
+</p>
 
-Hoplane 是一个面向 AI Agent 的本地 SSH 安全网关。它在 Agent 与远程服务器之间提供统一的凭据保险库、主机管理、权限策略、操作审计和文件传输能力，并可一键接入 Codex、Cursor、Claude Code 等客户端。
+<p align="center">
+  <strong>让 AI 安全地操作 SSH 主机，同时把凭据、权限与最终控制权留在本地。</strong>
+</p>
 
-Hoplane 不是另一个聊天窗口，也不是传统交互式 SSH 终端。它的目标是把远程操作收敛为可控制、可停止、可追踪的工具调用：Agent 只能看到被授权的主机，只能执行策略允许的操作，并且永远不会获得登录凭据。
+Hoplane 是一个面向 AI Agent 的本地 SSH 网关与桌面运维工具。它把主机管理、本地加密凭据、Policy V3、操作审计、文件传输、AI 指令记录和人工交互终端放在同一个 App 中，并可一键接入 Codex、Cursor、Claude Code 与 WorkBuddy。
 
-## 为什么选择 Hoplane
+AI 不会获得登录密码、私钥口令或 sudo 密码，也不能自行确认新的 SSH 主机指纹。所有 MCP 命令和文件操作都要经过主机开关、当前登录身份、权限策略与审计链路；需要人工处理时，用户可以在 App 内打开独立的交互式终端。
+
+> 当前版本：`0.1.0`。项目处于 MVP 阶段，安装包尚未进行正式代码签名或公证。
+
+## 为什么使用 Hoplane
 
 | 能力 | 直接让 Agent 使用 SSH | 常见单配置 SSH MCP | Hoplane |
 | --- | --- | --- | --- |
-| 凭据与 Agent 隔离 | 通常不能保证 | 取决于实现 | 本地加密保险库，MCP/CLI 不返回凭据 |
-| 多主机图形化管理 | 无 | 通常依赖配置文件 | 分组、标签、启停、状态和批量复制 |
-| 每台主机独立授权 | 无 | 通常较弱 | 主机级 AI 开关和独立策略 |
-| Docker / Kubernetes 策略 | 无 | 通常依赖手写命令规则 | 内置场景模板和可视化黑名单 |
-| 文件传输边界 | 无 | 取决于实现 | 路径、大小、覆盖和符号链接复核 |
-| Agent 接入 | 依赖 Agent Shell 权限 | 手动配置 MCP | Codex、Cursor、Claude Code 一键集成 |
-| 操作追踪 | Shell 历史有限 | 取决于实现 | 策略判断、结果、耗时和错误统一审计 |
-| 紧急停止 | 需要回收密钥 | 通常需要改配置 | 停用主机或关闭 AI 访问立即生效 |
+| 凭据与 Agent 隔离 | 很难保证 | 取决于实现 | 本地加密保险库，MCP/CLI 不返回凭据 |
+| 多主机管理 | 通常没有 | 多依赖配置文件 | 分组、标签、启停、测试与多选复制 |
+| 多登录身份 | Agent 自行选择密钥 | 通常单一身份 | 每台主机可保存多套身份，AI 只使用当前身份 |
+| sudo 验证 | 可能需要暴露密码 | 常见为 NOPASSWD | Hoplane 在 SSH 通道内应答，密码不返回 Agent |
+| 主机级授权 | 依赖密钥权限 | 通常较弱 | 独立 AI 开关、策略和当前登录用户 |
+| Docker / Kubernetes 控制 | 无统一边界 | 常靠手写规则 | 内置场景模板与可视化命令黑名单 |
+| 文件传输边界 | 通常没有 | 取决于实现 | 路径、大小和覆盖策略 |
+| Agent 接入 | 依赖 Agent Shell 权限 | 手动配置 | Skill + stdio MCP 一键安装 |
+| 操作追踪 | Shell 历史有限 | 取决于实现 | 策略判断、状态、错误和耗时统一审计 |
+| 人工接管 | 需要切换 SSH 工具 | 通常没有 | App 内独立 PTY 终端，不暴露给 AI |
+| 紧急停止 | 回收密钥 | 修改配置 | 停用主机或关闭 AI 访问立即生效 |
 
-核心优势：
+Hoplane 的核心设计：
 
-- **凭据不进入 Agent 上下文**：密码、私钥口令和 MCP Token 保存在本地 AES-256-GCM 加密保险库中，数据库只保存引用。
-- **所有入口共用同一条安全链路**：MCP、CLI 和桌面界面都必须经过主机状态检查、策略判断、SSH 执行和审计记录。
-- **权限可以被人理解**：通过可视化界面配置系统、Docker、Compose、Kubernetes 和文件传输黑名单，高级用户仍可直接编辑 YAML。
-- **主机随时可撤销**：停用主机后立即断开连接、从 AI 主机列表移除，并拒绝 Agent 保存的旧主机 ID。
-- **本地优先**：Core、数据库、策略和凭据全部保存在本机，不依赖 Hoplane 云服务。
-- **既适合 Agent，也保留人的控制权**：用户可以查看指令记录、策略结果和有限实时输出，但监控页面不提供远程输入入口。
+- **本地优先**：Core、SQLite、策略 YAML 和加密保险库都保存在本机，不依赖 Hoplane 云服务。
+- **AI 最小暴露**：Agent 只看到允许 AI 访问的主机及其能力，不会收到密码、口令、私钥内容或保险库数据。
+- **身份可切换**：一台主机可保存多套 SSH 登录身份；当前激活身份是 AI 唯一可用的身份。
+- **权限可解释**：使用内置场景模板快速开始，也可通过可视化界面或 YAML 直接维护命令与文件策略。
+- **结果可追踪**：允许、拒绝、失败、超时和文件传输都会生成结构化审计记录。
+- **人工与 AI 分离**：AI 操作受策略控制；人工交互终端是独立 UI 通道，边界和审计方式明确区分。
 
 ## 界面预览
 
-### 多主机、分组与独立授权
+### 主机分组与独立授权
 
-主机可以分组折叠、启用或停用，并分别设置 AI 访问权限、默认目录和策略。多选模式支持批量选择并复制主机名称或地址。
+主机支持分组折叠、分组重命名、启用/停用和多选复制。每台主机可以快速切换 AI 当前登录用户、sudo 权限和策略。
 
 ![Hoplane 主机分组与权限管理](docs/images/hoplane-hosts.jpg)
 
-### 可视化策略与 YAML 双向编辑
+### 可视化策略与 YAML 编辑
 
-内置错误追溯、系统巡检、容器排障、容器运维、完全禁用和全权限模板。策略既可以通过操作开关配置，也可以直接编辑本地 YAML 文件。
+策略页面提供场景模板、可视化黑名单、文件传输边界和 YAML 源码两种编辑方式。
 
 ![Hoplane 可视化权限策略](docs/images/hoplane-policies.jpg)
 
+### AI 指令记录与加密运行结果
+
+按主机实时查看 AI 发出的命令、策略判断和执行状态。运行结果可由用户控制显示，并使用主密码派生密钥在 Core 内存中加密。
+
+![Hoplane AI 指令记录](docs/images/hoplane-operations.jpg)
+
 ### 统一操作审计
 
-成功、拒绝、失败和超时都会记录来源、主机、请求摘要、策略判断、错误码和耗时。审计记录不会写入密码、私钥、口令或 Token。
+成功、拒绝、失败与超时都会记录来源、主机、请求摘要、策略判断、错误码和耗时。
 
 ![Hoplane 操作审计](docs/images/hoplane-audit.jpg)
 
 ### 多 Agent 一键接入
 
-App 可以扫描有限的常见配置位置，也支持手动选择目录。Codex、Cursor 和 Claude Code 均可安装 Hoplane Skill 和稳定的 stdio MCP；其他客户端可以使用 Streamable HTTP 配置。
+App 只检查有限的常见配置位置，也支持手动选择目录。Codex、Cursor、Claude Code 和 WorkBuddy 使用稳定的 stdio MCP；其他兼容客户端可选用本机 Streamable HTTP MCP。
 
 ![Hoplane Agent 接入](docs/images/hoplane-integrations.jpg)
 
 > 截图使用独立演示数据和 [RFC 5737](https://datatracker.ietf.org/doc/html/rfc5737) 保留地址，不包含真实服务器信息。
 
+## 两条操作通道
+
+Hoplane 明确区分 AI 自动操作与用户人工终端：
+
+| 通道 | 登录身份 | Policy V3 | 审计范围 | 凭据 |
+| --- | --- | --- | --- | --- |
+| MCP / CLI 命令与文件操作 | 主机当前激活身份 | 必须通过 | 请求、策略、状态、耗时、错误等 | 由 Hoplane 解析，不返回调用方 |
+| App 人工交互终端 | 用户在终端页选择的身份 | 不经过 AI 黑名单 | 会话开始、结束、耗时、退出码或错误 | 由 Hoplane 解析，不显示在终端配置中 |
+
+人工终端使用独立 PTY 和 WebSocket 连接，可运行交互式 Shell 应用。终端输入与输出不写入数据库，也不进入 AI 指令记录；切换终端身份不会改变 AI 当前身份。终端会话不会跨 App/Core 重启恢复。
+
 ## 工作方式
 
 ```text
-Codex / Cursor / Claude Code / Other Agents
-                    │
-              MCP stdio / HTTP
-                    │
-                    ▼
-┌──────────────────────────────────────────┐
-│              Hoplane Core                │
-│                                          │
-│  Host Registry  →  Policy Engine         │
-│         │                 │               │
-│  Encrypted Vault  →  Operation Service   │
-│                           │              │
-│                    Audit + Monitor        │
-└───────────────────────────┬──────────────┘
-                            │ SSH / SFTP
-                            ▼
-                    Remote Hosts
+Codex / Cursor / Claude Code / WorkBuddy / Other Agents
+                         │
+                   stdio / HTTP MCP
+                         │
+                         ▼
+┌──────────────────────────────────────────────────┐
+│                   Hoplane Core                   │
+│                                                  │
+│  Host Registry ── Policy V3 ── Operation Service │
+│       │               │               │          │
+│  Encrypted Vault      └────── Audit + Monitor    │
+└───────────────────────────────┬──────────────────┘
+                                │ SSH / SFTP
+                                ▼
+                         Remote Hosts
+
+Desktop App ── same-origin WebSocket ── Human PTY Session
 ```
 
-一次远程操作必须经过：
+一次 AI 远程操作会依次经过：
 
 ```text
-Agent 提交请求
-→ 检查主机是否启用以及是否允许 AI 访问
-→ 加载该主机绑定的策略
-→ 检查命令、目录或文件路径
-→ 从保险库解析凭据
+Agent 提交 host_id 与操作
+→ 检查主机是否存在、启用并允许 AI 访问
+→ 加载当前激活登录身份
+→ 检查 sudo 开关和主机绑定策略
+→ 检查命令黑名单或文件传输边界
+→ 从本地保险库解析受管密码/口令
 → 执行 SSH / SFTP
 → 脱敏并写入审计
 → 返回结构化结果
 ```
 
-Agent 不能确认新的 SSH 主机指纹、查看凭据或绕过已停用的主机。
-
 ## 功能
 
-### 主机管理
+### 主机、分组与多登录身份
 
-- 新增、编辑、删除和测试 SSH 主机；
-- 支持密码、私钥/口令和 SSH Agent；
-- 非 root 主机可复用登录密码或配置独立 sudo 密码，验证过程由 Hoplane 完成且不向 Agent 暴露密码；
-- 主机分组、标签、折叠、排序和多选复制；
-- 每台主机独立设置默认工作目录、权限策略和 AI 访问开关；
-- 主机启用/停用立即影响 MCP 可见性和已有连接；
-- 从 SSH Config 导入具体主机配置；
-- 首次连接显示 SHA-256 指纹，指纹变化时阻止连接并要求用户重新确认。
+- 新增、编辑、删除、启用/停用并测试 SSH 主机；
+- 支持密码、私钥文件/口令和 SSH Agent；
+- 每台主机分别配置地址、端口、默认目录、标签、策略和 AI 访问开关；
+- 主机可按自定义分组折叠展示，可选择已有分组、创建新分组或重命名整组；
+- 多选模式支持全选、按组选择，并复制所选主机的显示名称与地址；
+- 一台主机可保存多套登录身份，每套身份独立绑定认证方式和 sudo 权限；
+- AI 始终只使用当前激活身份；切换身份会断开旧连接，后续操作使用新用户；
+- 备用身份可在人工终端中单独选择，不改变 AI 当前身份；
+- 新增主机后自动发起连接测试；
+- Core API 支持导入基础 SSH Config 主机条目，导入后默认不开放 AI 访问；
+- 最多保留 20 个池化 SSH 命令连接。
+
+主机状态是当前 Core 进程内的连接状态，不是持续健康检查：
+
+- `CONNECTED`：当前存在已就绪的池化 SSH 连接；
+- `CONNECTING`：正在建立连接；
+- `DISCONNECTED`：当前没有活动连接，不等于主机故障；
+- `AUTH_FAILED` / `FAILED` / `HOST_KEY_BLOCKED`：最近连接在对应阶段失败或被安全检查阻止。
+
+### SSH 指纹与连接保护
+
+- 首次连接采用需要人工确认的 TOFU 流程；
+- Hoplane 先记录服务器 SHA-256 指纹并阻止连接，用户在 App 确认后才会信任；
+- 已信任指纹发生变化时继续阻止连接并显示明确警告；
+- MCP、CLI 和 Agent 都不能代替用户接受主机指纹；
+- App 区分认证失败、网络不可达、连接被拒绝、超时、DNS 失败和一般 SSH 错误；
+- 主机连接配置或当前身份变化时会断开旧连接，避免复用过期会话。
 
 ### 本地加密保险库
 
-- 使用 scrypt 从主密码派生密钥；
+- 使用 scrypt 从主密码派生 256 位密钥；
 - 使用 AES-256-GCM 对本地保险库进行认证加密；
-- 每次写入使用新的随机 IV，主密钥只保留在进程内存中；
+- 每次保存使用新的随机 IV，主密钥只保留在进程内存中；
 - 默认保存到 `~/.hoplane/vault.enc`，不依赖系统钥匙串；
-- 锁定保险库时关闭 SSH 连接并清除 MCP Token 缓存；
-- 用户重新验证主密码后，可以在 30 秒内查看和复制自己的登录密码、私钥口令或私钥内容；
-- 查看凭据只允许来自同源 App 页面，并且成功和失败都会进入审计。
-- sudo 密码使用独立的保险库引用保存，不写入命令、环境变量、审计或 MCP 返回内容。
+- 登录密码、私钥口令、独立 sudo 密码和 HTTP MCP Token 以随机引用存储；
+- 私钥文件本体保留在用户配置的本地路径中，保险库保存其口令而不是复制私钥文件；
+- 锁定保险库会清除内存密钥、关闭 SSH 连接并清除实时输出；
+- 用户重新验证主密码后，可在 30 秒内查看和复制当前身份的密码、私钥口令或私钥文件内容；
+- 凭据查看仅允许同源 App 页面调用，成功与失败都会进入审计；
+- MCP 和 CLI 无权调用凭据查看接口。
+
+保险库目录权限为 `0700`，保险库文件权限为 `0600`。主密码不可恢复且当前不支持修改，请妥善保存。
+
+### sudo 代验证
+
+非 root 身份可以独立启用 sudo，并选择：
+
+- 仅允许远端已配置的 `NOPASSWD`；
+- 复用 SSH 登录密码；
+- 使用独立 sudo 密码。
+
+当使用受管密码时，Hoplane 会把检测到的 sudo 调用改写为带随机提示标记的非交互形式，并只在远端提示实际出现后通过 SSH 标准输入应答。链式命令中的多个 sudo 提示会分别处理；提示标记会从 stderr 过滤。
+
+密码不会写入命令、环境变量、审计或 MCP 返回内容。未配置受管密码时使用 `sudo -n`，避免等待输入。身份关闭 sudo 时，请求会在执行前拒绝；即使身份允许 sudo，命令仍必须通过当前策略。
 
 ### Policy V3
 
-Policy V3 使用黑名单模型：未命中规则的命令默认允许，命中任意黑名单规则时拒绝；“全权限”模板的命令黑名单为空。
+Policy V3 采用命令黑名单模型：
+
+- `commandBlacklist` 中的 Unicode 正则按顺序匹配原始命令；
+- 命中任意规则即拒绝；
+- 未命中规则默认允许；
+- “全权限”模板的命令黑名单为空；
+- 文件上传、下载、覆盖、大小和允许路径单独控制。
 
 内置模板：
 
-- **错误追溯（推荐）**：允许常见查询，阻止系统、Docker 和 Kubernetes 变更；
-- **系统巡检（只读）**：允许系统查询，阻止系统修改及容器编排命令；
-- **容器排障（只读）**：允许 Docker/Kubernetes 查询，阻止状态变更和高风险操作；
-- **容器运维（受限）**：允许常规运维，阻止远程执行、删除、构建和资源写入；
-- **完全禁用**：所有命令和文件传输均拒绝；
-- **全权限（高风险）**：命令黑名单为空，只适用于隔离环境、低权限账号或人工监督场景。
+| 模板 | 风险 | 行为 |
+| --- | --- | --- |
+| 错误追溯（推荐） | 低 | 允许未命中的排障查询，阻止已收录的系统、Docker、Kubernetes 变更和 Shell 包装/组合 |
+| 系统巡检（只读） | 低 | 允许系统查询，阻止常见系统变更以及所有 `docker`、`kubectl` 命令 |
+| 容器排障（只读） | 低 | 允许未命中的 Docker/Kubernetes 查询，阻止已收录的状态变更与高风险操作 |
+| 容器运维（受限） | 中 | 放开常规启停、重启和扩缩容，继续阻止已收录的远程执行、删除、构建和资源写入 |
+| 完全禁用 | 低 | 拒绝所有命令并关闭文件传输 |
+| 全权限（高风险） | 高 | 命令黑名单为空，允许任意路径的上传、下载和覆盖，单文件上限 10 GiB |
 
-策略特性：
+除“全权限”外，内置模板默认关闭文件传输。自定义策略启用传输后，默认单文件上限为 100 MiB。
 
-- 系统、Docker/Compose、Kubernetes、Shell 包装和组合符分组配置；
-- 上传、下载、覆盖、单文件大小和允许路径控制；
-- 可视化配置与 YAML 源码共享同一份草稿；
-- 每个策略对应 `~/.hoplane/policies/*.yaml`；
-- 严格 Schema 校验，未知字段和错误枚举不会生效；
-- 外部合法修改自动生成新版本，无效修改继续使用上一有效快照；
-- 文件缺失或策略停用时，绑定主机的操作统一拒绝。
+Docker、Compose 与 Kubernetes 仍通过通用 `execute_command` 执行，不是独立容器 API。Hoplane 使用命令正则识别常见操作，包括：
 
-> 黑名单和正则策略不能替代服务器端最小权限。生产环境仍应为 AI 使用独立的低权限 SSH 账号，并优先选择受限模板。
+- Docker 启停、重启、`exec`、`run`、删除、构建、清理和部分 Compose 写操作；
+- Kubernetes 重启、扩缩容、`set`、`exec`、`apply`、`patch`、`delete`、`port-forward` 和部分节点维护操作；
+- Shell 组合符、重定向、命令替换、sudo/env/Shell 包装。
+
+> 黑名单是正则匹配，不是 Shell AST、Docker 授权插件或 Kubernetes RBAC。未收录的命令形式默认允许，规则也可能产生误判。生产环境仍应为 AI 使用独立低权限账号，并结合系统权限、容器权限与集群 RBAC。
+
+### YAML 策略同步
+
+每个策略对应一个本地 YAML 文件：
+
+```text
+~/.hoplane/policies/<slug>--<uuid>.yaml
+```
+
+- App 的可视化编辑器与 YAML 编辑器共享同一份草稿；
+- Core 监听策略目录顶层的 `.yaml` 与 `.yml` 文件；
+- 合法新增文件会自动导入，没有 `id` 时生成 UUID 并回写；
+- 合法修改会更新 SQLite 运行快照并增加版本；
+- 未知字段、错误类型、非 V3 Schema 和无效正则不会生效；
+- 已有策略的 YAML 无效时保留上一份有效运行快照，并显示错误位置；
+- 文件缺失时策略标记为 `MISSING`，绑定主机的后续操作统一拒绝；
+- 可从上一份有效快照恢复缺失文件；
+- 保存使用 `expectedVersion` 乐观锁，避免覆盖外部修改；
+- Hoplane 保存 YAML 时使用临时文件加原子重命名，目录/文件权限分别为 `0700` / `0600`。
 
 ### 命令与文件操作
 
-- 非交互式远程命令执行；
-- 命令工作目录和最长执行时间控制；
-- 最多 20 个并发 SSH 连接；
-- stdout、stderr、请求体和超时上限；
-- SFTP 上传和下载；
-- 本地路径 `realpath` 边界检查；
-- 远端路径词法校验和服务器端 `realpath` 二次检查；
+- 非交互式远程命令最大 32,768 字符；
+- 超时范围 100 毫秒至 300 秒，默认 30 秒；
+- stdout 与 stderr 默认各限制为 1 MiB，达到上限后标记截断；
+- SFTP 上传与下载单个文件；
+- 上传源必须是现有普通文件；
+- 本地路径经过 `realpath` 后检查允许根目录；
+- 远端路径必须是绝对 POSIX 路径；
+- 下载会复核远端最终路径，上传会复核目标父目录；
 - 下载先写入权限为 `0600` 的临时文件，再原子移动；
+- 覆盖权限与单文件大小由策略独立控制；
 - 超时会主动关闭对应 SSH channel。
 
-### 指令记录与审计
+### 指令记录、实时输出与审计
 
-- 每台主机提供独立的只读“指令记录”页面；
-- 显示 AI/MCP、CLI 和 UI 发起的命令、策略判断、stdout、stderr、退出码和耗时；
-- 是否显示实时命令输出可以按主机关闭；
-- 实时输出使用用户保险库派生的密钥保护，仅在内存中保留有限事件窗口；
-- stdout/stderr 不持久化，Core 退出后不会恢复；
-- 审计数据库保留请求摘要、策略结果、状态和脱敏错误信息。
+- 每台主机提供只读“指令记录”页面；
+- 持久审计记录命令、文件传输、连接测试、凭据查看和人工终端会话；
+- 记录来源、客户端 ID、主机快照、请求摘要、策略及版本、判断结果、原因码、状态、退出码、耗时、传输字节数和错误；
+- 拒绝、失败、超时和 Core 中断同样进入审计；
+- 命令和文件路径摘要会对常见敏感模式进行自动脱敏并限制长度；
+- stdout/stderr 不写入 SQLite；
+- 按主机开启输出显示后，脱敏后的实时输出通过 SSE 展示；
+- 实时输出使用保险库密钥进行 AES-256-GCM 加密，仅在 Core 内存中保留每台主机最近 500 个事件；
+- 关闭输出、锁定保险库或退出 Core 后，实时输出无法恢复；
+- 人工终端只审计会话边界，不保存用户输入和终端输出。
 
-### Agent 集成
+实时命令结果仍会返回给发起操作的 MCP/CLI 调用方。“不持久化 stdout/stderr”不表示 Agent 看不到执行结果。自动脱敏基于有限规则，用户不应主动把任意秘密写入命令行。
 
-- Codex、Cursor、Claude Code 配置目录有限扫描和手动选择；
-- 一键安装 Hoplane Skill；
-- 一键写入或刷新稳定的 stdio MCP 启动入口；
-- App 内运行诊断和真实工具列表验证；
-- 可选 Streamable HTTP MCP，默认关闭且只监听本机；
-- `aiterm` CLI 与 MCP 共用策略和审计逻辑。
+## Agent 集成
 
-MCP 工具：
+### 一键 stdio 集成
+
+| Agent | 默认 Skill 位置 | 默认 MCP 配置 |
+| --- | --- | --- |
+| Codex | `~/.codex/skills/hoplane` | `~/.codex/config.toml` |
+| Cursor | `~/.cursor/skills/hoplane` | `~/.cursor/mcp.json` |
+| Claude Code | `~/.claude/skills/hoplane` | `~/.claude.json` |
+| WorkBuddy | `~/.workbuddy/skills/hoplane` | `~/.workbuddy/mcp.json` |
+
+App 会：
+
+1. 只检查有限的常见配置位置，不递归扫描整个用户目录；
+2. 验证目录、配置文件结构和可写性；
+3. 在存在多个有效目录时让用户选择，也支持手动填写绝对路径；
+4. 安装 Hoplane Skill；
+5. 保留其他配置，只新增或刷新 `hoplane` MCP；
+6. 首次修改非空配置时创建一次 `.hoplane-backup`；
+7. 写入使用当前 Hoplane App 内置运行时的 stdio 启动入口。
+
+stdio 集成不依赖系统 Node、HTTP MCP 开关或 HTTP Bearer Token。安装完成后必须完全退出并重新打开对应 Agent。配置保存的是 Hoplane App 和适配器的绝对路径，因此应先把 App 放到固定位置；移动或重装 App 后，需要回到“接入”页刷新路径。
+
+Codex 页面还可以直接运行 stdio 初始化和工具列表诊断。其他一键集成会在 Skill 中安装 `scripts/diagnose` 与 `scripts/diagnose.cmd`。
+
+### Streamable HTTP
+
+其他支持 Streamable HTTP MCP 的客户端可以使用：
+
+```text
+http://127.0.0.1:21722/mcp
+```
+
+HTTP MCP 默认关闭，只监听本机地址，并要求保险库中的独立 Bearer Token。App 会生成可复制的配置，但不同 Agent 的字段格式可能不同，应以目标客户端文档为准。HTTP 开关与 stdio 一键集成互不影响。
+
+### MCP 工具
 
 ```text
 list_hosts
@@ -182,101 +303,119 @@ upload_file
 download_file
 ```
 
-`list_hosts` 只列出同时满足 `enabled=true` 和 `aiAccessEnabled=true` 的主机，所有操作都使用 `host_id` 指定目标主机。
+`list_hosts` 只返回同时满足 `enabled=true` 与 `aiAccessEnabled=true` 的主机。所有操作使用 `host_id` 指定目标主机；Agent 不会获得 SSH 凭据。
 
 ## 快速开始
 
 ### 使用安装包
 
-发布文件位于 GitHub Release：
+构建产物位于 `release/`。发布到 [GitHub Releases](https://github.com/HaotMan/Hoplane/releases) 时，可提供：
 
 ```text
 Hoplane-<version>-macos-arm64-installer.dmg
+Hoplane-<version>-arm64-mac.zip
 Hoplane-<version>-windows-x64-installer.exe
 Hoplane-<version>-windows-x64.zip
 ```
 
-当前构建尚未进行代码签名。系统首次打开时可能显示未知开发者或未知发布者提示。
+macOS：从 DMG 将 App 移到 `/Applications` 等固定目录，或将 ZIP 解压到固定目录后运行。
 
-首次使用：
+Windows：运行可选择安装目录的 NSIS Installer，或将 ZIP 解压到固定目录后运行 `Hoplane.exe`。
 
-1. 启动 Hoplane 并创建本地保险库主密码；
-2. 添加主机，在同一表单中填写连接信息和认证方式；
-3. 测试连接并核对首次出现的 SSH 主机指纹；
-4. 为主机选择策略，测试成功后再开启“允许 AI 访问”；
-5. 在“接入”页面选择 Agent 和配置目录，点击一键安装；
-6. 完全退出并重新打开 Agent 客户端，让新 Skill 和 MCP 配置生效。
+当前产物未进行正式签名或公证，首次打开可能出现未知开发者/未知发布者提示。项目当前没有 Linux 安装包。
 
-之后可以直接对 Agent 说：
+首次配置：
+
+1. 启动 Hoplane，创建至少 10 个字符的本地保险库主密码；
+2. 添加主机和第一套登录身份；
+3. 等待自动连接测试，并人工核对首次出现的 SSH 主机指纹；
+4. 选择权限策略，再开启“允许 AI 访问”；
+5. 如有需要，添加备用登录身份并配置 sudo；
+6. 在“接入”页选择 Agent 与配置目录，点击一键安装；
+7. 完全退出并重新打开 Agent，使 Skill 与 MCP 配置生效。
+
+然后可以直接对 Agent 说：
 
 ```text
 用 Hoplane 检查 Production API 上失败的 systemd 服务。
 用 Hoplane 查看 Kubernetes Control 的 Pod 状态。
-用 Hoplane 下载应用日志到本地 Downloads 目录。
+用 Hoplane 下载应用日志到本地指定目录。
 ```
 
-### 从源码运行
+## CLI
 
-构建要求：
+完成 `pnpm build` 后：
 
-- Node.js 24；
-- pnpm 11；
-- 可访问的 SSH 服务器用于真实连接测试。
+```bash
+pnpm cli -- core status
+pnpm cli -- host list
+pnpm cli -- host test <host-id>
+pnpm cli -- exec <host-id> --directory /opt/app --timeout 30000 -- df -h
+pnpm cli -- upload <host-id> ./app.tar /opt/app/app.tar
+pnpm cli -- download <host-id> /var/log/app.log ./app.log
+```
+
+CLI 会按需启动构建后的 Core。命令与文件操作仍经过主机状态、策略、凭据和审计链路。
+
+## 从源码开发
+
+建议环境：
+
+- Node.js 24 或更高版本；
+- pnpm `11.15.0`；
+- 用于真实连接测试的 SSH 服务器。
+
+安装与开发：
 
 ```bash
 pnpm install
-pnpm build
-pnpm app
+pnpm dev
 ```
 
-开发模式：
+也可以分别启动：
 
 ```bash
 pnpm dev:core
 pnpm dev:desktop
 ```
 
-构建当前平台安装包：
+构建与运行：
+
+```bash
+pnpm build
+pnpm app
+```
+
+`pnpm app` 运行已经构建的源码产物。Agent 一键集成依赖安装包中的 Skill 资源，完整测试一键安装时应使用打包后的 App。
+
+构建 macOS DMG 与 ZIP：
 
 ```bash
 pnpm build:app
 ```
 
-构建 Windows x64 安装包和免安装 ZIP：
+构建 Windows x64 NSIS Installer 与 ZIP：
 
 ```bash
 pnpm build:app:win
 ```
 
-桌面 App 会启动内置 Core 并驻留托盘。关闭窗口不会停止 MCP；需要通过托盘菜单“退出”才能结束进程。也可以运行 `pnpm core` 单独启动浏览器版本。
-
-## CLI
-
-构建后可以运行：
-
-```bash
-pnpm cli -- host list
-pnpm cli -- host test <host-id>
-pnpm cli -- exec <host-id> --directory /opt/app -- df -h
-pnpm cli -- upload <host-id> ./app.tar /opt/app/app.tar
-pnpm cli -- download <host-id> /var/log/app.log ./app.log
-```
-
-CLI 会按需启动构建后的 Core，不直接调用 SSH Connection Manager。
+App 会启动内置 Core 并驻留托盘。关闭窗口只会隐藏界面，Core 与 MCP 仍继续运行；需要从托盘菜单选择“退出”才能结束进程。托盘菜单也支持设置登录时启动。
 
 ## 数据目录
 
-默认数据保存在 `~/.hoplane`：
+默认数据位于 `~/.hoplane`：
 
 ```text
-hoplane.sqlite3  主机、策略版本和审计数据
-core.token       本地 API 随机 Token（权限 0600）
+hoplane.sqlite3  主机、登录身份、策略运行快照和审计
+core.token       本地 Core API 随机 Token（0600）
 core.pid         Core 进程 ID
-vault.enc        本地加密凭据保险库（权限 0600）
-policies/        可直接编辑的策略 YAML 文件
+core.log         Core 日志
+vault.enc        本地加密保险库（0600）
+policies/        可直接编辑的 Policy V3 YAML
 ```
 
-可以使用以下环境变量覆盖测试实例的数据目录和端口：
+可用于测试实例的环境变量：
 
 ```text
 HOPLANE_DATA_DIR
@@ -284,16 +423,20 @@ HOPLANE_CORE_PORT
 HOPLANE_OUTPUT_LIMIT_BYTES
 ```
 
+Core 与管理界面默认只监听 `127.0.0.1:21722`。
+
 ## 安全边界
 
-- Core API、管理界面和 HTTP MCP 只监听 `127.0.0.1`；
-- HTTP MCP 默认关闭，使用保险库中的独立随机 Bearer Token；
-- HTTP MCP 校验 `127.0.0.1`/`localhost` Host 头，阻止跨源访问和 DNS 重绑定；
-- 新的或发生变化的 SSH 主机指纹只能由管理界面确认，MCP 无权接受；
-- MCP 和 CLI 无法调用凭据查看接口；
-- sudo 密码只会在远端随机提示标记出现后通过 SSH 标准输入发送一次；未配置时强制使用 `sudo -n`，不会等待交互输入；
-- 审计摘要和实时输出经过脱敏并限制长度；
-- 管理界面与 Core 同源，不开放任意系统命令 IPC。
+- Core API、管理界面与 HTTP MCP 只监听本机回环地址；
+- HTTP MCP 默认关闭，并使用保险库中的独立随机 Token；
+- HTTP MCP 校验 `127.0.0.1` / `localhost` Host 头；
+- 新的或变化的 SSH 指纹只能由 App 用户确认；
+- MCP 和 CLI 不能查看凭据或修改信任指纹；
+- 受管 sudo 密码只在随机远端提示出现后通过 SSH stdin 应答；
+- 审计摘要和实时输出会对常见敏感模式进行脱敏并限制长度；
+- 管理界面与 Core 同源，Electron 不向网页开放任意系统命令能力；
+- 人工交互终端不经过 AI Policy V3，只提供会话级审计；
+- 黑名单不能代替远端系统权限、容器权限或 Kubernetes RBAC。
 
 ## 验证
 
@@ -301,23 +444,54 @@ HOPLANE_OUTPUT_LIMIT_BYTES
 pnpm typecheck
 pnpm test
 pnpm build
-pnpm build:app
 ```
 
-自动化测试覆盖策略匹配、Shell 绕过、目录边界、数据库迁移、YAML 同步、版本冲突、连接 revision、主机指纹、保险库、审计脱敏、操作监控、SSH Config 解析和 MCP HTTP 鉴权。
+自动化测试覆盖：
 
-## 当前边界
+- Policy V3 命令黑名单、文件路径边界、YAML 同步与版本冲突；
+- 数据库迁移、多登录身份、分组重命名和主机状态；
+- 本地保险库、凭据查看保护与审计脱敏；
+- sudo 命令识别、链式多 sudo 应答和端到端 SSH 行为；
+- SSH Config 解析、主机指纹与连接错误分类；
+- Agent 配置目录扫描、一键集成与 stdio 工具诊断；
+- MCP HTTP 鉴权、操作监控和实时输出。
 
-- 不支持交互式 PTY、Vim、Top、GDB 或持久终端会话；
-- 不支持 MFA、SOCKS、ProxyJump 和团队同步；
-- SSH Config 导入暂不支持复杂的 `Include`、`Match`、`ProxyJump` 和通配符继承；
-- HTTP MCP 当前使用单个本机 Agent Token，不支持每个客户端独立过期和吊销；
-- 本地主密码不可恢复且暂不支持修改，忘记密码需要重建保险库并重新录入凭据；
-- 当前安装包尚未签名或公证；
-- Node.js `node:sqlite` 仍可能输出实验性 API 提示。
+## 当前限制
+
+- Policy V3 是正则黑名单，不是完整 Shell 语法分析器；未收录形式默认允许，也可能误判；
+- 人工终端会话不持久化，断开或重启后不能恢复；
+- 暂不支持 MFA、SOCKS、ProxyJump、堡垒机链路和团队同步；
+- SSH Config 导入不支持复杂的 `Include`、`Match`、`ProxyJump` 与通配继承；
+- HTTP MCP 当前使用单个本机 Agent Token，不支持按客户端独立过期和吊销；
+- 本地主密码不可恢复且暂不支持修改；
+- 审计记录暂时没有可配置的自动保留期或清理界面；
+- 当前只提供 macOS 与 Windows 构建目标，没有 Linux 安装包；
+- 安装包尚未正式签名或公证；
+- Node.js `node:sqlite` 在部分版本中可能输出实验性 API 提示。
+
+## 项目结构
+
+```text
+apps/
+  desktop/            React + Electron 桌面 App、人工终端
+  cli/                aiterm CLI
+packages/
+  core/               本地 API、保险库、审计、Agent 集成、终端网关
+  ssh-core/           SSH/SFTP、连接池、主机指纹、sudo 处理
+  policy/             Policy V3 命令与文件判断
+  mcp-adapter/        stdio MCP 适配器与工具
+  audit/              脱敏
+  shared/             类型、Schema 与内置策略模板
+integrations/
+  codex/hoplane/      App 内置的 Hoplane Skill
+docs/                 MVP 需求、设计和实现说明
+test/                 单元、集成与 SSH 端到端测试
+```
 
 ## 进一步了解
 
 - [MVP 需求文档](docs/AI远程终端管理器-MVP需求文档.md)
 - [MVP 设计文档](docs/AI远程终端管理器-MVP设计文档.md)
 - [实现说明与后续计划](docs/MVP实现说明.md)
+
+这些文档记录了项目演进过程；当前功能与安全边界以本 README 和现有代码为准。
