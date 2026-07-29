@@ -5,9 +5,15 @@ export class ApiError extends Error {
 }
 
 export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const method = (options.method ?? "GET").toUpperCase();
+  const headers = new Headers(options.headers);
+  const isMutation = method !== "GET" && method !== "HEAD";
+  if (!headers.has("content-type") && (typeof options.body === "string" || (isMutation && options.body === undefined))) {
+    headers.set("content-type", "application/json");
+  }
   const response = await fetch(path, {
     ...options,
-    headers: { ...(options.body ? { "content-type": "application/json" } : {}), ...options.headers }
+    headers
   });
   const result = await response.json() as Record<string, unknown>;
   if (!response.ok) throw new ApiError(String(result.code ?? "API_ERROR"), String(result.message ?? "Request failed"), result.details as Record<string, unknown> | undefined);
