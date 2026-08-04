@@ -1,5 +1,7 @@
 import { app, BrowserWindow, Menu, Tray, ipcMain, nativeImage, shell } from "electron";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import type { CoreConfig } from "../../../packages/core/src/config.js";
 import type { CoreRuntime } from "../../../packages/core/src/server.js";
 
 process.stderr.write("Hoplane desktop initializing\n");
@@ -9,24 +11,33 @@ let tray: Tray | null = null;
 let runtime: CoreRuntime | null = null;
 let quitting = false;
 let shutdownComplete = false;
-const coreUrl = "http://127.0.0.1:21722";
+let coreUrl = "http://127.0.0.1:21722";
 
 void app.whenReady().then(async () => {
   process.stderr.write("Hoplane desktop ready\n");
-  try {
-    process.env.HOPLANE_MCP_RUNTIME = process.execPath;
-    process.env.HOPLANE_MCP_ENTRY = join(app.getAppPath(), "dist", "packages", "mcp-adapter", "src", "index.js");
-    process.env.HOPLANE_MCP_DIAGNOSE_ENTRY = join(app.getAppPath(), "dist", "packages", "mcp-adapter", "src", "diagnose.js");
-    process.env.HOPLANE_MCP_RUNTIME_IS_ELECTRON = "1";
-    process.env.HOPLANE_CODEX_SKILL_SOURCE = join(process.resourcesPath, "codex", "hoplane");
-    const { startCore } = await import("../../../packages/core/src/server.js");
-    runtime = await startCore({ staticRoot: join(app.getAppPath(), "apps", "desktop", "dist") });
-    const { loadConfig } = await import("../../../packages/core/src/config.js");
-    ipcMain.handle("hoplane:open-policies-directory", async () => { await shell.openPath(loadConfig().policyDir); });
-  } catch (error) {
-    const healthy = await fetch(`${coreUrl}/health`).then((response) => response.ok).catch(() => false);
-    if (!healthy) throw error;
+  process.env.HOPLANE_MCP_RUNTIME = process.execPath;
+  process.env.HOPLANE_MCP_ENTRY = join(app.getAppPath(), "dist", "packages", "mcp-adapter", "src", "index.js");
+  process.env.HOPLANE_MCP_DIAGNOSE_ENTRY = join(app.getAppPath(), "dist", "packages", "mcp-adapter", "src", "diagnose.js");
+  process.env.HOPLANE_MCP_RUNTIME_IS_ELECTRON = "1";
+  process.env.HOPLANE_CODEX_SKILL_SOURCE = join(process.resourcesPath, "codex", "hoplane");
+  const { loadConfig } = await import("../../../packages/core/src/config.js");
+  const { computeUiBuildId, startCore } = await import("../../../packages/core/src/server.js");
+  const config = loadConfig();
+  const staticRoot = join(app.getAppPath(), "apps", "desktop", "dist");
+  const expectedUiBuildId = await computeUiBuildId(staticRoot);
+  if (!expectedUiBuildId) throw new Error(`Packaged Hoplane UI is missing from ${staticRoot}`);
+  coreUrl = `http://${config.host}:${config.port}`;
+  const existing = await readCoreHealth(coreUrl);
+  if (existing && existing.uiBuildId !== expectedUiBuildId) {
+    process.stderr.write(`Replacing stale Hoplane Core (${existing.uiBuildId ?? "legacy"}) with UI build ${expectedUiBuildId}\n`);
+    await stopExistingCore(config, coreUrl);
   }
+  if (!existing || existing.uiBuildId !== expectedUiBuildId) {
+    runtime = await startCore({ staticRoot });
+  } else {
+    process.stderr.write(`Reusing Hoplane Core with matching UI build ${expectedUiBuildId}\n`);
+  }
+  ipcMain.handle("hoplane:open-policies-directory", async () => { await shell.openPath(config.policyDir); });
   createWindow();
   createTray();
 }).catch((error: unknown) => {
@@ -110,4 +121,40 @@ function showWindow(): void {
   if (!window) createWindow();
   window?.show();
   window?.focus();
+}
+
+interface CoreHealth {
+  status: string;
+  version?: string;
+  uiBuildId?: string;
+}
+
+async function readCoreHealth(url: string): Promise<CoreHealth | null> {
+  try {
+    const response = await fetch(`${url}/health`, { signal: AbortSignal.timeout(500) });
+    if (!response.ok) return null;
+    return await response.json() as CoreHealth;
+  } catch {
+    return null;
+  }
+}
+
+async function stopExistingCore(config: CoreConfig, url: string): Promise<void> {
+  const rawPid = await readFile(config.pidPath, "utf8").catch(() => "");
+  if (!/^[1-9][0-9]*\s*$/u.test(rawPid)) {
+    throw new Error(`A stale Hoplane Core is listening at ${url}, but ${config.pidPath} does not contain a valid process ID`);
+  }
+  const pid = Number(rawPid.trim());
+  if (pid === process.pid) throw new Error("Refusing to stop the current Hoplane desktop process");
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "ESRCH") throw error;
+  }
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    if (!await readCoreHealth(url)) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`Timed out while replacing the stale Hoplane Core at ${url}`);
 }

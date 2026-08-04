@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { timingSafeEqual, randomUUID } from "node:crypto";
+import { createHash, timingSafeEqual, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile, stat, writeFile, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -67,6 +67,16 @@ function resolveDefaultStaticRoot(): string {
   return candidates[0]!;
 }
 
+export async function computeUiBuildId(staticRoot: string): Promise<string | null> {
+  try {
+    const index = await readFile(join(staticRoot, "index.html"));
+    return createHash("sha256").update(index).digest("hex").slice(0, 16);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+}
+
 export async function startCore(options: { staticRoot?: string; registerProcessSignals?: boolean } = {}): Promise<CoreRuntime> {
 const config = loadConfig();
 await ensurePrivateDirectory(config.dataDir);
@@ -90,12 +100,13 @@ const claudeCodeIntegration = new JsonAgentIntegrationService("claude-code", sav
 const workbuddyIntegration = new JsonAgentIntegrationService("workbuddy", savedWorkbuddyDirectory ? { configDirectory: savedWorkbuddyDirectory } : {});
 const jsonAgentIntegrations = { cursor: cursorIntegration, "claude-code": claudeCodeIntegration, workbuddy: workbuddyIntegration } as const;
 const staticRoot = options.staticRoot ?? resolveDefaultStaticRoot();
+const uiBuildId = await computeUiBuildId(staticRoot);
 
 const server = createServer(async (request, response) => {
   try {
     applySecurityHeaders(response);
     const url = new URL(request.url ?? "/", `http://${config.host}:${config.port}`);
-    if (url.pathname === "/health" && request.method === "GET") return json(response, 200, { status: "ok", version: "0.1.2", mcpEnabled: mcpService.isEnabled() });
+    if (url.pathname === "/health" && request.method === "GET") return json(response, 200, { status: "ok", version: "0.1.2", uiBuildId, mcpEnabled: mcpService.isEnabled() });
     if (url.pathname === "/mcp") {
       const parsed = request.method === "POST" ? await body(request) : undefined;
       return await mcpService.handle(request, response, parsed);
