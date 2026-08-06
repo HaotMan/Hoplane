@@ -241,7 +241,7 @@ export class CodexIntegrationService {
       await withTimeout(client.connect(transport), 15_000, "Hoplane stdio MCP initialization timed out");
       const tools = await withTimeout(client.listTools(), 5_000, "Hoplane MCP tool listing timed out");
       const toolNames = tools.tools.map((tool) => tool.name);
-      const expected = ["list_hosts", "test_host", "execute_command", "upload_file", "download_file"];
+      const expected = ["list_hosts", "test_host", "execute_command", "upload_file", "download_file", "transfer_file"];
       const complete = expected.every((name) => toolNames.includes(name));
       checks.push({ name: "stdio MCP", ok: complete, detail: complete ? `${toolNames.length} tools loaded` : `Missing tools: ${expected.filter((name) => !toolNames.includes(name)).join(", ")}` });
       return { ok: checks.every((check) => check.ok), toolNames, checks };

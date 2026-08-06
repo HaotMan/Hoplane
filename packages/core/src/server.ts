@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { z, ZodError } from "zod";
 import {
   AppError, asAppError, commandRequestSchema, credentialInputSchema, DEFAULT_POLICY_TEMPLATE, hostInputSchema, hostLoginInputSchema, hostPatchSchema,
-  policyInputSchema, transferRequestSchema
+  policyInputSchema, transferRequestSchema, hostTransferRequestSchema
 } from "../../shared/src/index.js";
 import type { Credential, Host } from "../../shared/src/index.js";
 import { loadConfig, ensurePrivateDirectory, getOrCreateCoreToken } from "./config.js";
@@ -625,6 +625,9 @@ async function routeApi(request: IncomingMessage, response: ServerResponse, url:
   }
   if (method === "POST" && url.pathname === "/v1/operations/download") {
     return json(response, 200, await operations.downloadFile(transferRequestSchema.parse(await body(request))));
+  }
+  if (method === "POST" && url.pathname === "/v1/operations/transfer") {
+    return json(response, 200, await operations.transferFile(hostTransferRequestSchema.parse(await body(request))));
   }
   throw new AppError("NOT_FOUND", "Route not found", false, undefined, undefined, 404);
 }

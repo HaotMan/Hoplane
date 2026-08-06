@@ -9,7 +9,8 @@ const backend: HoplaneMcpBackend = {
   testHost: (hostId) => client.request("POST", `/v1/hosts/${hostId}/test`, { clientType: "MCP", clientId: "mcp-stdio" }),
   executeCommand: (input) => client.request("POST", "/v1/operations/execute", { ...input, clientType: "MCP", clientId: "mcp-stdio" }),
   uploadFile: (input) => client.request("POST", "/v1/operations/upload", { ...input, clientType: "MCP", clientId: "mcp-stdio" }),
-  downloadFile: (input) => client.request("POST", "/v1/operations/download", { ...input, clientType: "MCP", clientId: "mcp-stdio" })
+  downloadFile: (input) => client.request("POST", "/v1/operations/download", { ...input, clientType: "MCP", clientId: "mcp-stdio" }),
+  transferFile: (input) => client.request("POST", "/v1/operations/transfer", { ...input, clientType: "MCP", clientId: "mcp-stdio" })
 };
 const server = createHoplaneMcpServer(backend);
 

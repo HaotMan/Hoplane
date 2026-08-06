@@ -50,6 +50,7 @@ export interface Host {
   defaultDirectory: string | null;
   enabled: boolean;
   aiAccessEnabled: boolean;
+  hostTransferEnabled: boolean;
   monitorOutputEnabled: boolean;
   configRevision: number;
   createdAt: string;
@@ -86,7 +87,7 @@ export interface Credential {
 }
 
 export interface PolicyDocument {
-  schemaVersion: 3;
+  schemaVersion: 4;
   commandBlacklist: PolicyCommandRule[];
   files: {
     allowUpload: boolean;
@@ -105,7 +106,7 @@ export interface Policy {
   name: string;
   version: number;
   document: PolicyDocument;
-  schemaVersion: 3;
+  schemaVersion: 4;
   enabled: boolean;
   sourcePath: string | null;
   sourceStatus: PolicySourceStatus;
@@ -155,16 +156,33 @@ export interface TransferResult {
   durationMs: number;
 }
 
+export interface HostTransferRequest {
+  sourceHostId: string;
+  sourcePath: string;
+  destinationHostId: string;
+  destinationPath: string;
+  clientType: "MCP" | "CLI" | "UI";
+  clientId?: string;
+}
+
+export interface HostTransferResult extends TransferResult {
+  transport: "SFTP" | "SSH_STREAM";
+}
+
 export interface AuditLog {
   id: string;
   clientType: string;
   clientId: string | null;
   hostId: string | null;
   hostNameSnapshot: string | null;
+  peerHostId: string | null;
+  peerHostNameSnapshot: string | null;
   operationType: string;
   requestSummary: string | null;
   policyId: string | null;
   policyVersion: number | null;
+  peerPolicyId: string | null;
+  peerPolicyVersion: number | null;
   policyDecision: PolicyDecision | null;
   decisionReasonCode: string | null;
   status: OperationStatus;

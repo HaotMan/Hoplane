@@ -45,7 +45,7 @@ const commonMutation = ["power", "packages", "filesystem", "users", "signals", "
 
 function base(commandBlacklist: PolicyCommandRule[] = [], files: Partial<PolicyDocument["files"]> = {}): PolicyDocument {
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     commandBlacklist,
     files: {
       allowUpload: false, allowDownload: false, allowOverwrite: false,

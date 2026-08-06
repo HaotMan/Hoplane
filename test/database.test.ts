@@ -20,10 +20,12 @@ describe("HoplaneDatabase", () => {
     const policies = db.listPolicies();
     expect(policies.map((policy) => policy.name).sort()).toEqual(POLICY_TEMPLATES.map((template) => template.name).sort());
     const diagnostic = policies.find((policy) => policy.name === "错误追溯（推荐）")!;
-    expect(diagnostic.document).toMatchObject({ schemaVersion: 3, files: { allowUpload: false, allowDownload: false } });
+    expect(diagnostic.document).toMatchObject({ schemaVersion: 4, files: { allowUpload: false, allowDownload: false } });
+    expect(diagnostic.document.files).not.toHaveProperty("allowHostTransfer");
     expect(diagnostic.document.commandBlacklist.length).toBeGreaterThan(0);
     const fullAccess = policies.find((policy) => policy.name === "全权限（高风险）")!;
-    expect(fullAccess.document).toMatchObject({ schemaVersion: 3, commandBlacklist: [], files: { allowUpload: true, allowDownload: true } });
+    expect(fullAccess.document).toMatchObject({ schemaVersion: 4, commandBlacklist: [], files: { allowUpload: true, allowDownload: true } });
+    expect(fullAccess.document.files).not.toHaveProperty("allowHostTransfer");
     db.close();
   });
   it("merges legacy Docker and Kubernetes templates and rebinds their hosts", async () => {
@@ -98,17 +100,51 @@ describe("HoplaneDatabase", () => {
     const db = new HoplaneDatabase(path);
     const policies = db.listPolicies();
     expect(policies).toHaveLength(POLICY_TEMPLATES.length);
-    expect(policies.every((policy) => policy.schemaVersion === 3 && policy.document.schemaVersion === 3)).toBe(true);
+    expect(policies.every((policy) => policy.schemaVersion === 4 && policy.document.schemaVersion === 4)).toBe(true);
     const host = db.getHost("legacy-host")!;
     expect(host.policyId).not.toBe("legacy-policy");
     expect(policies.find((policy) => policy.id === host.policyId)?.name).toBe("错误追溯（推荐）");
     const columns = db.db.prepare("PRAGMA table_info(policies)").all().map((row) => String((row as { name: unknown }).name));
     expect(columns).toEqual(expect.arrayContaining(["schema_version", "enabled", "source_path", "source_status", "source_error", "source_hash"]));
     const hostColumns = db.db.prepare("PRAGMA table_info(hosts)").all().map((row) => String((row as { name: unknown }).name));
-    expect(hostColumns).toContain("monitor_output_enabled");
+    expect(hostColumns).toEqual(expect.arrayContaining(["monitor_output_enabled", "host_transfer_enabled"]));
+    expect(host.hostTransferEnabled).toBe(false);
     const credentialColumns = db.db.prepare("PRAGMA table_info(credentials)").all().map((row) => String((row as { name: unknown }).name));
     expect(credentialColumns).toEqual(expect.arrayContaining(["sudo_mode", "sudo_secret_ref"]));
     db.close();
+  });
+  it("upgrades V3 policies in place without losing custom rules or host bindings", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hoplane-test-")); dirs.push(dir);
+    const path = join(dir, "policy-v3.sqlite3");
+    const initial = new HoplaneDatabase(path);
+    const custom = initial.createPolicy("Custom V3", {
+      ...initial.listPolicies()[0]!.document,
+      commandBlacklist: [{ pattern: "^custom(?:\\s|$)", description: "custom rule" }]
+    });
+    const host = initial.createHost({
+      name: "bound", hostname: "127.0.0.1", port: 22, username: "root", credentialId: null,
+      policyId: custom.id, groupName: null, tags: [], defaultDirectory: null, enabled: true, aiAccessEnabled: true
+    });
+    initial.close();
+
+    const raw = new DatabaseSync(path);
+    const stored = JSON.parse(String((raw.prepare("SELECT policy_json FROM policies WHERE id=?").get(custom.id) as { policy_json: string }).policy_json)) as Record<string, unknown>;
+    const files = { ...(stored.files as Record<string, unknown>), allowHostTransfer: true };
+    raw.prepare("UPDATE policies SET policy_json=?,schema_version=3 WHERE id=?")
+      .run(JSON.stringify({ ...stored, schemaVersion: 3, files }), custom.id);
+    raw.close();
+
+    const migrated = new HoplaneDatabase(path);
+    expect(migrated.getPolicy(custom.id)).toMatchObject({
+      id: custom.id,
+      name: "Custom V3",
+      schemaVersion: 4,
+      document: { schemaVersion: 4, commandBlacklist: [{ pattern: "^custom(?:\\s|$)", description: "custom rule" }] }
+    });
+    expect(migrated.getPolicy(custom.id)?.document.files).not.toHaveProperty("allowHostTransfer");
+    expect(migrated.getHost(host.id)?.policyId).toBe(custom.id);
+    expect(migrated.getHost(host.id)?.hostTransferEnabled).toBe(false);
+    migrated.close();
   });
   it("does not rotate connection revision for label-only changes", async () => {
     const db = await database();
@@ -116,6 +152,8 @@ describe("HoplaneDatabase", () => {
     const host = db.createHost({ name: "dev", hostname: "127.0.0.1", port: 22, username: "dev", credentialId: null, policyId: policy.id, groupName: null, tags: [], defaultDirectory: null, enabled: true, aiAccessEnabled: false });
     const renamed = db.updateHost(host.id, { name: "development" });
     expect(renamed.configRevision).toBe(host.configRevision);
+    const transferEnabled = db.updateHost(host.id, { hostTransferEnabled: true });
+    expect(transferEnabled).toMatchObject({ hostTransferEnabled: true, configRevision: host.configRevision });
     const moved = db.updateHost(host.id, { port: 2222 });
     expect(moved.configRevision).toBe(host.configRevision + 1);
     db.close();

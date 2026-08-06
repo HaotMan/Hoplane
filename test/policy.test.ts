@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { PolicyService } from "../packages/policy/src/index.js";
-import { findPolicyTemplate, type PolicyDocument } from "../packages/shared/src/index.js";
+import { findPolicyTemplate, policyDocumentSchema, type PolicyDocument } from "../packages/shared/src/index.js";
 
 function policy(commandBlacklist: PolicyDocument["commandBlacklist"] = []): PolicyDocument {
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     commandBlacklist,
     files: {
       allowUpload: false, allowDownload: false, allowOverwrite: false,
@@ -64,5 +64,28 @@ describe("PolicyService V3 blacklist mode", () => {
 
   it("supports a match-all blacklist for completely disabled policies", () => {
     expect(service.evaluateCommand(findPolicyTemplate("deny-all")!.document, "uptime").decision).toBe("DENY");
+  });
+
+  it("applies source and destination file constraints to host transfers", () => {
+    const source = policy();
+    source.files.allowedRemoteDownloadPaths = ["/exports"];
+    expect(service.evaluateHostTransferSource(source, "/exports/release.tar").reasonCode).toBe("SOURCE_DOWNLOAD_DISABLED");
+    source.files.allowDownload = true;
+    expect(service.evaluateHostTransferSource(source, "/exports/release.tar")).toMatchObject({ decision: "ALLOW", normalizedRemotePath: "/exports/release.tar" });
+    expect(service.evaluateHostTransferSource(source, "/private/release.tar").reasonCode).toBe("SOURCE_REMOTE_PATH_NOT_ALLOWED");
+
+    const destination = policy();
+    destination.files.allowUpload = true;
+    destination.files.allowedRemoteUploadPaths = ["/imports"];
+    expect(service.evaluateHostTransferDestination(destination, "/imports/release.tar").decision).toBe("ALLOW");
+    expect(service.evaluateHostTransferDestination(destination, "/outside/release.tar").reasonCode).toBe("DESTINATION_REMOTE_PATH_NOT_ALLOWED");
+    expect(service.evaluateHostTransferSize(source, destination, 1025).reasonCode).toBe("SOURCE_FILE_TOO_LARGE");
+  });
+
+  it("normalizes legacy policy documents without retaining the host transfer switch", () => {
+    const current = policy();
+    const upgraded = policyDocumentSchema.parse({ ...current, schemaVersion: 3, files: { ...current.files, allowHostTransfer: true } });
+    expect(upgraded).toMatchObject({ schemaVersion: 4 });
+    expect(upgraded.files).not.toHaveProperty("allowHostTransfer");
   });
 });

@@ -35,7 +35,8 @@ export class McpServiceManager {
       testHost: (hostId) => operations.testHost(hostId, "MCP", clientId),
       executeCommand: (input) => operations.executeCommand({ ...input, clientType: "MCP", clientId }),
       uploadFile: (input) => operations.uploadFile({ ...input, clientType: "MCP", clientId }),
-      downloadFile: (input) => operations.downloadFile({ ...input, clientType: "MCP", clientId })
+      downloadFile: (input) => operations.downloadFile({ ...input, clientType: "MCP", clientId }),
+      transferFile: (input) => operations.transferFile({ ...input, clientType: "MCP", clientId })
     };
   }
 

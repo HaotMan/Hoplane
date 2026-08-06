@@ -8,6 +8,7 @@ export interface HoplaneMcpBackend {
   executeCommand(input: { hostId: string; command: string; directory?: string; timeoutMs: number }): Promise<unknown>;
   uploadFile(input: { hostId: string; localPath: string; remotePath: string }): Promise<unknown>;
   downloadFile(input: { hostId: string; remotePath: string; localPath: string }): Promise<unknown>;
+  transferFile(input: { sourceHostId: string; sourcePath: string; destinationHostId: string; destinationPath: string }): Promise<unknown>;
 }
 
 export function createHoplaneMcpServer(backend: HoplaneMcpBackend): McpServer {
@@ -50,6 +51,20 @@ export function createHoplaneMcpServer(backend: HoplaneMcpBackend): McpServer {
     inputSchema: { host_id: z.string().uuid(), remote_path: z.string().min(1).max(4096), local_path: z.string().min(1).max(4096) }
   }, async ({ host_id, remote_path, local_path }) => toolCall(() => backend.downloadFile({
     hostId: host_id, localPath: local_path, remotePath: remote_path
+  })));
+
+  server.registerTool("transfer_file", {
+    title: "Transfer file between SSH hosts",
+    description: "Stream one regular file from an AI-enabled source host to an AI-enabled destination host through Hoplane. Both hosts must have their host-level file transfer switch enabled and advertise transfer_source / transfer_destination; policy file constraints still apply. SFTP is preferred, with a fixed POSIX SSH exec stream used only when the SFTP subsystem is unavailable. The hosts do not need direct connectivity and file contents are not returned.",
+    inputSchema: {
+      source_host_id: z.string().uuid(), source_path: z.string().min(1).max(4096),
+      destination_host_id: z.string().uuid(), destination_path: z.string().min(1).max(4096)
+    }
+  }, async ({ source_host_id, source_path, destination_host_id, destination_path }) => toolCall(() => backend.transferFile({
+    sourceHostId: source_host_id,
+    sourcePath: source_path,
+    destinationHostId: destination_host_id,
+    destinationPath: destination_path
   })));
 
   return server;

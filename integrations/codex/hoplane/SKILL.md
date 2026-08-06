@@ -1,6 +1,6 @@
 ---
 name: hoplane
-description: Use policy-controlled SSH hosts through the Hoplane MCP tools. Trigger when the user asks to inspect, test, operate, deploy to, upload to, download from, or troubleshoot a remote server managed by Hoplane, or when Hoplane MCP tools are missing or fail to initialize.
+description: Use policy-controlled SSH hosts through the Hoplane MCP tools. Trigger when the user asks to inspect, test, operate, deploy to, upload to, download from, transfer files between, or troubleshoot remote servers managed by Hoplane, or when Hoplane MCP tools are missing or fail to initialize.
 ---
 
 # Hoplane
@@ -14,7 +14,7 @@ Use Hoplane's MCP tools for every remote operation so credentials remain hidden 
 3. Call `list_hosts` before operating unless the user already supplied an unambiguous host ID from the current result.
 4. Match the requested host by ID or exact name. Ask before choosing between ambiguous hosts.
 5. Use `test_host` when connectivity is unknown. If a host key is new or changed, direct the user to confirm it in the Hoplane App; never accept it yourself.
-6. Use `execute_command`, `upload_file`, or `download_file` as requested. Preserve the user's command and paths; do not broaden an operation after a policy denial.
+6. Use `execute_command`, `upload_file`, or `download_file` as requested. For a file moving directly between two Hoplane hosts, use `transfer_file` so the Core streams it without exposing contents to the Agent or staging it on the local filesystem. Both hosts must advertise the corresponding `transfer_source` / `transfer_destination` capability, which requires their host-level transfer switches plus policy file constraints. Hoplane prefers SFTP and automatically uses its fixed POSIX SSH stream only when SFTP is unavailable; report the returned `transport`. Preserve both host IDs and paths; do not broaden an operation after a denial.
 7. Return stdout, stderr, exit code, duration, or transfer size concisely. Explain policy denials using the returned reason code.
 
 ## Privileged commands (sudo)

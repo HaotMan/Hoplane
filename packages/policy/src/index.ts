@@ -41,6 +41,34 @@ export class PolicyService {
     return { ...allow("DOWNLOAD_ALLOWED", "Download is permitted"), canonicalLocalPath: local, normalizedRemotePath: remote };
   }
 
+  evaluateHostTransferSource(policy: PolicyDocument, remotePath: string): PolicyResult & { normalizedRemotePath?: string } {
+    const files = policy.files;
+    if (!files.allowDownload) return deny("SOURCE_DOWNLOAD_DISABLED", "Downloads are disabled by the source policy");
+    let remote: string;
+    try { remote = normalizeRemote(remotePath); }
+    catch { return deny("SOURCE_REMOTE_PATH_INVALID", "Source path must be an absolute POSIX path"); }
+    const decision = evaluateRemotePath(remote, files.allowedRemoteDownloadPaths);
+    if (decision.decision === "DENY") return deny(`SOURCE_${decision.reasonCode}`, decision.reason);
+    return { ...allow("SOURCE_TRANSFER_ALLOWED", "Source path is permitted for host-to-host transfer"), normalizedRemotePath: remote };
+  }
+
+  evaluateHostTransferDestination(policy: PolicyDocument, remotePath: string): PolicyResult & { normalizedRemotePath?: string } {
+    const files = policy.files;
+    if (!files.allowUpload) return deny("DESTINATION_UPLOAD_DISABLED", "Uploads are disabled by the destination policy");
+    let remote: string;
+    try { remote = normalizeRemote(remotePath); }
+    catch { return deny("DESTINATION_REMOTE_PATH_INVALID", "Destination path must be an absolute POSIX path"); }
+    const decision = evaluateRemotePath(remote, files.allowedRemoteUploadPaths);
+    if (decision.decision === "DENY") return deny(`DESTINATION_${decision.reasonCode}`, decision.reason);
+    return { ...allow("DESTINATION_TRANSFER_ALLOWED", "Destination path is permitted for host-to-host transfer"), normalizedRemotePath: remote };
+  }
+
+  evaluateHostTransferSize(sourcePolicy: PolicyDocument, destinationPolicy: PolicyDocument, size: number): PolicyResult {
+    if (size > sourcePolicy.files.maxDownloadBytes) return deny("SOURCE_FILE_TOO_LARGE", "Source file exceeds the source download size limit");
+    if (size > destinationPolicy.files.maxUploadBytes) return deny("DESTINATION_FILE_TOO_LARGE", "Source file exceeds the destination upload size limit");
+    return allow("HOST_TRANSFER_SIZE_ALLOWED", "File size is permitted by both policies");
+  }
+
   evaluateCanonicalRemote(path: string, allowedRoots: string[]): PolicyResult { return evaluateRemotePath(path, allowedRoots); }
 }
 

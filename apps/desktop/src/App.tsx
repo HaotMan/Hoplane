@@ -446,9 +446,9 @@ function LiveTerminalEntry({ event }: { event: HostMonitorEvent }) {
 
 function terminalTime(value: string): string { return new Date(value).toLocaleTimeString([], { hour12: false }); }
 function terminalStatusClass(status?: string): string { return status === "SUCCEEDED" ? "success" : ["FAILED", "DENIED", "TIMED_OUT"].includes(status ?? "") ? "failure" : "muted"; }
-function operationLabel(value: string): string { return ({ EXECUTE_COMMAND: "执行命令", TEST_HOST: "连接测试", UPLOAD_FILE: "上传文件", DOWNLOAD_FILE: "下载文件", REVEAL_CREDENTIAL: "查看认证信息", TERMINAL_SESSION: "交互终端" } as Record<string, string>)[value] ?? value; }
+function operationLabel(value: string): string { return ({ EXECUTE_COMMAND: "执行命令", TEST_HOST: "连接测试", UPLOAD_FILE: "上传文件", DOWNLOAD_FILE: "下载文件", TRANSFER_FILE: "主机间传输", REVEAL_CREDENTIAL: "查看认证信息", TERMINAL_SESSION: "交互终端" } as Record<string, string>)[value] ?? value; }
 function statusText(status: string, value: Pick<AuditLog, "exitCode" | "durationMs" | "bytesTransferred" | "errorCode" | "errorMessage"> | HostMonitorEvent): string {
-  const labels: Record<string, string> = { RECEIVED: "已接收", EXECUTING: "远端执行中", SUCCEEDED: "执行完成", DENIED: "策略拒绝", FAILED: "执行失败", TIMED_OUT: "执行超时", INTERRUPTED: "执行中断" };
+  const labels: Record<string, string> = { RECEIVED: "已接收", EXECUTING: "远端执行中", SUCCEEDED: "执行完成", DENIED: "已拒绝", FAILED: "执行失败", TIMED_OUT: "执行超时", INTERRUPTED: "执行中断" };
   const details = [value.exitCode != null ? `退出码 ${value.exitCode}` : null, value.durationMs != null ? `${value.durationMs} ms` : null, value.bytesTransferred != null ? `${value.bytesTransferred} bytes` : null, value.errorCode ?? null, value.errorMessage ?? null].filter(Boolean);
   return `${labels[status] ?? status}${details.length ? ` · ${details.join(" · ")}` : ""}`;
 }
@@ -488,7 +488,8 @@ function HostDialog({ host, credentials, policies, groupNames, onAccountsChanged
       ...(!host ? { username: data.get("username"), credential, sudoEnabled } : {}),
       policyId: data.get("policyId") || null, groupName: data.get("groupName") || null,
       tags: String(data.get("tags") ?? "").split(",").map(v => v.trim()).filter(Boolean), defaultDirectory: data.get("defaultDirectory") || null,
-      enabled: data.get("enabled") === "on", aiAccessEnabled: data.get("aiAccessEnabled") === "on"
+      enabled: data.get("enabled") === "on", aiAccessEnabled: data.get("aiAccessEnabled") === "on",
+      hostTransferEnabled: data.get("hostTransferEnabled") === "on"
     };
     try {
       const saved = host ? await patch<Host>(`/v1/hosts/${host.id}`, payload) : await post<Host>("/v1/hosts", payload);
@@ -525,6 +526,8 @@ function HostDialog({ host, credentials, policies, groupNames, onAccountsChanged
     <label className="span-2">标签<input name="tags" defaultValue={host?.tags.join(", ")} placeholder="production, api" /></label>
     <label className="check"><input name="enabled" type="checkbox" defaultChecked={host?.enabled ?? true} />启用主机</label>
     <label className="check"><input name="aiAccessEnabled" type="checkbox" defaultChecked={host?.aiAccessEnabled ?? false} />允许 AI 访问</label>
+    <label className="check span-2"><input name="hostTransferEnabled" type="checkbox" defaultChecked={host?.hostTransferEnabled ?? false} />允许主机间文件传输</label>
+    <p className="form-hint span-2">文件传输开关属于当前主机且默认关闭；路径、大小、上传下载和覆盖限制仍由所选策略控制。</p>
     <p className="form-hint span-2">AI 和 MCP 只会收到主机 ID，不会得到密码、私钥、口令或保险库内容。</p>
     {errorText && <div className="form-error span-2" role="alert">{errorText}</div>}
   </form>{host && <HostLoginsEditor host={host} onChanged={onAccountsChanged} onEditingChange={setLoginEditorActive} />}
@@ -795,7 +798,7 @@ function StructuredPolicyEditor({ value, disabled, onChange }: { value: PolicyDo
     <PolicySection title="Shell 黑名单" description="阻止组合符和包装执行；未勾选时相应命令默认允许。">
       <BlacklistGroup group="SHELL" value={value.commandBlacklist} disabled={disabled} onToggle={toggleCatalog} />
     </PolicySection>
-    <PolicySection title="文件传输" description="控制上传、下载、覆盖、路径和单文件大小。">
+    <PolicySection title="文件传输约束" description="控制上传、下载、覆盖、路径和单文件大小；是否允许主机间传输由每台主机自己的开关控制。">
       <div className="permission-toggles"><Toggle label="允许上传" checked={value.files.allowUpload} disabled={disabled} onChange={(allowUpload) => update("files", { ...value.files, allowUpload })} /><Toggle label="允许下载" checked={value.files.allowDownload} disabled={disabled} onChange={(allowDownload) => update("files", { ...value.files, allowDownload })} /><Toggle label="允许覆盖" danger checked={value.files.allowOverwrite} disabled={disabled} onChange={(allowOverwrite) => update("files", { ...value.files, allowOverwrite })} /></div>
       <div className="policy-field-grid"><TextList label="允许的本地路径" value={value.files.allowedLocalPaths} disabled={disabled} placeholder="/Users/name/Downloads" onChange={(allowedLocalPaths) => update("files", { ...value.files, allowedLocalPaths })} /><TextList label="远端上传路径" value={value.files.allowedRemoteUploadPaths} disabled={disabled} placeholder="/opt/app/uploads" onChange={(allowedRemoteUploadPaths) => update("files", { ...value.files, allowedRemoteUploadPaths })} /><TextList label="远端下载路径" value={value.files.allowedRemoteDownloadPaths} disabled={disabled} placeholder="/var/log/app" onChange={(allowedRemoteDownloadPaths) => update("files", { ...value.files, allowedRemoteDownloadPaths })} /><label>最大上传 MB<input disabled={disabled} type="number" min="1" max="10240" value={Math.round(value.files.maxUploadBytes / 1024 / 1024)} onChange={(event) => update("files", { ...value.files, maxUploadBytes: Math.max(1, Number(event.target.value)) * 1024 * 1024 })} /></label><label>最大下载 MB<input disabled={disabled} type="number" min="1" max="10240" value={Math.round(value.files.maxDownloadBytes / 1024 / 1024)} onChange={(event) => update("files", { ...value.files, maxDownloadBytes: Math.max(1, Number(event.target.value)) * 1024 * 1024 })} /></label></div>
     </PolicySection>
@@ -841,7 +844,7 @@ function AuditPage({ notify }: { notify: Notify }) {
   const load = useCallback(async () => { try { setItems(await api(`/v1/audit-logs?limit=200${status ? `&status=${status}` : ""}`)); } catch(e) { notify("error", message(e)); } }, [notify, status]);
   useEffect(() => { void load(); const timer = setInterval(() => void load(), 5000); return () => clearInterval(timer); }, [load]);
   return <section><PageHeader eyebrow="Traceability" title="操作审计"><select className="filter" aria-label="筛选审计结果" value={status} onChange={e => setStatus(e.target.value)}><option value="">全部结果</option><option>SUCCEEDED</option><option>DENIED</option><option>FAILED</option><option>TIMED_OUT</option></select></PageHeader>
-    <div className="panel table-panel audit-table-panel"><table><thead><tr><th>时间</th><th>来源</th><th>主机 / 操作</th><th>请求摘要</th><th>策略</th><th>结果</th><th>耗时</th></tr></thead><tbody>{items.map(log => <tr key={log.id}><td>{new Date(log.createdAt).toLocaleString()}</td><td>{log.clientType}</td><td><strong>{log.hostNameSnapshot ?? "—"}</strong><small>{log.operationType}</small></td><td className="summary">{log.requestSummary ?? "—"}</td><td>{log.policyDecision ?? "—"}</td><td><Status value={log.status} detail={log.errorCode} /></td><td>{log.durationMs == null ? "—" : `${log.durationMs} ms`}</td></tr>)}</tbody></table>{items.length === 0 && <Empty text="暂无操作记录。拒绝和失败的请求也会显示在这里。" />}</div>
+    <div className="panel table-panel audit-table-panel"><table><thead><tr><th>时间</th><th>来源</th><th>主机 / 操作</th><th>请求摘要</th><th>策略</th><th>结果</th><th>耗时</th></tr></thead><tbody>{items.map(log => <tr key={log.id}><td>{new Date(log.createdAt).toLocaleString()}</td><td>{log.clientType}</td><td><strong>{log.peerHostNameSnapshot ? `${log.hostNameSnapshot ?? "—"} → ${log.peerHostNameSnapshot}` : log.hostNameSnapshot ?? "—"}</strong><small>{log.operationType}</small></td><td className="summary">{log.requestSummary ?? "—"}</td><td>{log.policyDecision ?? "—"}</td><td><Status value={log.status} detail={log.errorCode} /></td><td>{log.durationMs == null ? "—" : `${log.durationMs} ms`}</td></tr>)}</tbody></table>{items.length === 0 && <Empty text="暂无操作记录。拒绝和失败的请求也会显示在这里。" />}</div>
   </section>;
 }
 

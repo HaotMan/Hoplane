@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -32,9 +32,10 @@ describe("MCP Streamable HTTP", () => {
       dataDir: dir, databasePath: join(dir, "test.sqlite3"), tokenPath: join(dir, "core.token"),
       pidPath: join(dir, "core.pid"), logPath: join(dir, "core.log"), vaultPath: join(dir, "vault.enc"), policyDir: join(dir, "policies"), host: "127.0.0.1", port, outputLimitBytes: 1024
     };
+    const transferFile = vi.fn(async () => ({ operationId: "transfer-op", bytesTransferred: 42, durationMs: 5, transport: "SFTP" as const }));
     const operations = {
       listHosts: () => [],
-      testHost: async () => ({}), executeCommand: async () => ({}), uploadFile: async () => ({}), downloadFile: async () => ({})
+      testHost: async () => ({}), executeCommand: async () => ({}), uploadFile: async () => ({}), downloadFile: async () => ({}), transferFile
     } as unknown as OperationService;
     manager = new McpServiceManager(config, database, new MemoryVault(), operations);
 
@@ -53,8 +54,28 @@ describe("MCP Streamable HTTP", () => {
       await client.connect(transport);
       const tools = await client.listTools();
       expect(tools.tools.map((tool) => tool.name)).toEqual([
-        "list_hosts", "test_host", "execute_command", "upload_file", "download_file"
+        "list_hosts", "test_host", "execute_command", "upload_file", "download_file", "transfer_file"
       ]);
+      const sourceHostId = "11111111-1111-4111-8111-111111111111";
+      const destinationHostId = "22222222-2222-4222-8222-222222222222";
+      const result = await client.callTool({
+        name: "transfer_file",
+        arguments: {
+          source_host_id: sourceHostId,
+          source_path: "/exports/release.tar",
+          destination_host_id: destinationHostId,
+          destination_path: "/imports/release.tar"
+        }
+      });
+      expect(result.isError).not.toBe(true);
+      expect(transferFile).toHaveBeenCalledWith({
+        sourceHostId,
+        sourcePath: "/exports/release.tar",
+        destinationHostId,
+        destinationPath: "/imports/release.tar",
+        clientType: "MCP",
+        clientId: "mcp-http"
+      });
       await client.close();
     } finally {
       const closed = new Promise<void>((resolve) => httpServer.close(() => resolve()));

@@ -1,7 +1,7 @@
 export interface Host {
   id: string; name: string; hostname: string; port: number; username: string; credentialId: string | null; policyId: string | null;
   activeLoginId: string | null;
-  groupName: string | null; tags: string[]; defaultDirectory: string | null; enabled: boolean; aiAccessEnabled: boolean; monitorOutputEnabled: boolean; status: string;
+  groupName: string | null; tags: string[]; defaultDirectory: string | null; enabled: boolean; aiAccessEnabled: boolean; hostTransferEnabled: boolean; monitorOutputEnabled: boolean; status: string;
 }
 export interface HostLogin { id: string; hostId: string; username: string; credentialId: string | null; sudoEnabled: boolean; active: boolean; createdAt: string; updatedAt: string; }
 export interface Credential { id: string; name: string; type: "PASSWORD" | "PRIVATE_KEY" | "SSH_AGENT"; sudoMode: "NONE" | "LOGIN_PASSWORD" | "CUSTOM_PASSWORD"; metadata: { privateKeyPath?: string; agentSocket?: string }; hasSecret: boolean; hasSudoSecret: boolean; }
@@ -10,7 +10,7 @@ export type Policy = SharedPolicy;
 export type PolicyDocument = SharedPolicyDocument;
 export type PolicyCommandRule = SharedPolicyCommandRule;
 export interface AuditLog {
-  id: string; createdAt: string; hostNameSnapshot: string | null; clientType: string; operationType: string; requestSummary: string | null;
+  id: string; createdAt: string; hostNameSnapshot: string | null; peerHostNameSnapshot: string | null; clientType: string; operationType: string; requestSummary: string | null;
   policyDecision: string | null; decisionReasonCode: string | null; status: string; durationMs: number | null; errorCode: string | null;
   errorMessage: string | null; exitCode: number | null; bytesTransferred: number | null; finishedAt: string | null;
 }

@@ -8,7 +8,7 @@
   <strong>让 AI 安全地操作 SSH 主机，同时把凭据、权限与最终控制权留在本地。</strong>
 </p>
 
-Hoplane 是一个面向 AI Agent 的本地 SSH 网关与桌面运维工具。它把主机管理、本地加密凭据、Policy V3、操作审计、文件传输、AI 指令记录和人工交互终端放在同一个 App 中，并可一键接入 Codex、Cursor、Claude Code 与 WorkBuddy。
+Hoplane 是一个面向 AI Agent 的本地 SSH 网关与桌面运维工具。它把主机管理、本地加密凭据、Policy V4、操作审计、文件传输、AI 指令记录和人工交互终端放在同一个 App 中，并可一键接入 Codex、Cursor、Claude Code 与 WorkBuddy。
 
 AI 不会获得登录密码、私钥口令或 sudo 密码，也不能自行确认新的 SSH 主机指纹。所有 MCP 命令和文件操作都要经过主机开关、当前登录身份、权限策略与审计链路；需要人工处理时，用户可以在 App 内打开独立的交互式终端。
 
@@ -77,7 +77,7 @@ App 只检查有限的常见配置位置，也支持手动选择目录。Codex�
 
 Hoplane 明确区分 AI 自动操作与用户人工终端：
 
-| 通道 | 登录身份 | Policy V3 | 审计范围 | 凭据 |
+| 通道 | 登录身份 | Policy V4 | 审计范围 | 凭据 |
 | --- | --- | --- | --- | --- |
 | MCP / CLI 命令与文件操作 | 主机当前激活身份 | 必须通过 | 请求、策略、状态、耗时、错误等 | 由 Hoplane 解析，不返回调用方 |
 | App 人工交互终端 | 用户在终端页选择的身份 | 不经过 AI 黑名单 | 会话开始、结束、耗时、退出码或错误 | 由 Hoplane 解析，不显示在终端配置中 |
@@ -95,7 +95,7 @@ Codex / Cursor / Claude Code / WorkBuddy / Other Agents
 ┌──────────────────────────────────────────────────┐
 │                   Hoplane Core                   │
 │                                                  │
-│  Host Registry ── Policy V3 ── Operation Service │
+│  Host Registry ── Policy V4 ── Operation Service │
 │       │               │               │          │
 │  Encrypted Vault      └────── Audit + Monitor    │
 └───────────────────────────────┬──────────────────┘
@@ -126,7 +126,7 @@ Agent 提交 host_id 与操作
 
 - 新增、编辑、删除、启用/停用并测试 SSH 主机；
 - 支持密码、私钥文件/口令和 SSH Agent；
-- 每台主机分别配置地址、端口、默认目录、标签、策略和 AI 访问开关；
+- 每台主机分别配置地址、端口、默认目录、标签、策略、AI 访问开关和默认关闭的主机间文件传输开关；
 - 主机可按自定义分组折叠展示，可选择已有分组、创建新分组或重命名整组；
 - 多选模式支持全选、按组选择，并复制所选主机的显示名称与地址；
 - 一台主机可保存多套登录身份，每套身份独立绑定认证方式和 sudo 权限；
@@ -179,15 +179,15 @@ Agent 提交 host_id 与操作
 
 密码不会写入命令、环境变量、审计或 MCP 返回内容。未配置受管密码时使用 `sudo -n`，避免等待输入。身份关闭 sudo 时，请求会在执行前拒绝；即使身份允许 sudo，命令仍必须通过当前策略。
 
-### Policy V3
+### Policy V4
 
-Policy V3 采用命令黑名单模型：
+Policy V4 采用命令黑名单模型；主机是否允许参与文件中继不属于策略，而由每台主机自己的默认关闭开关控制：
 
 - `commandBlacklist` 中的 Unicode 正则按顺序匹配原始命令；
 - 命中任意规则即拒绝；
 - 未命中规则默认允许；
 - “全权限”模板的命令黑名单为空；
-- 文件上传、下载、覆盖、大小和允许路径单独控制。
+- 策略继续控制文件上传、下载、覆盖、大小和允许路径；中继还必须同时开启源、目标主机的传输开关，并分别通过源端下载与目标端上传约束。
 
 内置模板：
 
@@ -301,9 +301,14 @@ test_host
 execute_command
 upload_file
 download_file
+transfer_file
 ```
 
 `list_hosts` 只返回同时满足 `enabled=true` 与 `aiAccessEnabled=true` 的主机。所有操作使用 `host_id` 指定目标主机；Agent 不会获得 SSH 凭据。
+
+`transfer_file` 使用两条独立 SSH 连接，将普通文件按流从源主机经 Hoplane 内存传到目标主机。Core 优先使用 SFTP；只有服务器明确无法启动 SFTP 子系统时，才回退到由 Hoplane 固定生成的 POSIX SSH Exec 流。普通路径、权限、覆盖或连接错误不会触发降级。两台主机不需要互相可达，文件不落本机磁盘，也不会返回给 Agent；源、目标主机必须分别开启主机级文件传输开关，策略再负责下载/上传路径、大小和覆盖约束。成功结果的 `transport` 为 `SFTP` 或 `SSH_STREAM`；两种方式都不可用时返回 `FILE_TRANSFER_TRANSPORT_UNAVAILABLE`。
+
+SSH 流回退要求远端允许非交互 Exec，并提供 POSIX Shell、`realpath`、`cat`、`wc`、`mv`、`rm`，禁止覆盖时还需要 `ln`。这些都是一次性命令，不需要安装 Hoplane 服务或启动常驻进程。
 
 ## 快速开始
 
@@ -353,6 +358,7 @@ pnpm cli -- host test <host-id>
 pnpm cli -- exec <host-id> --directory /opt/app --timeout 30000 -- df -h
 pnpm cli -- upload <host-id> ./app.tar /opt/app/app.tar
 pnpm cli -- download <host-id> /var/log/app.log ./app.log
+pnpm cli -- transfer <source-host-id> /opt/app/release.tar <destination-host-id> /opt/app/release.tar
 ```
 
 CLI 会按需启动构建后的 Core。命令与文件操作仍经过主机状态、策略、凭据和审计链路。
@@ -412,7 +418,7 @@ core.token       本地 Core API 随机 Token（0600）
 core.pid         Core 进程 ID
 core.log         Core 日志
 vault.enc        本地加密保险库（0600）
-policies/        可直接编辑的 Policy V3 YAML
+policies/        可直接编辑的 Policy V4 YAML
 ```
 
 可用于测试实例的环境变量：
@@ -435,7 +441,7 @@ Core 与管理界面默认只监听 `127.0.0.1:21722`。
 - 受管 sudo 密码只在随机远端提示出现后通过 SSH stdin 应答；
 - 审计摘要和实时输出会对常见敏感模式进行脱敏并限制长度；
 - 管理界面与 Core 同源，Electron 不向网页开放任意系统命令能力；
-- 人工交互终端不经过 AI Policy V3，只提供会话级审计；
+- 人工交互终端不经过 AI Policy V4，只提供会话级审计；
 - 黑名单不能代替远端系统权限、容器权限或 Kubernetes RBAC。
 
 ## 验证
@@ -448,7 +454,7 @@ pnpm build
 
 自动化测试覆盖：
 
-- Policy V3 命令黑名单、文件路径边界、YAML 同步与版本冲突；
+- Policy V4 命令黑名单、主机级双端文件中继开关、文件路径边界、YAML 同步与版本冲突；
 - 数据库迁移、多登录身份、分组重命名和主机状态；
 - 本地保险库、凭据查看保护与审计脱敏；
 - sudo 命令识别、链式多 sudo 应答和端到端 SSH 行为；
@@ -458,8 +464,9 @@ pnpm build
 
 ## 当前限制
 
-- Policy V3 是正则黑名单，不是完整 Shell 语法分析器；未收录形式默认允许，也可能误判；
+- Policy V4 的命令控制仍是正则黑名单，不是完整 Shell 语法分析器；未收录形式默认允许，也可能误判；
 - 人工终端会话不持久化，断开或重启后不能恢复；
+- 主机间中继当前只支持单个普通文件，不支持目录递归、元数据保留或断点续传；异常退出可能在目标目录留下 `.hoplane-part-*` 临时文件；SSH 流回退当前只支持 POSIX 主机，不支持 Windows PowerShell；
 - 暂不支持 MFA、SOCKS、ProxyJump、堡垒机链路和团队同步；
 - SSH Config 导入不支持复杂的 `Include`、`Match`、`ProxyJump` 与通配继承；
 - HTTP MCP 当前使用单个本机 Agent Token，不支持按客户端独立过期和吊销；
@@ -478,7 +485,7 @@ apps/
 packages/
   core/               本地 API、保险库、审计、Agent 集成、终端网关
   ssh-core/           SSH/SFTP、连接池、主机指纹、sudo 处理
-  policy/             Policy V3 命令与文件判断
+  policy/             Policy V4 命令与文件判断
   mcp-adapter/        stdio MCP 适配器与工具
   audit/              脱敏
   shared/             类型、Schema 与内置策略模板

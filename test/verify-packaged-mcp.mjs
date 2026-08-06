@@ -15,7 +15,7 @@ try {
   await client.connect(transport);
   const result = await client.listTools();
   const names = result.tools.map((tool) => tool.name);
-  const expected = ["list_hosts", "test_host", "execute_command", "upload_file", "download_file"];
+  const expected = ["list_hosts", "test_host", "execute_command", "upload_file", "download_file", "transfer_file"];
   if (!expected.every((name) => names.includes(name))) throw new Error(`Missing tools: ${expected.filter((name) => !names.includes(name)).join(", ")}`);
   process.stdout.write(`${JSON.stringify({ ok: true, tools: names })}\n`);
 } finally {

@@ -1,6 +1,8 @@
 import { Client, type ClientChannel, type ConnectConfig, type SFTPWrapper } from "ssh2";
 import { readFile } from "node:fs/promises";
 import { createWriteStream } from "node:fs";
+import { Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { basename, dirname, join } from "node:path/posix";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -20,6 +22,21 @@ export interface ShellSession {
   stream: ClientChannel;
   setWindow(rows: number, cols: number): void;
   close(): void;
+}
+
+export interface RelayFileInput {
+  sourceHostId: string;
+  sourcePath: string;
+  destinationHostId: string;
+  destinationPath: string;
+  expectedSize: number;
+  allowOverwrite: boolean;
+  operationId: string;
+}
+
+export interface RelayFileResult {
+  bytesTransferred: number;
+  transport: "SFTP" | "SSH_STREAM";
 }
 
 export class SSHConnectionManager {
@@ -159,6 +176,16 @@ export class SSHConnectionManager {
     }
   }
 
+  async resolveRemotePathForRelay(hostId: string, path: string, forCreate: boolean): Promise<string> {
+    try { return await this.resolveRemotePath(hostId, path, forCreate); }
+    catch (error) {
+      const sftpError = classifySshError(error);
+      if (sftpError.code !== "SFTP_UNAVAILABLE") throw sftpError;
+      try { return await this.resolveRemotePathViaSsh(hostId, path, forCreate); }
+      catch (sshError) { throw combineTransportErrors(sftpError, sshError); }
+    }
+  }
+
   async upload(hostId: string, localPath: string, remotePath: string, allowOverwrite: boolean): Promise<number> {
     const sftp = await this.getSftp(hostId);
     try {
@@ -177,6 +204,227 @@ export class SSHConnectionManager {
     const sftp = await this.getSftp(hostId);
     try { return (await sftpStat(sftp, remotePath)).size; }
     finally { sftp.end(); }
+  }
+
+  async getRemoteRegularFileInfo(hostId: string, remotePath: string): Promise<{ size: number }> {
+    const sftp = await this.getSftp(hostId);
+    try {
+      const info = await sftpFullStat(sftp, remotePath);
+      if (!info.isFile()) throw new AppError("SOURCE_NOT_REGULAR_FILE", "Source path is not a regular file", false, undefined, undefined, 409);
+      return { size: info.size };
+    } finally {
+      sftp.end();
+    }
+  }
+
+  async getRemoteRegularFileInfoForRelay(hostId: string, remotePath: string): Promise<{ size: number }> {
+    try { return await this.getRemoteRegularFileInfo(hostId, remotePath); }
+    catch (error) {
+      const sftpError = classifySshError(error);
+      if (sftpError.code !== "SFTP_UNAVAILABLE") throw sftpError;
+      try { return await this.getRemoteRegularFileInfoViaSsh(hostId, remotePath); }
+      catch (sshError) { throw combineTransportErrors(sftpError, sshError); }
+    }
+  }
+
+  async relayFile(input: RelayFileInput): Promise<RelayFileResult> {
+    try {
+      return { bytesTransferred: await this.relayFileViaSftp(input), transport: "SFTP" };
+    } catch (error) {
+      const sftpError = classifySshError(error);
+      if (sftpError.code !== "SFTP_UNAVAILABLE") throw sftpError;
+      try {
+        return { bytesTransferred: await this.relayFileViaSsh(input), transport: "SSH_STREAM" };
+      } catch (sshError) {
+        throw combineTransportErrors(sftpError, sshError);
+      }
+    }
+  }
+
+  private async relayFileViaSftp(input: RelayFileInput): Promise<number> {
+    const sourceSftp = await this.getSftp(input.sourceHostId);
+    let destinationSftp: SFTPWrapper | null = null;
+    let temporaryPath: string | null = null;
+    try {
+      destinationSftp = await this.getSftp(input.destinationHostId);
+      const sourceInfo = await sftpFullStat(sourceSftp, input.sourcePath);
+      if (!sourceInfo.isFile()) throw new AppError("SOURCE_NOT_REGULAR_FILE", "Source path is not a regular file", false, undefined, undefined, 409);
+      if (sourceInfo.size !== input.expectedSize) {
+        throw new AppError("SOURCE_FILE_CHANGED", "Source file changed before transfer started", true, undefined, { expectedSize: input.expectedSize, actualSize: sourceInfo.size }, 409);
+      }
+
+      const existingDestination = await sftpLstatOptional(destinationSftp, input.destinationPath);
+      if (existingDestination?.isSymbolicLink()) {
+        throw new AppError("DESTINATION_SYMLINK_UNSAFE", "Destination path is a symbolic link", false, undefined, undefined, 409);
+      }
+      if (existingDestination && !existingDestination.isFile()) {
+        throw new AppError("DESTINATION_NOT_REGULAR_FILE", "Destination path exists and is not a regular file", false, undefined, undefined, 409);
+      }
+      if (existingDestination && !input.allowOverwrite) {
+        throw new AppError("REMOTE_FILE_EXISTS", "Remote destination already exists", false, undefined, undefined, 409);
+      }
+
+      temporaryPath = join(dirname(input.destinationPath), `.hoplane-part-${input.operationId}`);
+      if (await sftpExists(destinationSftp, temporaryPath)) {
+        throw new AppError("TRANSFER_TEMP_FILE_EXISTS", "Transfer temporary file already exists", false, undefined, undefined, 409);
+      }
+
+      let bytesTransferred = 0;
+      const counter = new Transform({
+        transform(chunk: Buffer, _encoding, callback) {
+          bytesTransferred += chunk.length;
+          callback(null, chunk);
+        }
+      });
+      await pipeline(
+        sourceSftp.createReadStream(input.sourcePath),
+        counter,
+        destinationSftp.createWriteStream(temporaryPath, { flags: "wx", mode: 0o600 })
+      );
+
+      const temporaryInfo = await sftpFullStat(destinationSftp, temporaryPath);
+      if (!temporaryInfo.isFile() || bytesTransferred !== input.expectedSize || temporaryInfo.size !== input.expectedSize) {
+        throw new AppError("TRANSFER_SIZE_MISMATCH", "Transferred file size does not match the source", true, undefined, {
+          expectedSize: input.expectedSize, bytesTransferred, destinationSize: temporaryInfo.size
+        }, 502);
+      }
+
+      if (existingDestination) await sftpAtomicReplace(destinationSftp, temporaryPath, input.destinationPath);
+      else await sftpRename(destinationSftp, temporaryPath, input.destinationPath);
+      temporaryPath = null;
+
+      const finalInfo = await sftpFullStat(destinationSftp, input.destinationPath);
+      if (!finalInfo.isFile() || finalInfo.size !== input.expectedSize) {
+        throw new AppError("TRANSFER_SIZE_MISMATCH", "Final destination file size does not match the source", true, undefined, {
+          expectedSize: input.expectedSize, destinationSize: finalInfo.size
+        }, 502);
+      }
+      return bytesTransferred;
+    } catch (error) {
+      if (destinationSftp && temporaryPath) await sftpUnlinkIfExists(destinationSftp, temporaryPath);
+      throw classifySshError(error);
+    } finally {
+      sourceSftp.end();
+      destinationSftp?.end();
+    }
+  }
+
+  private async resolveRemotePathViaSsh(hostId: string, path: string, forCreate: boolean): Promise<string> {
+    assertSshStreamPath(path);
+    const command = forCreate
+      ? `parent=${shellQuote(dirname(path))}; name=${shellQuote(basename(path))}; cd -P "$parent" 2>/dev/null || exit 45; resolved=$(pwd -P) || exit 45; printf '%s/%s\\n' "$resolved" "$name"`
+      : `command -v realpath >/dev/null 2>&1 || exit 127; realpath ${shellQuote(path)}`;
+    const result = await this.runSshStreamCommand(hostId, command);
+    if (result.exitCode === 127) throw sshStreamUnavailable("Required command `realpath` is unavailable");
+    if (result.exitCode === 45) throw new AppError("DESTINATION_PARENT_UNAVAILABLE", "Destination parent directory does not exist or is not accessible", false, undefined, undefined, 409);
+    if (result.exitCode !== 0) {
+      throw new AppError("REMOTE_PATH_RESOLUTION_FAILED", visibleSshError(result.stderr, "Remote path could not be resolved"), false, undefined, { exitCode: result.exitCode }, 409);
+    }
+    const resolved = result.stdout.trimEnd();
+    if (!resolved.startsWith("/") || /[\r\n]/u.test(resolved)) {
+      throw new AppError("REMOTE_PATH_RESOLUTION_FAILED", "Remote path resolution returned an invalid absolute path", false, undefined, undefined, 409);
+    }
+    return resolved;
+  }
+
+  private async getRemoteRegularFileInfoViaSsh(hostId: string, remotePath: string): Promise<{ size: number }> {
+    assertSshStreamPath(remotePath);
+    const command = `command -v wc >/dev/null 2>&1 || exit 127; [ -f ${shellQuote(remotePath)} ] || exit 44; wc -c < ${shellQuote(remotePath)}`;
+    const result = await this.runSshStreamCommand(hostId, command);
+    if (result.exitCode === 127) throw sshStreamUnavailable("Required command `wc` is unavailable");
+    if (result.exitCode === 44) throw new AppError("SOURCE_NOT_REGULAR_FILE", "Source path is not a regular file", false, undefined, undefined, 409);
+    if (result.exitCode !== 0) {
+      throw new AppError("SOURCE_FILE_PROBE_FAILED", visibleSshError(result.stderr, "Source file could not be inspected"), false, undefined, { exitCode: result.exitCode }, 409);
+    }
+    const text = result.stdout.trim();
+    if (!/^\d+$/u.test(text)) throw new AppError("SOURCE_FILE_PROBE_FAILED", "Source file size response is invalid", false, undefined, undefined, 502);
+    const size = Number(text);
+    if (!Number.isSafeInteger(size)) throw new AppError("SOURCE_FILE_PROBE_FAILED", "Source file size exceeds the supported integer range", false, undefined, undefined, 413);
+    return { size };
+  }
+
+  private async relayFileViaSsh(input: RelayFileInput): Promise<number> {
+    assertSshStreamPath(input.sourcePath);
+    assertSshStreamPath(input.destinationPath);
+    const temporaryPath = join(dirname(input.destinationPath), `.hoplane-part-${input.operationId}`);
+    const sourceCommand = `command -v cat >/dev/null 2>&1 || exit 127; cat ${shellQuote(input.sourcePath)}`;
+    const requiredDestinationCommands = input.allowOverwrite ? "cat wc mv rm" : "cat wc ln rm";
+    const destinationCommand = [
+      `for command in ${requiredDestinationCommands}; do command -v "$command" >/dev/null 2>&1 || exit 127; done`,
+      `tmp=${shellQuote(temporaryPath)}`,
+      `dest=${shellQuote(input.destinationPath)}`,
+      `if [ -e "$tmp" ] || [ -L "$tmp" ]; then exit 70; fi`,
+      `trap 'rm -f "$tmp"' EXIT HUP INT TERM`,
+      `if [ -L "$dest" ]; then exit 71; fi`,
+      `if [ -e "$dest" ] && [ ! -f "$dest" ]; then exit 72; fi`,
+      ...(!input.allowOverwrite ? [`if [ -e "$dest" ]; then exit 73; fi`] : []),
+      `umask 077`,
+      `set -C`,
+      `cat > "$tmp" || exit 74`,
+      `set +C`,
+      `actual=$(wc -c < "$tmp") || exit 75`,
+      `[ "$actual" -eq ${input.expectedSize} ] || exit 76`,
+      input.allowOverwrite ? `mv -f "$tmp" "$dest" || exit 77` : `ln "$tmp" "$dest" || exit 78`,
+      ...(!input.allowOverwrite ? [`rm -f "$tmp" || exit 79`] : []),
+      `final=$(wc -c < "$dest") || exit 80`,
+      `[ "$final" -eq ${input.expectedSize} ] || exit 80`,
+      `trap - EXIT HUP INT TERM`
+    ].join("; ");
+
+    let sourceStream: ClientChannel | null = null;
+    let destinationStream: ClientChannel | null = null;
+    try {
+      destinationStream = await this.openSshStreamChannel(input.destinationHostId, destinationCommand);
+      const destinationCompletion = observeExecChannel(destinationStream, this.outputLimitBytes);
+      destinationStream.on("data", () => undefined);
+      sourceStream = await this.openSshStreamChannel(input.sourceHostId, sourceCommand);
+      const sourceCompletion = observeExecChannel(sourceStream, this.outputLimitBytes);
+      let bytesTransferred = 0;
+      const counter = new Transform({
+        transform(chunk: Buffer, _encoding, callback) {
+          bytesTransferred += chunk.length;
+          callback(null, chunk);
+        }
+      });
+      let pipelineError: unknown;
+      try { await pipeline(sourceStream, counter, destinationStream); }
+      catch (error) {
+        pipelineError = error;
+        sourceStream.close();
+        destinationStream.close();
+      }
+      const [sourceResult, destinationResult] = await Promise.allSettled([sourceCompletion, destinationCompletion]);
+      if (sourceResult.status === "fulfilled" && sourceResult.value.exitCode === 127) throw sshStreamUnavailable("Required source command `cat` is unavailable");
+      if (destinationResult.status === "fulfilled" && destinationResult.value.exitCode === 127) throw sshStreamUnavailable("Required destination file commands are unavailable");
+      if (destinationResult.status === "fulfilled" && [70, 71, 72, 73].includes(destinationResult.value.exitCode ?? -1)) {
+        throw mapSshDestinationExit(destinationResult.value);
+      }
+      if (sourceResult.status === "fulfilled" && sourceResult.value.exitCode !== 0) {
+        throw new AppError("SSH_STREAM_SOURCE_FAILED", visibleSshError(sourceResult.value.stderr, "Source SSH stream failed"), true, undefined, { exitCode: sourceResult.value.exitCode }, 502);
+      }
+      if (destinationResult.status === "fulfilled" && destinationResult.value.exitCode !== 0) throw mapSshDestinationExit(destinationResult.value);
+      if (sourceResult.status === "rejected") throw classifySshStreamError(sourceResult.reason);
+      if (destinationResult.status === "rejected") throw classifySshStreamError(destinationResult.reason);
+      if (pipelineError) throw classifySshStreamError(pipelineError);
+      if (bytesTransferred !== input.expectedSize) {
+        throw new AppError("TRANSFER_SIZE_MISMATCH", "Transferred file size does not match the source", true, undefined, { expectedSize: input.expectedSize, bytesTransferred }, 502);
+      }
+      return bytesTransferred;
+    } catch (error) {
+      sourceStream?.close();
+      destinationStream?.close();
+      throw classifySshStreamError(error);
+    }
+  }
+
+  private async runSshStreamCommand(hostId: string, command: string): Promise<Omit<CommandResult, "operationId" | "durationMs">> {
+    try { return await this.execute(hostId, command, { timeoutMs: 30_000 }); }
+    catch (error) { throw classifySshStreamError(error); }
+  }
+
+  private async openSshStreamChannel(hostId: string, command: string): Promise<ClientChannel> {
+    const client = await this.getConnection(hostId);
+    return new Promise((resolve, reject) => client.exec(command, { pty: false }, (error, stream) => error ? reject(classifySshStreamError(error)) : resolve(stream)));
   }
 
   async download(hostId: string, remotePath: string, localPath: string, allowOverwrite: boolean): Promise<number> {
@@ -226,7 +474,7 @@ export class SSHConnectionManager {
 
   private async getSftp(hostId: string): Promise<SFTPWrapper> {
     const client = await this.getConnection(hostId);
-    return new Promise((resolve, reject) => client.sftp((error, sftp) => error ? reject(new AppError("SFTP_UNAVAILABLE", error.message, true)) : resolve(sftp)));
+    return new Promise((resolve, reject) => client.sftp((error, sftp) => error ? reject(classifySftpOpenError(error)) : resolve(sftp)));
   }
 
   private async resolveSudoPassword(hostId: string): Promise<string | null> {
@@ -348,6 +596,77 @@ function appendLimited(current: Buffer, chunk: Buffer, limit: number): { value: 
 }
 
 function shellQuote(value: string): string { return `'${value.replaceAll("'", `'\\''`)}'`; }
+
+interface ExecChannelResult {
+  exitCode: number | null;
+  stderr: string;
+}
+
+function observeExecChannel(stream: ClientChannel, limit: number): Promise<ExecChannelResult> {
+  let stderr: Buffer = Buffer.alloc(0);
+  return new Promise((resolve, reject) => {
+    stream.stderr.on("data", (chunk: Buffer) => { stderr = appendLimited(stderr, chunk, limit).value; });
+    stream.once("close", (exitCode: number | null) => resolve({ exitCode, stderr: stderr.toString("utf8") }));
+    stream.once("error", reject);
+    stream.stderr.once("error", reject);
+  });
+}
+
+function classifySftpOpenError(error: unknown): AppError {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/unable to start subsystem|subsystem request failed|sftp subsystem|unknown channel type|channel open failure.*(?:prohibited|unsupported|not supported)/iu.test(message)) {
+    return new AppError("SFTP_UNAVAILABLE", "The SSH server does not provide an SFTP subsystem", false, undefined, { reason: message }, 409);
+  }
+  return classifySshError(error);
+}
+
+function classifySshStreamError(error: unknown): AppError {
+  const appError = classifySshError(error);
+  if (/unable to exec|exec request failed|unable to open channel|channel open failure.*(?:prohibited|unsupported|not supported)/iu.test(appError.message)) {
+    return sshStreamUnavailable(appError.message);
+  }
+  return appError;
+}
+
+function sshStreamUnavailable(reason: string): AppError {
+  return new AppError("SSH_STREAM_UNAVAILABLE", "The SSH server cannot provide the POSIX exec stream required for file transfer", false, undefined, { reason }, 409);
+}
+
+function combineTransportErrors(sftpError: AppError, sshError: unknown): AppError {
+  const streamError = classifySshStreamError(sshError);
+  if (streamError.code !== "SSH_STREAM_UNAVAILABLE") return streamError;
+  return new AppError("FILE_TRANSFER_TRANSPORT_UNAVAILABLE", "Neither SFTP nor the SSH POSIX file stream is available on the required host", false, undefined, {
+    sftpReason: String(sftpError.details?.reason ?? sftpError.message),
+    sshReason: String(streamError.details?.reason ?? streamError.message)
+  }, 409);
+}
+
+function assertSshStreamPath(path: string): void {
+  if (/[\r\n\0]/u.test(path)) throw new AppError("SSH_STREAM_PATH_UNSUPPORTED", "SSH stream fallback does not support paths containing line breaks or NUL bytes", false, undefined, undefined, 409);
+}
+
+function visibleSshError(stderr: string, fallback: string): string {
+  const message = stderr.trim();
+  return message ? message.slice(0, 1000) : fallback;
+}
+
+function mapSshDestinationExit(result: ExecChannelResult): AppError {
+  const message = visibleSshError(result.stderr, "Destination SSH stream failed");
+  switch (result.exitCode) {
+    case 70: return new AppError("TRANSFER_TEMP_FILE_EXISTS", "Transfer temporary file already exists", false, undefined, undefined, 409);
+    case 71: return new AppError("DESTINATION_SYMLINK_UNSAFE", "Destination path is a symbolic link", false, undefined, undefined, 409);
+    case 72: return new AppError("DESTINATION_NOT_REGULAR_FILE", "Destination path exists and is not a regular file", false, undefined, undefined, 409);
+    case 73: return new AppError("REMOTE_FILE_EXISTS", "Remote destination already exists", false, undefined, undefined, 409);
+    case 74: return new AppError("SSH_STREAM_DESTINATION_WRITE_FAILED", message, true, undefined, { exitCode: result.exitCode }, 502);
+    case 75: return new AppError("DESTINATION_FILE_PROBE_FAILED", message, true, undefined, { exitCode: result.exitCode }, 502);
+    case 76:
+    case 80: return new AppError("TRANSFER_SIZE_MISMATCH", "Destination file size does not match the source", true, undefined, { exitCode: result.exitCode }, 502);
+    case 77: return new AppError("DESTINATION_ATOMIC_REPLACE_UNSUPPORTED", "Destination server cannot safely replace the existing file", false, undefined, undefined, 409);
+    case 78: return new AppError("DESTINATION_ATOMIC_PUBLISH_UNSUPPORTED", "Destination filesystem cannot atomically publish a new file", false, undefined, undefined, 409);
+    case 79: return new AppError("TRANSFER_TEMP_CLEANUP_FAILED", "Destination file was published but its temporary hard link could not be removed", true, undefined, undefined, 502);
+    default: return new AppError("SSH_STREAM_DESTINATION_FAILED", message, true, undefined, { exitCode: result.exitCode }, 502);
+  }
+}
 
 export interface PreparedSudoExecution {
   command: string;
@@ -473,4 +792,38 @@ function sftpExists(sftp: SFTPWrapper, path: string): Promise<boolean> {
 
 function sftpStat(sftp: SFTPWrapper, path: string): Promise<{ size: number }> {
   return new Promise((resolve, reject) => sftp.stat(path, (error, stats) => error ? reject(classifySshError(error)) : resolve({ size: stats.size })));
+}
+
+function sftpFullStat(sftp: SFTPWrapper, path: string): Promise<import("ssh2").Stats> {
+  return new Promise((resolve, reject) => sftp.stat(path, (error, stats) => error ? reject(classifySshError(error)) : resolve(stats)));
+}
+
+function sftpLstatOptional(sftp: SFTPWrapper, path: string): Promise<import("ssh2").Stats | null> {
+  return new Promise((resolve, reject) => sftp.lstat(path, (error, stats) => {
+    if (!error) resolve(stats);
+    else if ((error as NodeJS.ErrnoException).code === "ENOENT" || /no such file/i.test(error.message)) resolve(null);
+    else reject(classifySshError(error));
+  }));
+}
+
+function sftpRename(sftp: SFTPWrapper, sourcePath: string, destinationPath: string): Promise<void> {
+  return new Promise((resolve, reject) => sftp.rename(sourcePath, destinationPath, (error) => error ? reject(classifySshError(error)) : resolve()));
+}
+
+async function sftpAtomicReplace(sftp: SFTPWrapper, sourcePath: string, destinationPath: string): Promise<void> {
+  try {
+    await new Promise<void>((resolve, reject) => sftp.ext_openssh_rename(sourcePath, destinationPath, (error) => error ? reject(error) : resolve()));
+  } catch (extensionError) {
+    try { await sftpRename(sftp, sourcePath, destinationPath); }
+    catch {
+      throw new AppError("DESTINATION_ATOMIC_REPLACE_UNSUPPORTED", "Destination server cannot safely replace the existing file", false, undefined, {
+        reason: extensionError instanceof Error ? extensionError.message : String(extensionError)
+      }, 409);
+    }
+  }
+}
+
+async function sftpUnlinkIfExists(sftp: SFTPWrapper, path: string): Promise<void> {
+  if (!await sftpExists(sftp, path).catch(() => false)) return;
+  await new Promise<void>((resolve) => sftp.unlink(path, () => resolve()));
 }

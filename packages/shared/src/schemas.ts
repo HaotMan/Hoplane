@@ -12,6 +12,7 @@ export const hostInputSchema = z.object({
   defaultDirectory: z.string().trim().max(4096).nullable().optional(),
   enabled: z.boolean().default(true),
   aiAccessEnabled: z.boolean().default(false),
+  hostTransferEnabled: z.boolean().default(false),
   monitorOutputEnabled: z.boolean().default(false)
 });
 
@@ -54,8 +55,8 @@ export const policyCommandRuleSchema = z.object({
   description: z.string().trim().max(200).optional()
 }).strict();
 
-export const policyDocumentSchema = z.object({
-  schemaVersion: z.literal(3),
+const policyDocumentV4Schema = z.object({
+  schemaVersion: z.literal(4),
   commandBlacklist: z.array(policyCommandRuleSchema).max(500).default([]),
   files: z.object({
     allowUpload: z.boolean().default(false),
@@ -69,16 +70,34 @@ export const policyDocumentSchema = z.object({
   }).strict()
 }).strict();
 
+/** Accepts V3 and early V4 documents, removing the retired host transfer switch. */
+export function normalizePolicyDocumentV4(value: unknown): unknown {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return value;
+  const document = value as Record<string, unknown>;
+  if (document.schemaVersion !== 3 && document.schemaVersion !== 4) return value;
+  const files = document.files;
+  if (typeof files !== "object" || files === null || Array.isArray(files)) return value;
+  const normalizedFiles = { ...(files as Record<string, unknown>) };
+  delete normalizedFiles.allowHostTransfer;
+  return {
+    ...document,
+    schemaVersion: 4,
+    files: normalizedFiles
+  };
+}
+
+export const policyDocumentSchema = z.preprocess(normalizePolicyDocumentV4, policyDocumentV4Schema);
+
 export const policyInputSchema = z.object({
   name: z.string().trim().min(1).max(120),
   document: policyDocumentSchema,
   expectedVersion: z.number().int().positive().optional()
 });
 
-export const policySourceSchema = policyDocumentSchema.extend({
+export const policySourceSchema = z.preprocess(normalizePolicyDocumentV4, policyDocumentV4Schema.extend({
   id: z.string().uuid().optional(),
   name: z.string().trim().min(1).max(120)
-}).strict();
+}).strict());
 
 export const commandRequestSchema = z.object({
   hostId: z.string().uuid(),
@@ -93,6 +112,15 @@ export const transferRequestSchema = z.object({
   hostId: z.string().uuid(),
   localPath: z.string().min(1).max(4096),
   remotePath: z.string().min(1).max(4096),
+  clientType: z.enum(["MCP", "CLI", "UI"]),
+  clientId: z.string().max(200).optional()
+});
+
+export const hostTransferRequestSchema = z.object({
+  sourceHostId: z.string().uuid(),
+  sourcePath: z.string().min(1).max(4096),
+  destinationHostId: z.string().uuid(),
+  destinationPath: z.string().min(1).max(4096),
   clientType: z.enum(["MCP", "CLI", "UI"]),
   clientId: z.string().max(200).optional()
 });

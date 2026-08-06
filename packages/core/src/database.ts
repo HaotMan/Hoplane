@@ -1,7 +1,7 @@
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import type { AuditLog, Credential, CredentialType, Host, HostLogin, OperationStatus, Policy, PolicyDecision, PolicyDocument, PolicySourceStatus, SudoAuthMode } from "../../shared/src/index.js";
-import { AppError, DEFAULT_POLICY_TEMPLATE, POLICY_TEMPLATES } from "../../shared/src/index.js";
+import { AppError, DEFAULT_POLICY_TEMPLATE, POLICY_TEMPLATES, policyDocumentSchema } from "../../shared/src/index.js";
 
 type Row = Record<string, unknown>;
 
@@ -46,6 +46,7 @@ const MIGRATIONS = [
     default_directory TEXT,
     enabled INTEGER NOT NULL DEFAULT 1,
     ai_access_enabled INTEGER NOT NULL DEFAULT 0,
+    host_transfer_enabled INTEGER NOT NULL DEFAULT 0,
     monitor_output_enabled INTEGER NOT NULL DEFAULT 0,
     config_revision INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
@@ -123,12 +124,16 @@ const POLICY_BLACKLIST_MIGRATION = 6;
 const POLICY_TEMPLATE_CONSOLIDATION_MIGRATION = 7;
 const SUDO_AUTH_MIGRATION = 8;
 const HOST_LOGINS_MIGRATION = 9;
+const POLICY_V4_MIGRATION = 10;
+const AUDIT_PEER_HOST_MIGRATION = 11;
+const HOST_TRANSFER_ENABLED_MIGRATION = 12;
 export const POLICY_TEMPLATE_CONSOLIDATION_CLEANUP_SETTING = "policy.v3TemplateConsolidationCleanup";
 const LEGACY_READONLY_TEMPLATE_NAMES = new Set(["Docker 排障（只读）", "Kubernetes 排障（只读）"]);
 const LEGACY_OPERATIONS_TEMPLATE_NAMES = new Set(["Docker 运维（受限）", "Kubernetes 应用运维（受限）"]);
 
-type CreateHostInput = Omit<Host, "id" | "createdAt" | "updatedAt" | "configRevision" | "status" | "monitorOutputEnabled" | "activeLoginId"> & {
+type CreateHostInput = Omit<Host, "id" | "createdAt" | "updatedAt" | "configRevision" | "status" | "monitorOutputEnabled" | "hostTransferEnabled" | "activeLoginId"> & {
   monitorOutputEnabled?: boolean;
+  hostTransferEnabled?: boolean;
   activeLoginId?: string | null;
   sudoEnabled?: boolean;
 };
@@ -184,7 +189,7 @@ export class HoplaneDatabase {
       }
     }
 
-    if (missingColumns.length > 0 || this.hasLegacyPolicyDocuments()) resetToV2 = true;
+    if (missingColumns.length > 0 || this.hasPreV3PolicyDocuments()) resetToV2 = true;
 
     const hostColumns = new Set((this.db.prepare("PRAGMA table_info(hosts)").all() as Row[]).map((row) => String(row.name)));
     if (!hostColumns.has("monitor_output_enabled") || !applied.has(HOST_MONITOR_OUTPUT_MIGRATION)) {
@@ -255,14 +260,93 @@ export class HoplaneDatabase {
         throw error;
       }
     }
+
+    if (!applied.has(POLICY_V4_MIGRATION) || this.hasPolicyV3Documents()) {
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        const rows = this.db.prepare("SELECT id,policy_json FROM policies").all() as Row[];
+        for (const row of rows) {
+          const raw = JSON.parse(String(row.policy_json)) as { schemaVersion?: unknown };
+          if (raw.schemaVersion !== 3) continue;
+          const upgraded = policyDocumentSchema.parse(raw);
+          this.db.prepare("UPDATE policies SET policy_json=?,schema_version=4,version=version+1,updated_at=? WHERE id=?")
+            .run(JSON.stringify(upgraded), now(), String(row.id));
+        }
+        this.db.prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(POLICY_V4_MIGRATION, now());
+        this.db.exec("COMMIT");
+      } catch (error) {
+        this.db.exec("ROLLBACK");
+        throw error;
+      }
+    }
+
+    this.db.exec(`CREATE TABLE IF NOT EXISTS audit_logs (
+      id TEXT PRIMARY KEY, client_type TEXT NOT NULL, client_id TEXT,
+      host_id TEXT, host_name_snapshot TEXT, peer_host_id TEXT, peer_host_name_snapshot TEXT,
+      operation_type TEXT NOT NULL, request_summary TEXT,
+      policy_id TEXT, policy_version INTEGER, peer_policy_id TEXT, peer_policy_version INTEGER,
+      policy_decision TEXT, decision_reason_code TEXT, status TEXT NOT NULL,
+      exit_code INTEGER, duration_ms INTEGER, bytes_transferred INTEGER,
+      error_code TEXT, error_message TEXT, created_at TEXT NOT NULL, finished_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_audit_host_created ON audit_logs(host_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_audit_status_created ON audit_logs(status, created_at DESC);`);
+    const auditColumns = new Set((this.db.prepare("PRAGMA table_info(audit_logs)").all() as Row[]).map((row) => String(row.name)));
+    if (!applied.has(AUDIT_PEER_HOST_MIGRATION) || ["peer_host_id", "peer_host_name_snapshot", "peer_policy_id", "peer_policy_version"].some((column) => !auditColumns.has(column))) {
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        if (!auditColumns.has("peer_host_id")) this.db.exec("ALTER TABLE audit_logs ADD COLUMN peer_host_id TEXT");
+        if (!auditColumns.has("peer_host_name_snapshot")) this.db.exec("ALTER TABLE audit_logs ADD COLUMN peer_host_name_snapshot TEXT");
+        if (!auditColumns.has("peer_policy_id")) this.db.exec("ALTER TABLE audit_logs ADD COLUMN peer_policy_id TEXT");
+        if (!auditColumns.has("peer_policy_version")) this.db.exec("ALTER TABLE audit_logs ADD COLUMN peer_policy_version INTEGER");
+        this.db.exec("CREATE INDEX IF NOT EXISTS idx_audit_peer_host_created ON audit_logs(peer_host_id, created_at DESC)");
+        this.db.prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(AUDIT_PEER_HOST_MIGRATION, now());
+        this.db.exec("COMMIT");
+      } catch (error) {
+        this.db.exec("ROLLBACK");
+        throw error;
+      }
+    }
+    const hostTransferColumns = new Set((this.db.prepare("PRAGMA table_info(hosts)").all() as Row[]).map((row) => String(row.name)));
+    if (!applied.has(HOST_TRANSFER_ENABLED_MIGRATION) || !hostTransferColumns.has("host_transfer_enabled")) {
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        if (!hostTransferColumns.has("host_transfer_enabled")) this.db.exec("ALTER TABLE hosts ADD COLUMN host_transfer_enabled INTEGER NOT NULL DEFAULT 0");
+        const policies = this.db.prepare("SELECT id,policy_json FROM policies").all() as Row[];
+        for (const policy of policies) {
+          let raw: { files?: unknown };
+          try { raw = JSON.parse(String(policy.policy_json)) as { files?: unknown }; }
+          catch { continue; }
+          if (typeof raw.files !== "object" || raw.files === null || Array.isArray(raw.files) || !("allowHostTransfer" in raw.files)) continue;
+          const parsed = policyDocumentSchema.safeParse(raw);
+          if (!parsed.success) continue;
+          const normalized = parsed.data;
+          const serialized = JSON.stringify(normalized);
+          if (serialized !== JSON.stringify(raw)) this.db.prepare("UPDATE policies SET policy_json=?,updated_at=? WHERE id=?").run(serialized, now(), String(policy.id));
+        }
+        this.db.prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(HOST_TRANSFER_ENABLED_MIGRATION, now());
+        this.db.exec("COMMIT");
+      } catch (error) {
+        this.db.exec("ROLLBACK");
+        throw error;
+      }
+    }
     return resetToV2;
   }
 
-  private hasLegacyPolicyDocuments(): boolean {
+  private hasPreV3PolicyDocuments(): boolean {
     const rows = this.db.prepare("SELECT policy_json FROM policies").all() as Row[];
     return rows.some((row) => {
-      try { return (JSON.parse(String(row.policy_json)) as { schemaVersion?: unknown }).schemaVersion !== 3; }
+      try { return ![3, 4].includes(Number((JSON.parse(String(row.policy_json)) as { schemaVersion?: unknown }).schemaVersion)); }
       catch { return true; }
+    });
+  }
+
+  private hasPolicyV3Documents(): boolean {
+    const rows = this.db.prepare("SELECT policy_json FROM policies").all() as Row[];
+    return rows.some((row) => {
+      try { return (JSON.parse(String(row.policy_json)) as { schemaVersion?: unknown }).schemaVersion === 3; }
+      catch { return false; }
     });
   }
 
@@ -270,7 +354,9 @@ export class HoplaneDatabase {
     const consolidateTemplates = !this.db.prepare("SELECT 1 FROM schema_migrations WHERE version = ?").get(POLICY_TEMPLATE_CONSOLIDATION_MIGRATION);
     this.transaction(() => {
       if (resetToV2) {
-        const legacyPaths = this.listPolicies().filter((policy) => LEGACY_READONLY_TEMPLATE_NAMES.has(policy.name) || LEGACY_OPERATIONS_TEMPLATE_NAMES.has(policy.name)).flatMap((policy) => policy.sourcePath ? [policy.sourcePath] : []);
+        const legacyPaths = (this.db.prepare("SELECT name,source_path FROM policies").all() as Row[])
+          .filter((row) => LEGACY_READONLY_TEMPLATE_NAMES.has(String(row.name)) || LEGACY_OPERATIONS_TEMPLATE_NAMES.has(String(row.name)))
+          .flatMap((row) => row.source_path ? [String(row.source_path)] : []);
         if (legacyPaths.length > 0) this.setSetting(POLICY_TEMPLATE_CONSOLIDATION_CLEANUP_SETTING, legacyPaths);
         this.db.prepare("UPDATE hosts SET policy_id=NULL").run();
         this.db.prepare("DELETE FROM policies").run();
@@ -353,10 +439,10 @@ export class HoplaneDatabase {
     const id = randomUUID();
     const timestamp = now();
     this.db.prepare(`INSERT INTO hosts
-      (id,name,hostname,port,username,credential_id,active_login_id,policy_id,group_name,tags_json,default_directory,enabled,ai_access_enabled,monitor_output_enabled,config_revision,created_at,updated_at)
-      VALUES (?,?,?,?,?,?,NULL,?,?,?,?,?,?,?,1,?,?)`).run(
+      (id,name,hostname,port,username,credential_id,active_login_id,policy_id,group_name,tags_json,default_directory,enabled,ai_access_enabled,host_transfer_enabled,monitor_output_enabled,config_revision,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,NULL,?,?,?,?,?,?,?,?,1,?,?)`).run(
       id, input.name, input.hostname, input.port, input.username, input.credentialId, input.policyId,
-      input.groupName, JSON.stringify(input.tags), input.defaultDirectory, bool(input.enabled), bool(input.aiAccessEnabled), bool(input.monitorOutputEnabled ?? false), timestamp, timestamp
+      input.groupName, JSON.stringify(input.tags), input.defaultDirectory, bool(input.enabled), bool(input.aiAccessEnabled), bool(input.hostTransferEnabled ?? false), bool(input.monitorOutputEnabled ?? false), timestamp, timestamp
     );
     const login = this.createHostLogin(id, input.username, input.credentialId, input.sudoEnabled ?? input.username === "root");
     this.db.prepare("UPDATE hosts SET active_login_id=? WHERE id=?").run(login.id, id);
@@ -367,9 +453,9 @@ export class HoplaneDatabase {
     const current = this.requireHost(id);
     const next = { ...current, ...patch, id: current.id };
     const connectionChanged = current.hostname !== next.hostname || current.port !== next.port || current.username !== next.username || current.credentialId !== next.credentialId;
-    this.db.prepare(`UPDATE hosts SET name=?,hostname=?,port=?,username=?,credential_id=?,active_login_id=?,policy_id=?,group_name=?,tags_json=?,default_directory=?,enabled=?,ai_access_enabled=?,monitor_output_enabled=?,config_revision=config_revision+?,updated_at=? WHERE id=?`).run(
+    this.db.prepare(`UPDATE hosts SET name=?,hostname=?,port=?,username=?,credential_id=?,active_login_id=?,policy_id=?,group_name=?,tags_json=?,default_directory=?,enabled=?,ai_access_enabled=?,host_transfer_enabled=?,monitor_output_enabled=?,config_revision=config_revision+?,updated_at=? WHERE id=?`).run(
       next.name, next.hostname, next.port, next.username, next.credentialId, next.activeLoginId, next.policyId, next.groupName,
-      JSON.stringify(next.tags), next.defaultDirectory, bool(next.enabled), bool(next.aiAccessEnabled), bool(next.monitorOutputEnabled), connectionChanged ? 1 : 0, now(), id
+      JSON.stringify(next.tags), next.defaultDirectory, bool(next.enabled), bool(next.aiAccessEnabled), bool(next.hostTransferEnabled), bool(next.monitorOutputEnabled), connectionChanged ? 1 : 0, now(), id
     );
     if (current.activeLoginId && (current.username !== next.username || current.credentialId !== next.credentialId)) {
       this.db.prepare("UPDATE host_logins SET username=?,credential_id=?,updated_at=? WHERE id=?")
@@ -521,7 +607,7 @@ export class HoplaneDatabase {
     const id = options.id ?? randomUUID();
     const timestamp = now();
     this.db.prepare(`INSERT INTO policies(id,name,version,policy_json,schema_version,enabled,source_path,source_status,source_error,source_hash,created_at,updated_at)
-      VALUES (?,?,1,?,3,1,?,?,NULL,?,?,?)`)
+      VALUES (?,?,1,?,4,1,?,?,NULL,?,?,?)`)
       .run(id, name, JSON.stringify(document), options.sourcePath ?? null, options.sourceStatus ?? "SYNCED", options.sourceHash ?? null, timestamp, timestamp);
     return this.getPolicy(id)!;
   }
@@ -533,7 +619,7 @@ export class HoplaneDatabase {
     if (options.expectedVersion !== undefined && current.version !== options.expectedVersion) {
       throw new AppError("POLICY_VERSION_CONFLICT", `Policy version changed from ${options.expectedVersion} to ${current.version}`, false, undefined, { currentVersion: current.version }, 409);
     }
-    this.db.prepare(`UPDATE policies SET name=?,policy_json=?,version=version+1,schema_version=3,enabled=?,source_path=?,source_status=?,source_error=NULL,source_hash=?,updated_at=? WHERE id=?`)
+    this.db.prepare(`UPDATE policies SET name=?,policy_json=?,version=version+1,schema_version=4,enabled=?,source_path=?,source_status=?,source_error=NULL,source_hash=?,updated_at=? WHERE id=?`)
       .run(name, JSON.stringify(document), bool(options.enabled ?? true), options.sourcePath === undefined ? current.sourcePath : options.sourcePath,
         options.sourceStatus ?? "SYNCED", options.sourceHash === undefined ? current.sourceHash : options.sourceHash, now(), id);
     return this.getPolicy(id)!;
@@ -589,18 +675,20 @@ export class HoplaneDatabase {
 
   createAudit(input: {
     id: string; clientType: string; clientId?: string; hostId?: string; hostNameSnapshot?: string;
+    peerHostId?: string; peerHostNameSnapshot?: string;
     operationType: string; requestSummary?: string;
   }): void {
     this.db.prepare(`INSERT INTO audit_logs
-      (id,client_type,client_id,host_id,host_name_snapshot,operation_type,request_summary,status,created_at)
-      VALUES (?,?,?,?,?,?,?,'RECEIVED',?)`).run(
+      (id,client_type,client_id,host_id,host_name_snapshot,peer_host_id,peer_host_name_snapshot,operation_type,request_summary,status,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,'RECEIVED',?)`).run(
       input.id, input.clientType, input.clientId ?? null, input.hostId ?? null, input.hostNameSnapshot ?? null,
-      input.operationType, input.requestSummary ?? null, now()
+      input.peerHostId ?? null, input.peerHostNameSnapshot ?? null, input.operationType, input.requestSummary ?? null, now()
     );
   }
 
   updateAudit(id: string, patch: {
-    policyId?: string | null; policyVersion?: number | null; policyDecision?: PolicyDecision | null;
+    policyId?: string | null; policyVersion?: number | null; peerPolicyId?: string | null; peerPolicyVersion?: number | null;
+    policyDecision?: PolicyDecision | null;
     decisionReasonCode?: string | null; status?: OperationStatus; exitCode?: number | null;
     durationMs?: number | null; bytesTransferred?: number | null; errorCode?: string | null; errorMessage?: string | null;
     finished?: boolean;
@@ -608,7 +696,8 @@ export class HoplaneDatabase {
     const fields: string[] = [];
     const values: SQLInputValue[] = [];
     const mapping: Record<string, string> = {
-      policyId: "policy_id", policyVersion: "policy_version", policyDecision: "policy_decision",
+      policyId: "policy_id", policyVersion: "policy_version", peerPolicyId: "peer_policy_id", peerPolicyVersion: "peer_policy_version",
+      policyDecision: "policy_decision",
       decisionReasonCode: "decision_reason_code", status: "status", exitCode: "exit_code", durationMs: "duration_ms",
       bytesTransferred: "bytes_transferred", errorCode: "error_code", errorMessage: "error_message"
     };
@@ -636,7 +725,7 @@ export class HoplaneDatabase {
   listAudit(filters: { hostId?: string; status?: string; limit?: number; offset?: number }): AuditLog[] {
     const where: string[] = [];
     const values: SQLInputValue[] = [];
-    if (filters.hostId) { where.push("host_id=?"); values.push(filters.hostId); }
+    if (filters.hostId) { where.push("(host_id=? OR peer_host_id=?)"); values.push(filters.hostId, filters.hostId); }
     if (filters.status) { where.push("status=?"); values.push(filters.status); }
     const limit = Math.min(Math.max(filters.limit ?? 100, 1), 500);
     const offset = Math.max(filters.offset ?? 0, 0);
@@ -654,7 +743,7 @@ function mapHost(row: Row): Host {
     id: String(row.id), name: String(row.name), hostname: String(row.hostname), port: Number(row.port), username: String(row.username),
     credentialId: nullable(row.credential_id), activeLoginId: nullable(row.active_login_id), policyId: nullable(row.policy_id), groupName: nullable(row.group_name),
     tags: JSON.parse(String(row.tags_json)) as string[], defaultDirectory: nullable(row.default_directory),
-    enabled: Boolean(row.enabled), aiAccessEnabled: Boolean(row.ai_access_enabled), monitorOutputEnabled: Boolean(row.monitor_output_enabled), configRevision: Number(row.config_revision),
+    enabled: Boolean(row.enabled), aiAccessEnabled: Boolean(row.ai_access_enabled), hostTransferEnabled: Boolean(row.host_transfer_enabled), monitorOutputEnabled: Boolean(row.monitor_output_enabled), configRevision: Number(row.config_revision),
     createdAt: String(row.created_at), updatedAt: String(row.updated_at)
   };
 }
@@ -680,7 +769,7 @@ function mapCredential(row: Row): Credential {
 function mapPolicy(row: Row): Policy {
   return {
     id: String(row.id), name: String(row.name), version: Number(row.version),
-    document: JSON.parse(String(row.policy_json)) as PolicyDocument, schemaVersion: 3, enabled: Boolean(row.enabled),
+    document: policyDocumentSchema.parse(JSON.parse(String(row.policy_json))), schemaVersion: 4, enabled: Boolean(row.enabled),
     sourcePath: nullable(row.source_path), sourceStatus: String(row.source_status) as PolicySourceStatus,
     sourceError: nullable(row.source_error), sourceHash: nullable(row.source_hash),
     createdAt: String(row.created_at), updatedAt: String(row.updated_at)
@@ -690,8 +779,10 @@ function mapPolicy(row: Row): Policy {
 function mapAudit(row: Row): AuditLog {
   return {
     id: String(row.id), clientType: String(row.client_type), clientId: nullable(row.client_id), hostId: nullable(row.host_id),
-    hostNameSnapshot: nullable(row.host_name_snapshot), operationType: String(row.operation_type), requestSummary: nullable(row.request_summary),
+    hostNameSnapshot: nullable(row.host_name_snapshot), peerHostId: nullable(row.peer_host_id), peerHostNameSnapshot: nullable(row.peer_host_name_snapshot),
+    operationType: String(row.operation_type), requestSummary: nullable(row.request_summary),
     policyId: nullable(row.policy_id), policyVersion: row.policy_version == null ? null : Number(row.policy_version),
+    peerPolicyId: nullable(row.peer_policy_id), peerPolicyVersion: row.peer_policy_version == null ? null : Number(row.peer_policy_version),
     policyDecision: nullable(row.policy_decision) as PolicyDecision | null, decisionReasonCode: nullable(row.decision_reason_code),
     status: String(row.status) as OperationStatus, exitCode: row.exit_code == null ? null : Number(row.exit_code),
     durationMs: row.duration_ms == null ? null : Number(row.duration_ms), bytesTransferred: row.bytes_transferred == null ? null : Number(row.bytes_transferred),

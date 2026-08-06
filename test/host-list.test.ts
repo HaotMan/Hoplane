@@ -6,7 +6,7 @@ function host(id: string, name: string, groupName: string | null): Host {
   return {
     id, name, groupName, hostname: `${id}.example.test`, port: 22, username: "root",
     credentialId: null, policyId: null, tags: [], defaultDirectory: null,
-    enabled: true, aiAccessEnabled: true, monitorOutputEnabled: false, status: "DISCONNECTED"
+    enabled: true, aiAccessEnabled: true, hostTransferEnabled: false, monitorOutputEnabled: false, status: "DISCONNECTED"
   };
 }
 

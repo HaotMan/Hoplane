@@ -26,7 +26,7 @@ apps/
 packages/
   shared/              类型、校验、错误和 Core API 客户端
   core/                HTTP、数据层、本地加密 Vault 和 Operation Service
-  ssh-core/            SSH 连接池与 SFTP
+  ssh-core/            SSH 连接池、SFTP 与 POSIX Exec 文件流回退
   policy/              命令和路径策略
   audit/               审计脱敏
   mcp-adapter/          可复用 MCP 工具与 stdio 适配器
@@ -57,12 +57,14 @@ test/                   单元和数据层测试
 → 未命中：允许
 ```
 
-策略使用 `schemaVersion: 3` 的黑名单模型。系统、Docker、Compose 和 Kubernetes 命令默认允许，仅由 `commandBlacklist` 中的正则规则过滤；“全权限（高风险）”模板的命令黑名单为空。文件上传和下载不是 Shell 命令，继续使用独立开关、大小限制与路径范围校验。
+策略使用 `schemaVersion: 4` 的黑名单模型。系统、Docker、Compose 和 Kubernetes 命令默认允许，仅由 `commandBlacklist` 中的正则规则过滤；“全权限（高风险）”模板的命令黑名单为空。主机间中继由源、目标主机各自默认关闭的 `hostTransferEnabled` 总闸控制，不写入共享策略；策略继续负责源端下载、目标端上传、大小、覆盖与路径范围校验。
+
+主机间中继优先建立两端 SFTP；仅当 SFTP 子系统启动失败时，Core 才使用固定生成的 POSIX SSH Exec 命令，以 `cat` 的 stdout/stdin 在两条 SSH 连接之间流式传输。路径、权限和覆盖错误不会触发回退；Exec 或所需基础命令也不可用时返回 `FILE_TRANSFER_TRANSPORT_UNAVAILABLE`。
 
 上传和下载执行双阶段检查：
 
 ```text
-功能开关与大小限制
+主机传输总闸、策略上传/下载开关与大小限制
 → 本地 realpath / 远端词法规范化
 → 允许目录检查
 → 建立 SFTP
@@ -140,6 +142,7 @@ POST           /v1/vault/lock
 POST /v1/operations/execute
 POST /v1/operations/upload
 POST /v1/operations/download
+POST /v1/operations/transfer
 ```
 
 MCP 协议端点：
@@ -150,7 +153,7 @@ POST /mcp  Streamable HTTP（默认关闭、Bearer Token、Host 校验）
 
 MCP 开关和保险库引用存入 `app_settings`；实际 `hpl_...` Token 只保存在本地加密保险库。HTTP 与 stdio 使用同一套工具注册和 Operation Service，避免出现两套权限路径。
 
-Codex 集成安装器只检查 `CODEX_HOME`、`~/.codex`、XDG/macOS/Windows 应用数据目录等有限候选位置，不递归扫描用户目录。界面会校验候选目录、`config.toml` 基础结构和可写性；发现多个目录时由用户选择，也支持手动输入绝对路径，选择结果持久化到本地设置。安装器将 Skill 安装到选定 Codex Home，并以托管区块更新 `config.toml` 中的 `mcp_servers.hoplane`。已有配置会保留，第一次修改前写入 `config.toml.hoplane-backup`。安装包使用 Electron 的 `ELECTRON_RUN_AS_NODE=1` 模式启动包内 stdio 入口，因此 macOS 和 Windows 都不依赖外部 Node。App 诊断会实际启动该入口、完成 MCP 初始化并核对五个工具；Skill 自带的诊断入口负责检查 Core、保险库和允许 AI 访问的主机。
+Codex 集成安装器只检查 `CODEX_HOME`、`~/.codex`、XDG/macOS/Windows 应用数据目录等有限候选位置，不递归扫描用户目录。界面会校验候选目录、`config.toml` 基础结构和可写性；发现多个目录时由用户选择，也支持手动输入绝对路径，选择结果持久化到本地设置。安装器将 Skill 安装到选定 Codex Home，并以托管区块更新 `config.toml` 中的 `mcp_servers.hoplane`。已有配置会保留，第一次修改前写入 `config.toml.hoplane-backup`。安装包使用 Electron 的 `ELECTRON_RUN_AS_NODE=1` 模式启动包内 stdio 入口，因此 macOS 和 Windows 都不依赖外部 Node。App 诊断会实际启动该入口、完成 MCP 初始化并核对六个工具；Skill 自带的诊断入口负责检查 Core、保险库和允许 AI 访问的主机。
 
 Agent 接入页按 Codex、Cursor、Claude Code、其他 Agent 分为四个标签。前三者都使用安装包内稳定的 stdio 入口并一键安装 Hoplane Skill：Cursor 写入 `~/.cursor/skills/hoplane` 与 `~/.cursor/mcp.json`，Claude Code 写入 `~/.claude/skills/hoplane` 与用户级 `~/.claude.json`；修改已有 JSON 前保留 `.hoplane-backup`，其他字段和 MCP 服务不变。“其他 Agent”继续通过默认关闭的本机 Streamable HTTP 服务复制配置和安装说明。界面支持跟随系统、深色、浅色三档主题并在本机持久化。
 

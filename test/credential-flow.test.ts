@@ -46,12 +46,13 @@ describe("host-owned credential flow", () => {
       const createdResponse = await fetch(`${runtime.url}/v1/hosts`, {
         method: "POST", headers: authorizedHeaders, body: JSON.stringify({
           name: "dev", hostname: "server.example.test", port: 22, username: "deploy",
-          policyId: null, groupName: null, tags: [], defaultDirectory: null, enabled: true, aiAccessEnabled: true,
+          policyId: null, groupName: null, tags: [], defaultDirectory: null, enabled: true, aiAccessEnabled: true, hostTransferEnabled: true,
           credential: { mode: "INLINE", name: "dev login", type: "PASSWORD", secret: "server-password", sudoMode: "CUSTOM_PASSWORD", sudoSecret: "sudo-password", metadata: {} }
         })
       });
       expect(createdResponse.status).toBe(201);
-      const host = await createdResponse.json() as { id: string; credentialId: string };
+      const host = await createdResponse.json() as { id: string; credentialId: string; hostTransferEnabled: boolean };
+      expect(host.hostTransferEnabled).toBe(true);
 
       const credentialsResponse = await fetch(`${runtime.url}/v1/credentials`, { headers: { authorization: `Bearer ${token}` } });
       const credentials = await credentialsResponse.json() as Array<Record<string, unknown>>;
@@ -61,7 +62,7 @@ describe("host-owned credential flow", () => {
       expect(await readFile(join(dataDir, "vault.enc"), "utf8")).not.toContain("sudo-password");
 
       const aiHostsBeforeDisable = await fetch(`${runtime.url}/v1/hosts?aiOnly=true`, { headers: { authorization: `Bearer ${token}` } });
-      expect(await aiHostsBeforeDisable.json()).toMatchObject([{ id: host.id, enabled: true, aiAccessEnabled: true }]);
+      expect(await aiHostsBeforeDisable.json()).toMatchObject([{ id: host.id, enabled: true, aiAccessEnabled: true, hostTransferEnabled: true }]);
       const disabled = await fetch(`${runtime.url}/v1/hosts/${host.id}`, {
         method: "PATCH", headers: authorizedHeaders, body: JSON.stringify({ enabled: false })
       });

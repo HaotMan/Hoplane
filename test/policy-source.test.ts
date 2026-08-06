@@ -42,7 +42,7 @@ describe("PolicySourceService", () => {
       const selected = database.listPolicies()[0]!;
       const source = await service.getSource(selected.id);
       expect(source.path).toMatch(/\.yaml$/u);
-      expect((await readFile(source.path, "utf8"))).toContain("schemaVersion: 3");
+      expect((await readFile(source.path, "utf8"))).toContain("schemaVersion: 4");
 
       const parsed = parse(source.yaml) as Record<string, unknown>;
       parsed.name = "外部编辑策略";
@@ -79,6 +79,30 @@ describe("PolicySourceService", () => {
       const imported = database.listPolicies().find((policy) => policy.name === "目录导入策略")!;
       expect(imported.id).toMatch(/^[0-9a-f-]{36}$/u);
       await expect(service.saveSource(imported.id, (await service.getSource(imported.id)).yaml, imported.version - 1)).rejects.toMatchObject({ code: "POLICY_VERSION_CONFLICT" });
+    } finally { await service.close(); database.close(); }
+  });
+
+  it("accepts legacy YAML and removes the retired host transfer switch on the next save", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hoplane-policy-v3-source-")); dirs.push(dir);
+    const database = new HoplaneDatabase(join(dir, "hoplane.sqlite3"));
+    const service = new PolicySourceService(config(dir), database, { watch: false });
+    await service.initialize();
+    try {
+      const selected = database.listPolicies()[0]!;
+      const source = await service.getSource(selected.id);
+      const legacy = parse(source.yaml) as Record<string, unknown>;
+      legacy.schemaVersion = 3;
+      (legacy.files as Record<string, unknown>).allowHostTransfer = true;
+      await writeFile(source.path, stringify(legacy));
+      expect((await service.rescan()).updated).toBe(1);
+      const normalized = database.getPolicy(selected.id)!;
+      expect(normalized.document).toMatchObject({ schemaVersion: 4 });
+      expect(normalized.document.files).not.toHaveProperty("allowHostTransfer");
+      expect(await readFile(source.path, "utf8")).toContain("schemaVersion: 3");
+
+      await service.saveSource(selected.id, await readFile(source.path, "utf8"), normalized.version);
+      expect(await readFile(source.path, "utf8")).toContain("schemaVersion: 4");
+      expect(await readFile(source.path, "utf8")).not.toContain("allowHostTransfer");
     } finally { await service.close(); database.close(); }
   });
 });

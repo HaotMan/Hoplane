@@ -46,6 +46,13 @@ async function run(argv: string[]): Promise<unknown> {
       clientType: "CLI", clientId: "aiterm"
     });
   }
+  if (command === "transfer") {
+    return client.request("POST", "/v1/operations/transfer", {
+      sourceHostId: required(subcommand, "source host id"), sourcePath: required(rest[0], "source path"),
+      destinationHostId: required(rest[1], "destination host id"), destinationPath: required(rest[2], "destination path"),
+      clientType: "CLI", clientId: "aiterm"
+    });
+  }
   throw new AppError("INVALID_ARGUMENT", `Unknown command: ${argv.join(" ")}`);
 }
 
@@ -66,6 +73,7 @@ function usage(): { usage: string[] } {
     "aiterm host test <host-id>",
     "aiterm exec <host-id> [--directory /path] [--timeout 30000] -- <command>",
     "aiterm upload <host-id> <local-path> <remote-path>",
-    "aiterm download <host-id> <remote-path> <local-path>"
+    "aiterm download <host-id> <remote-path> <local-path>",
+    "aiterm transfer <source-host-id> <source-path> <destination-host-id> <destination-path>"
   ] };
 }
