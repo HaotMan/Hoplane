@@ -106,7 +106,7 @@ const server = createServer(async (request, response) => {
   try {
     applySecurityHeaders(response);
     const url = new URL(request.url ?? "/", `http://${config.host}:${config.port}`);
-    if (url.pathname === "/health" && request.method === "GET") return json(response, 200, { status: "ok", version: "0.1.2", uiBuildId, mcpEnabled: mcpService.isEnabled() });
+    if (url.pathname === "/health" && request.method === "GET") return json(response, 200, { status: "ok", version: "0.1.3", uiBuildId, mcpEnabled: mcpService.isEnabled() });
     if (url.pathname === "/mcp") {
       const parsed = request.method === "POST" ? await body(request) : undefined;
       return await mcpService.handle(request, response, parsed);

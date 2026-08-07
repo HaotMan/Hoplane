@@ -1,6 +1,6 @@
 {
   "name": "hoplane",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Local-first MCP gateway for policy-controlled SSH access",
   "author": "Hoplane",
   "license": "MPL-2.0",

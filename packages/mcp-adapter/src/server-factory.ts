@@ -12,7 +12,7 @@ export interface HoplaneMcpBackend {
 }
 
 export function createHoplaneMcpServer(backend: HoplaneMcpBackend): McpServer {
-  const server = new McpServer({ name: "hoplane", version: "0.1.2" });
+  const server = new McpServer({ name: "hoplane", version: "0.1.3" });
 
   server.registerTool("list_hosts", {
     title: "List SSH hosts",
