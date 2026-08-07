@@ -9,6 +9,8 @@ describe("sudo invocation detection", () => {
     expect(findSudoInvocations("cd /opt && sudo make install")).toEqual([11]);
     expect(findSudoInvocations("echo x | sudo tee /etc/motd; sudo sync")).toEqual([9, 29]);
     expect(findSudoInvocations("(sudo id)\nsudo whoami")).toEqual([1, 10]);
+    expect(findSudoInvocations("time sudo id")).toEqual([5]);
+    expect(findSudoInvocations("time -p sudo whoami")).toEqual([8]);
   });
 
   it("ignores sudo inside quotes or in argument position", () => {
@@ -17,6 +19,7 @@ describe("sudo invocation detection", () => {
     expect(findSudoInvocations("grep sudo /etc/group")).toEqual([]);
     expect(findSudoInvocations("cat /var/log/sudo.log")).toEqual([]);
     expect(findSudoInvocations("visudo")).toEqual([]);
+    expect(findSudoInvocations("echo time sudo id")).toEqual([]);
   });
 });
 
@@ -42,6 +45,16 @@ describe("managed sudo execution", () => {
     const prepared = prepareSudoExecution("cd /opt && sudo make install", true, "HOPLANE_TEST_PROMPT");
     expect(prepared.command).toBe("cd /opt && sudo -S -p 'HOPLANE_TEST_PROMPT' make install");
     expect(prepareSudoExecution("cd /opt && sudo make install", false)).toEqual({ command: "cd /opt && sudo -n make install" });
+  });
+
+  it("rewrites sudo wrapped by the shell time keyword", () => {
+    expect(prepareSudoExecution("time sudo whoami", true, "HOPLANE_TEST_PROMPT")).toEqual({
+      command: "time sudo -S -p 'HOPLANE_TEST_PROMPT' whoami",
+      promptMarker: "HOPLANE_TEST_PROMPT"
+    });
+    expect(prepareSudoExecution("time -p sudo whoami 2>&1", false)).toEqual({
+      command: "time -p sudo -n whoami 2>&1"
+    });
   });
 
   it("does not rewrite sudo mentioned inside quoted text", () => {

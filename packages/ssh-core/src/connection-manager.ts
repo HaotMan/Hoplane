@@ -79,7 +79,11 @@ export class SSHConnectionManager {
       let stdoutTruncated = false;
       let stderrTruncated = false;
       let activeStream: { close(): void } | undefined;
-      const sudoPrompt = sudoExecution.promptMarker ? new SudoPromptFilter(sudoExecution.promptMarker) : null;
+      // A caller may use `2>&1`, which moves sudo's prompt from stderr to
+      // stdout. Keep independent packet filters for both SSH streams because a
+      // prompt can be split across chunks, but never across the two streams.
+      const stdoutSudoPrompt = sudoExecution.promptMarker ? new SudoPromptFilter(sudoExecution.promptMarker) : null;
+      const stderrSudoPrompt = sudoExecution.promptMarker ? new SudoPromptFilter(sudoExecution.promptMarker) : null;
       const timer = setTimeout(() => {
         if (settled) return;
         settled = true;
@@ -95,19 +99,18 @@ export class SSHConnectionManager {
           return;
         }
         activeStream = stream;
-        stream.on("data", (chunk: Buffer) => {
+        const answerSudoPrompts = (prompted: number) => {
+          // stdin stays open so every sudo in a chained command can be answered.
+          if (prompted > 0 && sudoPassword !== null) stream.write(`${sudoPassword}\n`.repeat(prompted));
+        };
+        const appendStdout = (chunk: Buffer) => {
+          if (chunk.length === 0) return;
           const remaining = Math.max(0, this.outputLimitBytes - stdout.length);
           if (remaining > 0) options.onStdout?.(chunk.subarray(0, remaining));
           const result = appendLimited(stdout, chunk, this.outputLimitBytes);
           stdout = result.value;
           stdoutTruncated ||= result.truncated;
-        });
-        stream.stderr.on("data", (chunk: Buffer) => {
-          const filtered = sudoPrompt?.push(chunk) ?? { visible: chunk, prompted: 0 };
-          // stdin stays open so every sudo in a chained command can be answered.
-          if (filtered.prompted > 0 && sudoPassword !== null) stream.write(`${sudoPassword}\n`.repeat(filtered.prompted));
-          appendStderr(filtered.visible);
-        });
+        };
         const appendStderr = (chunk: Buffer) => {
           if (chunk.length === 0) return;
           const remaining = Math.max(0, this.outputLimitBytes - stderr.length);
@@ -116,9 +119,20 @@ export class SSHConnectionManager {
           stderr = result.value;
           stderrTruncated ||= result.truncated;
         };
+        stream.on("data", (chunk: Buffer) => {
+          const filtered = stdoutSudoPrompt?.push(chunk) ?? { visible: chunk, prompted: 0 };
+          answerSudoPrompts(filtered.prompted);
+          appendStdout(filtered.visible);
+        });
+        stream.stderr.on("data", (chunk: Buffer) => {
+          const filtered = stderrSudoPrompt?.push(chunk) ?? { visible: chunk, prompted: 0 };
+          answerSudoPrompts(filtered.prompted);
+          appendStderr(filtered.visible);
+        });
         stream.on("close", (code: number | null) => {
           if (settled) return;
-          if (sudoPrompt) appendStderr(sudoPrompt.flush());
+          if (stdoutSudoPrompt) appendStdout(stdoutSudoPrompt.flush());
+          if (stderrSudoPrompt) appendStderr(stderrSudoPrompt.flush());
           settled = true;
           clearTimeout(timer);
           resolve({
@@ -678,7 +692,8 @@ const COMMAND_SEPARATORS = new Set([";", "&", "|", "(", "{", "`", "\n"]);
 /**
  * Finds the offset of every `sudo` that starts a shell command: at the beginning
  * of the string or right after a separator (`;`, `&&`, `||`, `|`, `(`, `` ` ``,
- * `{`, newline). Text inside single/double quotes is skipped, so e.g.
+ * `{`, newline), or immediately after the shell `time` wrapper (`time sudo`
+ * and `time -p sudo`). Text inside single/double quotes is skipped, so e.g.
  * `echo "a && sudo b"` is not treated as a sudo invocation. sudo credentials do
  * not carry across invocations on a non-interactive SSH channel (no TTY means no
  * usable timestamp cache), so every invocation needs its own authentication.
@@ -686,28 +701,41 @@ const COMMAND_SEPARATORS = new Set([";", "&", "|", "(", "{", "`", "\n"]);
 export function findSudoInvocations(command: string): number[] {
   const offsets: number[] = [];
   let atCommandStart = true;
+  let insideTimeWrapper = false;
   for (let index = 0; index < command.length; index += 1) {
     const char = command[index]!;
-    if (char === "\\") { index += 1; atCommandStart = false; continue; }
+    if (char === "\\") { index += 1; atCommandStart = false; insideTimeWrapper = false; continue; }
     if (char === "'") {
       const end = command.indexOf("'", index + 1);
       index = end < 0 ? command.length : end;
       atCommandStart = false;
+      insideTimeWrapper = false;
       continue;
     }
     if (char === '"') {
       index += 1;
       while (index < command.length && command[index] !== '"') { if (command[index] === "\\") index += 1; index += 1; }
       atCommandStart = false;
+      insideTimeWrapper = false;
       continue;
     }
-    if (COMMAND_SEPARATORS.has(char)) { atCommandStart = true; continue; }
+    if (COMMAND_SEPARATORS.has(char)) { atCommandStart = true; insideTimeWrapper = false; continue; }
     if (/\s/u.test(char)) continue;
+    if (atCommandStart && command.startsWith("time", index) && /\s/u.test(command[index + 4] ?? "")) {
+      index += 3;
+      insideTimeWrapper = true;
+      continue;
+    }
+    if (atCommandStart && insideTimeWrapper && command.startsWith("-p", index) && (index + 2 === command.length || /\s/u.test(command[index + 2]!))) {
+      index += 1;
+      continue;
+    }
     if (atCommandStart && command.startsWith("sudo", index) && (index + 4 === command.length || /\s/u.test(command[index + 4]!))) {
       offsets.push(index);
       index += 3;
     }
     atCommandStart = false;
+    insideTimeWrapper = false;
   }
   return offsets;
 }
@@ -728,9 +756,10 @@ export function prepareSudoExecution(command: string, hasManagedPassword: boolea
 }
 
 /**
- * Holds only a short stderr suffix so a sudo prompt split across SSH packets can
- * be removed. Every prompt occurrence is reported: a chained command may invoke
- * sudo several times and each invocation needs its own password answer.
+ * Holds only a short output-stream suffix so a sudo prompt split across SSH
+ * packets can be removed. The same filter is used independently for stdout and
+ * stderr. Every prompt occurrence is reported because a chained command may
+ * invoke sudo several times and each invocation needs its own password answer.
  */
 export class SudoPromptFilter {
   private readonly marker: Buffer;

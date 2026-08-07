@@ -10,8 +10,9 @@ const SUDO_PROMPT_PATTERN = /^sudo -S -p '([^']+)' (.*)$/u;
 
 /**
  * Fake sshd that emulates real sudo on a no-TTY channel: every `sudo -S -p`
- * invocation writes its prompt to stderr and requires a fresh password line on
- * stdin. Credentials never carry over between invocations.
+ * invocation writes its prompt to stderr, or stdout when `2>&1` is present,
+ * and requires a fresh password line on stdin. Credentials never carry over
+ * between invocations.
  */
 function startFakeSshServer(): Promise<{ server: InstanceType<typeof ssh2.Server>; port: number }> {
   const hostKey = ssh2.utils.generateKeyPairSync("ed25519");
@@ -50,9 +51,11 @@ function startFakeSshServer(): Promise<{ server: InstanceType<typeof ssh2.Server
           });
           void (async () => {
             for (const segment of info.command.split("&&").map((part) => part.trim())) {
-              const sudoMatch = segment.match(SUDO_PROMPT_PATTERN);
+              const unwrapped = segment.replace(/^time(?:\s+-p)?\s+/u, "");
+              const sudoMatch = unwrapped.match(SUDO_PROMPT_PATTERN);
               if (sudoMatch) {
-                channel.stderr.write(sudoMatch[1]!);
+                if (/(?:^|\s)2>&1(?:\s|$)/u.test(sudoMatch[2]!)) channel.write(sudoMatch[1]!);
+                else channel.stderr.write(sudoMatch[1]!);
                 const answer = await readStdinLine();
                 if (answer !== LOGIN_PASSWORD) {
                   channel.stderr.write("sudo: incorrect password\n");
@@ -137,6 +140,18 @@ describe("chained sudo over a real SSH channel", () => {
     expect(midChain.exitCode).toBe(0);
     expect(midChain.stdout).toBe("ran: cd /tmp\nsudo-ran: whoami\n");
     expect(midChain.stderr).toBe("");
+
+    const redirected = await manager.execute(host.id, "sudo whoami 2>&1", { timeoutMs: 5000 });
+    expect(redirected.exitCode).toBe(0);
+    expect(redirected.stdout).toBe("sudo-ran: whoami 2>&1\n");
+    expect(redirected.stdout).not.toContain("HOPLANE_SUDO_");
+    expect(redirected.stderr).toBe("");
+
+    const timedAndRedirected = await manager.execute(host.id, "time -p sudo whoami 2>&1", { timeoutMs: 5000 });
+    expect(timedAndRedirected.exitCode).toBe(0);
+    expect(timedAndRedirected.stdout).toBe("sudo-ran: whoami 2>&1\n");
+    expect(timedAndRedirected.stdout).not.toContain("HOPLANE_SUDO_");
+    expect(timedAndRedirected.stderr).toBe("");
 
     await manager.disconnect(host.id);
   });
