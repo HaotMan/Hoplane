@@ -13,7 +13,7 @@ let quitting = false;
 let shutdownComplete = false;
 let coreUrl = "http://127.0.0.1:21722";
 
-void app.whenReady().then(async () => {
+const startup = app.whenReady().then(async () => {
   process.stderr.write("Hoplane desktop ready\n");
   process.env.HOPLANE_MCP_RUNTIME = process.execPath;
   process.env.HOPLANE_MCP_ENTRY = join(app.getAppPath(), "dist", "packages", "mcp-adapter", "src", "index.js");
@@ -40,14 +40,15 @@ void app.whenReady().then(async () => {
   ipcMain.handle("hoplane:open-policies-directory", async () => { await shell.openPath(config.policyDir); });
   createWindow();
   createTray();
-}).catch((error: unknown) => {
+});
+
+void startup.catch((error: unknown) => {
   process.stderr.write(`Hoplane desktop failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
   app.quit();
 });
 
 app.on("activate", () => {
-  if (!window) createWindow();
-  else window.show();
+  void startup.then(() => showWindow()).catch(() => undefined);
 });
 
 app.on("window-all-closed", () => undefined);

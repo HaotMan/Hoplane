@@ -3,6 +3,7 @@ import { Terminal, type ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { WebLinksAddon } from "@xterm/addon-web-links";
+import { TerminalWindow } from "@phosphor-icons/react";
 import "@xterm/xterm/css/xterm.css";
 import { Breadcrumb, PageHeader } from "./page-chrome";
 import type { Host, HostLogin } from "./types";
@@ -136,7 +137,7 @@ export function HostTerminalPage({ host, logins, onBack }: { host: Host; logins:
     </PageHeader>
     <div className="terminal-shell panel interactive-terminal">
       <div className="terminal-toolbar">
-        <div className="terminal-dots"><i /><i /><i /></div>
+        <TerminalWindow size={18} aria-hidden="true" />
         <span>{connected && activeUsername ? `${activeUsername}@${host.hostname}:${host.port}` : `${host.hostname}:${host.port}`}</span>
         <div className="terminal-output-control interactive-terminal-controls">
           <label className="terminal-login-picker">登录用户

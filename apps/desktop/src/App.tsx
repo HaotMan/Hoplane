@@ -1,4 +1,19 @@
 import { useCallback, useEffect, useId, useRef, useState, type FormEvent } from "react";
+import {
+  ArrowClockwise,
+  CaretDown,
+  CheckCircle,
+  ClockCounterClockwise,
+  Desktop,
+  MagnifyingGlass,
+  Moon,
+  PencilSimple,
+  Sun,
+  Tag,
+  TerminalWindow,
+  Trash,
+  X
+} from "@phosphor-icons/react";
 import { COMMAND_BLACKLIST_CATALOG, DEFAULT_POLICY_TEMPLATE, findPolicyTemplate, findPolicyTemplateByName, POLICY_TEMPLATES } from "../../../packages/shared/src/policy-templates";
 import { policySourceSchema } from "../../../packages/shared/src/schemas";
 import { parseDocument, stringify } from "yaml";
@@ -18,17 +33,17 @@ function agentStateKey(agent: JsonAgentChannel): "cursor" | "claudeCode" | "work
 }
 interface VaultState { localInitialized: boolean; unlocked: boolean }
 const THEME_STORAGE_KEY = "hoplane.theme";
-const pages: Array<{ id: Page; label: string; mark: string }> = [
-  { id: "hosts", label: "主机", mark: "H" },
-  { id: "policies", label: "策略", mark: "P" }, { id: "audit", label: "审计", mark: "A" },
-  { id: "settings", label: "接入", mark: "S" }
+const pages: Array<{ id: Page; label: string }> = [
+  { id: "hosts", label: "主机" },
+  { id: "policies", label: "策略" }, { id: "audit", label: "审计" },
+  { id: "settings", label: "接入" }
 ];
 
 export function App() {
   const [page, setPage] = useState<Page>("hosts");
   const [themePreference, setThemePreference] = useState<ThemePreference>(() => {
     const saved = window.localStorage.getItem(THEME_STORAGE_KEY);
-    return saved === "dark" || saved === "light" ? saved : "system";
+    return saved === "system" || saved === "dark" || saved === "light" ? saved : "system";
   });
   const [systemDark, setSystemDark] = useState(() => window.matchMedia("(prefers-color-scheme: dark)").matches);
   const [notice, setNotice] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
@@ -47,12 +62,14 @@ export function App() {
   }, [themePreference, systemDark]);
   useEffect(() => { void api<VaultState>("/v1/vault-settings").then(setVaultState).catch((error) => notify("error", message(error))); }, [notify]);
   return <div className="app-shell">
-    <aside>
-      <div className="brand"><div className="brand-mark">H</div><div><strong>Hoplane</strong><span>AI SSH Gateway</span></div></div>
-      <nav>{pages.map((item) => <button key={item.id} className={page === item.id ? "active" : ""} onClick={() => setPage(item.id)}><i>{item.mark}</i>{item.label}</button>)}</nav>
-      <ThemePicker value={themePreference} onChange={setThemePreference} />
-      <div className="security-note"><span className="pulse" />Core 本地运行<br/><small>默认拒绝 · 全程审计</small></div>
-    </aside>
+    <header className="topbar">
+      <button type="button" className="brand" onClick={() => setPage("hosts")} aria-label="返回主机页面">Hoplane</button>
+      <nav aria-label="主导航">{pages.map((item) => <button key={item.id} className={page === item.id ? "active" : ""} onClick={() => setPage(item.id)}>{item.label}</button>)}</nav>
+      <div className="topbar-tools">
+        <div className="security-note"><span className="pulse" />Core 本地运行</div>
+        <ThemeCycleButton value={themePreference} onChange={setThemePreference} />
+      </div>
+    </header>
     <main>
       {page === "hosts" && <HostsPage notify={notify} />}
       {page === "policies" && <PoliciesPage notify={notify} />}
@@ -64,13 +81,14 @@ export function App() {
   </div>;
 }
 
-function ThemePicker({ value, onChange }: { value: ThemePreference; onChange(value: ThemePreference): void }) {
-  const options: Array<{ value: ThemePreference; label: string; short: string }> = [
-    { value: "system", label: "跟随系统", short: "A" },
-    { value: "dark", label: "深色", short: "D" },
-    { value: "light", label: "浅色", short: "L" }
-  ];
-  return <div className="theme-picker"><span>界面风格</span><div>{options.map((option) => <button key={option.value} title={option.label} aria-label={option.label} aria-pressed={value === option.value} className={value === option.value ? "selected" : ""} onClick={() => onChange(option.value)}><i>{option.short}</i><em>{option.label}</em></button>)}</div></div>;
+function ThemeCycleButton({ value, onChange }: { value: ThemePreference; onChange(value: ThemePreference): void }) {
+  const cycle: ThemePreference[] = ["system", "dark", "light"];
+  const labels: Record<ThemePreference, string> = { system: "跟随系统", dark: "深色", light: "浅色" };
+  const nextValue = cycle[(cycle.indexOf(value) + 1) % cycle.length]!;
+  const description = `当前外观：${labels[value]}；点击切换为${labels[nextValue]}`;
+  return <button type="button" className="theme-cycle" title={description} aria-label={description} onClick={() => onChange(nextValue)}>
+    {value === "system" ? <Desktop size={20} weight="regular" aria-hidden="true" /> : value === "dark" ? <Moon size={20} weight="regular" aria-hidden="true" /> : <Sun size={20} weight="regular" aria-hidden="true" />}
+  </button>;
 }
 
 function HostsPage({ notify }: { notify: Notify }) {
@@ -89,6 +107,11 @@ function HostsPage({ notify }: { notify: Notify }) {
   const [multiSelectMode, setMultiSelectMode] = useState(false);
   const [selectedHostIds, setSelectedHostIds] = useState<Set<string>>(() => new Set());
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => new Set());
+  const [query, setQuery] = useState("");
+  const [connectionFilter, setConnectionFilter] = useState("");
+  const [accessFilter, setAccessFilter] = useState("");
+  const [policyFilter, setPolicyFilter] = useState("");
+  const [tagFilter, setTagFilter] = useState("");
   const [testResults, setTestResults] = useState<Record<string, { kind: "ok" | "error" | "pending"; text: string }>>({});
   const load = useCallback(async () => {
     try {
@@ -214,6 +237,16 @@ function HostsPage({ notify }: { notify: Notify }) {
     } catch (error) { notify("error", message(error)); }
     finally { setUpdatingHostId(null); }
   }
+  async function toggleHostTransfer(host: Host) {
+    if (updatingHostId) return;
+    setUpdatingHostId(host.id);
+    try {
+      await patch(`/v1/hosts/${host.id}`, { hostTransferEnabled: !host.hostTransferEnabled });
+      await load();
+      notify("ok", host.hostTransferEnabled ? `${host.name} 已关闭主机间文件传输` : `${host.name} 已允许主机间文件传输`);
+    } catch (error) { notify("error", message(error)); }
+    finally { setUpdatingHostId(null); }
+  }
   async function renameGroup(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!renamingGroup) return;
@@ -244,25 +277,49 @@ function HostsPage({ notify }: { notify: Notify }) {
   if (monitorHostId && monitoredHost) return <HostMonitorPage host={monitoredHost} credential={monitoredCredential} onBack={() => setMonitorHostId(null)} onHostChanged={load} notify={notify} />;
   const terminalHost = terminalHostId ? hosts.find((host) => host.id === terminalHostId) : undefined;
   if (terminalHostId && terminalHost) return <HostTerminalPage key={terminalHost.id} host={terminalHost} logins={hostLogins.filter((login) => login.hostId === terminalHost.id)} onBack={() => setTerminalHostId(null)} />;
-  const groups = groupHosts(hosts);
-  const allSelected = hosts.length > 0 && selectedHostIds.size === hosts.length;
-  const someSelected = selectedHostIds.size > 0 && !allSelected;
-  const existingGroupNames = groups.filter((group) => !group.ungrouped).map((group) => group.name);
-  return <section><PageHeader eyebrow="Infrastructure" title="SSH 主机"><button className="primary" onClick={() => setEditing("new")}>添加主机</button></PageHeader>
-    <div className="summary-row">
-      <Metric label="主机总数" value={hosts.length} /><Metric label="允许 AI" value={hosts.filter(h => h.enabled && h.aiAccessEnabled).length} />
-      <Metric label="在线连接" value={hosts.filter(h => h.status === "CONNECTED").length} />
+  const normalizedQuery = query.trim().toLocaleLowerCase("zh-CN");
+  const filteredHosts = hosts.filter((host) => {
+    const activeLogin = hostLogins.find((login) => login.hostId === host.id && login.id === host.activeLoginId);
+    const searchable = [host.name, host.hostname, host.groupName ?? "", activeLogin?.username ?? "", ...host.tags].join(" ").toLocaleLowerCase("zh-CN");
+    if (normalizedQuery && !searchable.includes(normalizedQuery)) return false;
+    if (connectionFilter === "connected" && host.status !== "CONNECTED") return false;
+    if (connectionFilter === "disconnected" && host.status === "CONNECTED") return false;
+    if (accessFilter === "allowed" && !(host.enabled && host.aiAccessEnabled)) return false;
+    if (accessFilter === "blocked" && host.enabled && host.aiAccessEnabled) return false;
+    if (policyFilter && (host.policyId ?? "none") !== policyFilter) return false;
+    if (tagFilter && !host.tags.includes(tagFilter)) return false;
+    return true;
+  });
+  const groups = groupHosts(filteredHosts);
+  const allGroups = groupHosts(hosts);
+  const visibleHostIds = filteredHosts.map((host) => host.id);
+  const selectedVisibleCount = visibleHostIds.filter((id) => selectedHostIds.has(id)).length;
+  const allSelected = visibleHostIds.length > 0 && selectedVisibleCount === visibleHostIds.length;
+  const someSelected = selectedVisibleCount > 0 && !allSelected;
+  const existingGroupNames = allGroups.filter((group) => !group.ungrouped).map((group) => group.name);
+  const tags = [...new Set(hosts.flatMap((host) => host.tags))].sort((left, right) => left.localeCompare(right, "zh-CN"));
+  const connectedCount = hosts.filter((host) => host.status === "CONNECTED").length;
+  const aiAllowedCount = hosts.filter((host) => host.enabled && host.aiAccessEnabled).length;
+  return <section><PageHeader title="SSH 主机"><button className="primary" onClick={() => setEditing("new")}>添加主机</button></PageHeader>
+    <p className="host-summary">{hosts.length} 台主机，{connectedCount} 台已连接，{aiAllowedCount} 台允许 AI 访问 · 数据仅保存在本地 Core。</p>
+    <div className="host-filter-bar" aria-label="主机筛选">
+      <label className="host-search"><MagnifyingGlass size={19} weight="regular" aria-hidden="true" /><span className="sr-only">搜索主机</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索主机、地址或用户" /></label>
+      <select aria-label="筛选连接状态" value={connectionFilter} onChange={(event) => setConnectionFilter(event.target.value)}><option value="">连接状态：全部</option><option value="connected">已连接</option><option value="disconnected">未连接</option></select>
+      <select aria-label="筛选 AI 访问" value={accessFilter} onChange={(event) => setAccessFilter(event.target.value)}><option value="">AI 访问：全部</option><option value="allowed">允许</option><option value="blocked">未允许</option></select>
+      <select aria-label="筛选权限策略" value={policyFilter} onChange={(event) => setPolicyFilter(event.target.value)}><option value="">策略：全部</option><option value="none">未配置</option>{orderPolicies(policies).map((policy) => <option key={policy.id} value={policy.id}>{policy.name}</option>)}</select>
+      <label className="tag-filter"><Tag size={18} aria-hidden="true" /><span className="sr-only">筛选标签</span><select aria-label="筛选标签" value={tagFilter} onChange={(event) => setTagFilter(event.target.value)}><option value="">标签：全部</option>{tags.map((tag) => <option key={tag}>{tag}</option>)}</select></label>
+      <button className="icon-button" type="button" title="刷新主机" aria-label="刷新主机" onClick={() => void load()}><ArrowClockwise size={19} /></button>
     </div>
+    {hosts.length > 0 && <div className="host-list-toolbar"><div><strong>{multiSelectMode ? selectedHostIds.size > 0 ? `已选择 ${selectedHostIds.size} 台主机` : "请选择主机" : `显示 ${filteredHosts.length} 台主机`}</strong><small>{multiSelectMode ? "复制内容为显示名称和主机地址，每行一台" : `${groups.length} 个分组 · 行尾图标可直接操作`}</small></div><div>{multiSelectMode ? <><button onClick={() => selectHosts(visibleHostIds, !allSelected)}>{allSelected ? "取消全选" : "全选当前结果"}</button><button className="primary" disabled={selectedHostIds.size === 0} onClick={() => void copySelectedHostNames()}>复制名称和地址</button><button onClick={leaveMultiSelectMode}>完成</button></> : <button onClick={() => setMultiSelectMode(true)}>多选</button>}</div></div>}
     <div className="panel table-panel host-table-panel">
-      {hosts.length > 0 && <div className="host-list-toolbar"><div><strong>{multiSelectMode ? selectedHostIds.size > 0 ? `已选择 ${selectedHostIds.size} 台主机` : "请选择主机" : `${groups.length} 个分组`}</strong><small>{multiSelectMode ? "复制内容为显示名称和主机地址，每行一台" : "点击分组名称可展开或折叠"}</small></div><div>{multiSelectMode ? <><button onClick={() => selectHosts(hosts.map((host) => host.id), !allSelected)}>{allSelected ? "取消全选" : "全选主机"}</button><button className="primary" disabled={selectedHostIds.size === 0} onClick={() => void copySelectedHostNames()}>复制名称和地址</button><button onClick={leaveMultiSelectMode}>完成</button></> : <button onClick={() => setMultiSelectMode(true)}>多选</button>}</div></div>}
-      <table><thead><tr>{multiSelectMode && <th className="host-select-cell"><SelectionCheckbox label="选择全部主机" checked={allSelected} indeterminate={someSelected} disabled={hosts.length === 0} onChange={(selected) => selectHosts(hosts.map((host) => host.id), selected)} /></th>}<th className="host-name-column">主机</th><th className="host-status-column">状态</th><th className="host-access-column">AI 权限</th><th className="host-policy-column">策略</th><th className="host-actions-column" /></tr></thead>
+      <table><thead><tr>{multiSelectMode && <th className="host-select-cell"><SelectionCheckbox label="选择筛选结果中的全部主机" checked={allSelected} indeterminate={someSelected} disabled={filteredHosts.length === 0} onChange={(selected) => selectHosts(visibleHostIds, selected)} /></th>}<th className="host-name-column">主机</th><th className="host-status-column">连接</th><th className="host-access-column">AI 访问</th><th className="host-user-column">当前用户</th><th className="host-policy-column">策略</th><th className="host-actions-column" /></tr></thead>
       <tbody>{groups.map((group) => {
         const groupIds = group.hosts.map((host) => host.id);
         const selectedInGroup = groupIds.filter((id) => selectedHostIds.has(id)).length;
         const groupSelected = selectedInGroup === group.hosts.length;
         const collapsed = collapsedGroups.has(group.key);
-        return <GroupRows key={group.key} groupName={group.name} ungrouped={group.ungrouped} hosts={group.hosts} hostLogins={hostLogins} collapsed={collapsed} selectionMode={multiSelectMode} selectedIds={selectedHostIds} groupSelected={groupSelected} groupIndeterminate={selectedInGroup > 0 && !groupSelected} policies={policies} testResults={testResults} testingHostId={testingHostId} updatingHostId={updatingHostId} onToggleGroup={() => toggleGroup(group.key)} onRenameGroup={() => setRenamingGroup(group.name)} onSelectGroup={(selected) => selectHosts(groupIds, selected)} onSelectHost={selectHost} onActivateLogin={activateLogin} onChangePolicy={changePolicy} onToggleSudo={toggleSudo} onOpenTerminal={setTerminalHostId} onMonitor={setMonitorHostId} onTest={test} onToggleHost={toggleHost} onEdit={setEditing} onDelete={setDeletingHost} />;
-      })}</tbody></table>{hosts.length === 0 && <Empty text="还没有主机。添加主机时可以直接填写密码、私钥或 SSH Agent。" />}</div>
+        return <GroupRows key={group.key} groupName={group.name} ungrouped={group.ungrouped} hosts={group.hosts} hostLogins={hostLogins} collapsed={collapsed} selectionMode={multiSelectMode} selectedIds={selectedHostIds} groupSelected={groupSelected} groupIndeterminate={selectedInGroup > 0 && !groupSelected} policies={policies} testResults={testResults} testingHostId={testingHostId} updatingHostId={updatingHostId} onToggleGroup={() => toggleGroup(group.key)} onRenameGroup={() => setRenamingGroup(group.name)} onSelectGroup={(selected) => selectHosts(groupIds, selected)} onSelectHost={selectHost} onActivateLogin={activateLogin} onChangePolicy={changePolicy} onToggleSudo={toggleSudo} onToggleHostTransfer={toggleHostTransfer} onOpenTerminal={setTerminalHostId} onMonitor={setMonitorHostId} onTest={test} onToggleHost={toggleHost} onEdit={setEditing} onDelete={setDeletingHost} />;
+      })}</tbody></table>{hosts.length === 0 ? <Empty text="还没有主机。添加主机时可以直接填写密码、私钥或 SSH Agent。" /> : filteredHosts.length === 0 && <Empty text="没有符合当前筛选条件的主机。" />}</div>
     {editing && <HostDialog host={editing === "new" ? null : editing} credentials={credentials} policies={policies} groupNames={existingGroupNames} onAccountsChanged={load} onClose={() => setEditing(null)} onSaved={async (saved, created) => {
       setEditing(null);
       await load();
@@ -274,22 +331,36 @@ function HostsPage({ notify }: { notify: Notify }) {
   </section>;
 }
 
-function GroupRows({ groupName, ungrouped, hosts, hostLogins, collapsed, selectionMode, selectedIds, groupSelected, groupIndeterminate, policies, testResults, testingHostId, updatingHostId, onToggleGroup, onRenameGroup, onSelectGroup, onSelectHost, onActivateLogin, onChangePolicy, onToggleSudo, onOpenTerminal, onMonitor, onTest, onToggleHost, onEdit, onDelete }: { groupName: string; ungrouped: boolean; hosts: Host[]; hostLogins: HostLogin[]; collapsed: boolean; selectionMode: boolean; selectedIds: ReadonlySet<string>; groupSelected: boolean; groupIndeterminate: boolean; policies: Policy[]; testResults: Record<string, { kind: "ok" | "error" | "pending"; text: string }>; testingHostId: string | null; updatingHostId: string | null; onToggleGroup(): void; onRenameGroup(): void; onSelectGroup(selected: boolean): void; onSelectHost(hostId: string, selected: boolean): void; onActivateLogin(host: Host, loginId: string): Promise<void>; onChangePolicy(host: Host, policyId: string): Promise<void>; onToggleSudo(host: Host, login: HostLogin): Promise<void>; onOpenTerminal(hostId: string): void; onMonitor(hostId: string): void; onTest(host: Host): Promise<void>; onToggleHost(host: Host): Promise<void>; onEdit(host: Host): void; onDelete(host: Host): void }) {
+function GroupRows({ groupName, ungrouped, hosts, hostLogins, collapsed, selectionMode, selectedIds, groupSelected, groupIndeterminate, policies, testResults, testingHostId, updatingHostId, onToggleGroup, onRenameGroup, onSelectGroup, onSelectHost, onActivateLogin, onChangePolicy, onToggleSudo, onToggleHostTransfer, onOpenTerminal, onMonitor, onTest, onToggleHost, onEdit, onDelete }: { groupName: string; ungrouped: boolean; hosts: Host[]; hostLogins: HostLogin[]; collapsed: boolean; selectionMode: boolean; selectedIds: ReadonlySet<string>; groupSelected: boolean; groupIndeterminate: boolean; policies: Policy[]; testResults: Record<string, { kind: "ok" | "error" | "pending"; text: string }>; testingHostId: string | null; updatingHostId: string | null; onToggleGroup(): void; onRenameGroup(): void; onSelectGroup(selected: boolean): void; onSelectHost(hostId: string, selected: boolean): void; onActivateLogin(host: Host, loginId: string): Promise<void>; onChangePolicy(host: Host, policyId: string): Promise<void>; onToggleSudo(host: Host, login: HostLogin): Promise<void>; onToggleHostTransfer(host: Host): Promise<void>; onOpenTerminal(hostId: string): void; onMonitor(hostId: string): void; onTest(host: Host): Promise<void>; onToggleHost(host: Host): Promise<void>; onEdit(host: Host): void; onDelete(host: Host): void }) {
   return <>
-    <tr className="host-group-row">{selectionMode && <td className="host-select-cell"><SelectionCheckbox label={`选择${groupName}中的全部主机`} checked={groupSelected} indeterminate={groupIndeterminate} onChange={onSelectGroup} /></td>}<td colSpan={5}><div className="host-group-line"><button className="host-group-toggle" aria-expanded={!collapsed} onClick={onToggleGroup}><i className={collapsed ? "collapsed" : ""} aria-hidden="true" /><strong>{groupName}</strong><span>{hosts.length} 台</span>{selectionMode && hosts.some((host) => selectedIds.has(host.id)) && <em>{hosts.filter((host) => selectedIds.has(host.id)).length} 台已选</em>}</button>{!ungrouped && !selectionMode && <button className="host-group-rename" onClick={onRenameGroup}>重命名</button>}</div></td></tr>
+    <tr className="host-group-row">{selectionMode && <td className="host-select-cell"><SelectionCheckbox label={`选择${groupName}中的全部主机`} checked={groupSelected} indeterminate={groupIndeterminate} onChange={onSelectGroup} /></td>}<td colSpan={6}><div className="host-group-line"><button className="host-group-toggle" aria-expanded={!collapsed} onClick={onToggleGroup}><CaretDown className={`host-group-caret ${collapsed ? "collapsed" : ""}`} size={17} weight="bold" aria-hidden="true" /><strong>{groupName}</strong><span>{hosts.length} 台</span>{selectionMode && hosts.some((host) => selectedIds.has(host.id)) && <em>{hosts.filter((host) => selectedIds.has(host.id)).length} 台已选</em>}</button>{!ungrouped && !selectionMode && <button className="host-group-rename" onClick={onRenameGroup}>重命名</button>}</div></td></tr>
     {!collapsed && hosts.map((host) => {
       const availableLogins = hostLogins.filter((login) => login.hostId === host.id);
       const activeLoginAvailable = availableLogins.some((login) => login.id === host.activeLoginId);
       const activeLogin = availableLogins.find((login) => login.id === host.activeLoginId);
+      const terminalLabel = host.enabled ? "打开终端" : "打开终端（主机已停用）";
+      const testLabel = testingHostId === host.id ? "测试中…" : "测试连接";
+      const toggleLabel = updatingHostId === host.id ? "处理中…" : host.enabled ? "停用主机" : "启用主机";
       return <tr key={host.id} className={`host-member-row ${selectedIds.has(host.id) ? "host-row-selected" : ""}`}>
-        {selectionMode && <td className="host-select-cell"><SelectionCheckbox label={`选择主机 ${host.name}`} checked={selectedIds.has(host.id)} onChange={(selected) => onSelectHost(host.id, selected)} /></td>}
-        <td className="host-member-cell"><div className="host-name-text"><strong>{host.name}</strong><div className="host-identity-line"><div className="host-identity-control"><span>当前用户</span><select title="切换 AI 使用的 SSH 登录用户" aria-label={`${host.name} 当前登录用户`} value={activeLoginAvailable ? host.activeLoginId! : ""} disabled={updatingHostId !== null || availableLogins.length === 0} onChange={(event) => void onActivateLogin(host, event.target.value)}>{!activeLoginAvailable && <option value="" disabled>{availableLogins.length === 0 ? "暂无可用用户" : "请选择登录用户"}</option>}{availableLogins.map((login) => <option key={login.id} value={login.id}>{login.username}</option>)}</select>{activeLogin && activeLogin.username !== "root" && <button type="button" role="switch" aria-checked={activeLogin.sudoEnabled} aria-label={`${activeLogin.username} 的 sudo 权限`} className={`sudo-switch ${activeLogin.sudoEnabled ? "on" : ""}`} title={activeLogin.sudoEnabled ? `点击禁止 ${activeLogin.username} 使用 sudo` : `点击允许 ${activeLogin.username} 使用 sudo`} disabled={updatingHostId !== null} onClick={() => void onToggleSudo(host, activeLogin)}>sudo<i aria-hidden="true" /></button>}</div><small>{host.hostname}:{host.port}</small></div></div></td>
-        <td className="host-status-cell"><div className="host-status-line"><Status value={host.enabled ? host.status : "DISABLED"} /><button className="host-test-button" title={host.enabled ? "测试 SSH 连接" : "主机已停用"} disabled={!host.enabled || testingHostId !== null || updatingHostId !== null} onClick={() => void onTest(host)}>{testingHostId === host.id ? "测试中…" : "测试"}</button></div>{testResults[host.id] && <small className={`test-result ${testResults[host.id]!.kind}`}>{testResults[host.id]!.text}</small>}</td><td><span className={host.enabled && host.aiAccessEnabled ? "badge allow" : "badge"}>{!host.enabled ? "主机停用" : host.aiAccessEnabled ? "已开放" : "未开放"}</span></td>
-        <td className="host-policy-cell"><select className="host-inline-select" title="切换该主机的权限策略" aria-label={`${host.name} 权限策略`} value={host.policyId ?? ""} disabled={updatingHostId !== null} onChange={(event) => void onChangePolicy(host, event.target.value)}><option value="">未配置</option>{orderPolicies(policies).map((policy) => <option key={policy.id} value={policy.id}>{policy.name}</option>)}</select></td>
-        <td className="actions"><button disabled={!host.enabled} title={host.enabled ? "打开交互终端" : "主机已停用"} onClick={() => onOpenTerminal(host.id)}>终端</button><button onClick={() => onMonitor(host.id)}>指令记录</button><button className={host.enabled ? "danger-link" : ""} disabled={testingHostId !== null || updatingHostId !== null} onClick={() => void onToggleHost(host)}>{updatingHostId === host.id ? "处理中…" : host.enabled ? "停用" : "启用"}</button><button disabled={testingHostId === host.id || updatingHostId === host.id} onClick={() => onEdit(host)}>编辑</button><button className="danger-link" disabled={testingHostId === host.id || updatingHostId === host.id} onClick={() => onDelete(host)}>删除</button></td>
-      </tr>;
+          {selectionMode && <td className="host-select-cell"><SelectionCheckbox label={`选择主机 ${host.name}`} checked={selectedIds.has(host.id)} onChange={(selected) => onSelectHost(host.id, selected)} /></td>}
+          <td className="host-member-cell"><div className="host-member-main"><div className="host-name-text"><Desktop size={20} weight="regular" aria-hidden="true" /><span><strong>{host.name}</strong><small>{host.hostname}:{host.port}</small></span></div><div className="host-row-switches" aria-label={`${host.name} 快捷开关`}><HostRowSwitch label="启用主机" checked={host.enabled} ariaLabel={`${host.name}：${toggleLabel}`} title={toggleLabel} disabled={testingHostId !== null || updatingHostId !== null} onClick={() => void onToggleHost(host)} />{activeLogin && activeLogin.username !== "root" && <HostRowSwitch label="启用sudo" checked={activeLogin.sudoEnabled} ariaLabel={`${activeLogin.username} 的 sudo 权限`} title={activeLogin.sudoEnabled ? `点击禁止 ${activeLogin.username} 使用 sudo` : `点击允许 ${activeLogin.username} 使用 sudo`} disabled={updatingHostId !== null} onClick={() => void onToggleSudo(host, activeLogin)} />}<HostRowSwitch label="文件传输通道" checked={host.hostTransferEnabled} ariaLabel={`${host.name} 的文件传输`} title={host.hostTransferEnabled ? "关闭主机间文件传输" : "允许主机间文件传输"} disabled={updatingHostId !== null} onClick={() => void onToggleHostTransfer(host)} /></div></div></td>
+          <td className="host-status-cell"><div className="host-status-line"><Status value={host.enabled ? host.status : "DISABLED"} /><button className="host-action-icon host-status-test" aria-label={`${host.name}：${testLabel}`} data-tooltip={testLabel} disabled={!host.enabled || testingHostId !== null || updatingHostId !== null} onClick={() => void onTest(host)}><ArrowClockwise size={16} aria-hidden="true" /></button></div>{testResults[host.id] && <small className={`test-result ${testResults[host.id]!.kind}`}>{testResults[host.id]!.text}</small>}</td>
+          <td><span className={host.enabled && host.aiAccessEnabled ? "access-state allow" : "access-state"}>{host.enabled && host.aiAccessEnabled ? <CheckCircle size={17} weight="regular" /> : null}{!host.enabled ? "主机停用" : host.aiAccessEnabled ? "允许" : "未允许"}</span></td>
+          <td className="host-user-cell"><div className="host-inline-select-shell host-user-select-shell"><span className="host-select-badge" aria-hidden="true">SSH</span><select className="host-inline-select" title="切换 AI 使用的 SSH 登录用户" aria-label={`${host.name} 当前登录用户`} value={activeLoginAvailable ? host.activeLoginId! : ""} disabled={updatingHostId !== null || availableLogins.length === 0} onChange={(event) => void onActivateLogin(host, event.target.value)}>{!activeLoginAvailable && <option value="" disabled>{availableLogins.length === 0 ? "暂无可用用户" : "请选择登录用户"}</option>}{availableLogins.map((login) => <option key={login.id} value={login.id}>{login.username}</option>)}</select><CaretDown size={14} weight="bold" aria-hidden="true" /></div></td>
+          <td className="host-policy-cell"><div className="host-inline-select-shell host-policy-select-shell"><span className="host-select-badge" aria-hidden="true">权限策略</span><select className="host-inline-select" title="切换该主机的权限策略" aria-label={`${host.name} 权限策略`} value={host.policyId ?? ""} disabled={updatingHostId !== null} onChange={(event) => void onChangePolicy(host, event.target.value)}><option value="">未配置</option>{orderPolicies(policies).map((policy) => <option key={policy.id} value={policy.id}>{policy.name}</option>)}</select><CaretDown size={14} weight="bold" aria-hidden="true" /></div></td>
+          <td className="host-actions-column"><div className="host-inline-actions" aria-label={`${host.name} 操作`}>
+            <button className="host-action-icon" aria-label={`${host.name}：${terminalLabel}`} data-tooltip={terminalLabel} disabled={!host.enabled} onClick={() => onOpenTerminal(host.id)}><TerminalWindow size={18} aria-hidden="true" /></button>
+            <button className="host-action-icon" aria-label={`${host.name}：指令记录`} data-tooltip="指令记录" onClick={() => onMonitor(host.id)}><ClockCounterClockwise size={18} aria-hidden="true" /></button>
+            <button className="host-action-icon" aria-label={`${host.name}：编辑`} data-tooltip="编辑" disabled={testingHostId === host.id || updatingHostId === host.id} onClick={() => onEdit(host)}><PencilSimple size={18} aria-hidden="true" /></button>
+            <button className="host-action-icon danger-link" aria-label={`${host.name}：删除`} data-tooltip="删除" disabled={testingHostId === host.id || updatingHostId === host.id} onClick={() => onDelete(host)}><Trash size={18} aria-hidden="true" /></button>
+          </div></td>
+        </tr>;
     })}
   </>;
+}
+
+function HostRowSwitch({ label, checked, ariaLabel, title, disabled, onClick }: { label: string; checked: boolean; ariaLabel: string; title: string; disabled: boolean; onClick(): void }) {
+  return <button type="button" role="switch" aria-checked={checked} aria-label={ariaLabel} className={`host-row-switch ${checked ? "on" : ""}`} title={title} disabled={disabled} onClick={onClick}><span className="host-row-switch-label">{label}</span><span className="host-row-switch-track" aria-hidden="true"><span /></span></button>;
 }
 
 function SelectionCheckbox({ label, checked, indeterminate = false, disabled = false, onChange }: { label: string; checked: boolean; indeterminate?: boolean; disabled?: boolean; onChange(selected: boolean): void }) {
@@ -356,7 +427,7 @@ function HostMonitorPage({ host, credential, onBack, onHostChanged, notify }: { 
       {credential && credential.type !== "SSH_AGENT" && <button onClick={() => setShowCredential(true)}>查看 / 复制认证信息</button>}
     </div>
     <div className="terminal-shell panel">
-      <div className="terminal-toolbar"><div className="terminal-dots"><i /><i /><i /></div><span>{host.name} / AI 操作流</span><div className="terminal-output-control"><small>{host.monitorOutputEnabled ? "用户密钥加密 · 仅内存" : "stdout / stderr 已隐藏"}</small><button className={`compact-toggle ${host.monitorOutputEnabled ? "enabled" : ""}`} disabled={togglingOutput} aria-pressed={host.monitorOutputEnabled} onClick={() => void toggleOutput()}>{togglingOutput ? "处理中…" : host.monitorOutputEnabled ? "隐藏运行结果" : "显示运行结果"}</button></div></div>
+      <div className="terminal-toolbar"><TerminalWindow size={18} aria-hidden="true" /><span>{host.name} / AI 操作流</span><div className="terminal-output-control"><small>{host.monitorOutputEnabled ? "用户密钥加密 · 仅内存" : "stdout / stderr 已隐藏"}</small><button className={`compact-toggle ${host.monitorOutputEnabled ? "enabled" : ""}`} disabled={togglingOutput} aria-pressed={host.monitorOutputEnabled} onClick={() => void toggleOutput()}>{togglingOutput ? "处理中…" : host.monitorOutputEnabled ? "隐藏运行结果" : "显示运行结果"}</button></div></div>
       <div className="terminal-output" ref={terminalRef} role="log" aria-live="polite" aria-label={`${host.name} 只读命令监控`}>
         {!host.monitorOutputEnabled && <div className="terminal-output-disabled">命令与执行状态仍可审计；stdout/stderr 默认隐藏。开启后，短暂回放会使用当前用户的保险库密钥加密。</div>}
         {history.map((log) => <HistoricalTerminalEntry key={log.id} log={log} />)}
@@ -881,7 +952,7 @@ function VaultGate({ state, notify, onReady }: { state: VaultState; notify: Noti
     } catch (error) { setErrorText(message(error)); }
     finally { setBusy(false); }
   }
-  return <div className="modal-backdrop vault-backdrop"><div className="modal vault-modal"><div className="vault-emblem">H</div><span className="eyebrow">Encrypted local vault</span><h2>{state.localInitialized ? "解锁 Hoplane" : "创建本地主密码"}</h2><p>{state.localInitialized ? "输入主密码解锁 SSH 凭据和 MCP Token。主密码不会写入磁盘。" : "默认使用本地加密保险库。主密码无法恢复，请妥善保存。"}</p><form onSubmit={submit} className="vault-form">
+  return <div className="modal-backdrop vault-backdrop"><div className="modal vault-modal"><div className="vault-emblem">Hoplane</div><span className="eyebrow">Encrypted local vault</span><h2>{state.localInitialized ? "解锁 Hoplane" : "创建本地主密码"}</h2><p>{state.localInitialized ? "输入主密码解锁 SSH 凭据和 MCP Token。主密码不会写入磁盘。" : "默认使用本地加密保险库。主密码无法恢复，请妥善保存。"}</p><form onSubmit={submit} className="vault-form">
     <label>主密码<input name="password" type="password" minLength={state.localInitialized ? 1 : 10} maxLength={1024} required autoFocus autoComplete={state.localInitialized ? "current-password" : "new-password"} /></label>
     {!state.localInitialized && <label>确认主密码<input name="confirmation" type="password" minLength={10} maxLength={1024} required autoComplete="new-password" /></label>}
     {errorText && <div className="form-error" role="alert">{errorText}</div>}
@@ -1127,11 +1198,18 @@ function Modal({ title, onClose, children }: { title: string; onClose(): void; c
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
   }, [onClose]);
-  return <div className="modal-backdrop" onMouseDown={e => e.target === e.currentTarget && onClose()}><div className="modal" role="dialog" aria-modal="true" aria-labelledby={titleId}><div className="modal-head"><h2 id={titleId}>{title}</h2><button type="button" aria-label="关闭" onClick={onClose}>×</button></div>{children}</div></div>;
+  return <div className="modal-backdrop" onMouseDown={e => e.target === e.currentTarget && onClose()}><div className="modal" role="dialog" aria-modal="true" aria-labelledby={titleId}><div className="modal-head"><h2 id={titleId}>{title}</h2><button type="button" aria-label="关闭" onClick={onClose}><X size={20} /></button></div>{children}</div></div>;
 }
-function Metric({ label, value }: { label: string; value: number }) { return <div className="metric"><span>{label}</span><strong>{value}</strong></div>; }
 function Empty({ text }: { text: string }) { return <div className="empty">{text}</div>; }
-function Status({ value, detail }: { value: string; detail?: string | null }) { const good = value === "CONNECTED" || value === "SUCCEEDED"; const bad = ["FAILED", "DENIED", "TIMED_OUT", "AUTH_FAILED", "HOST_KEY_BLOCKED", "DISABLED"].includes(value); return <span className={`status ${good ? "good" : bad ? "bad" : "idle"}`}><i />{value === "DISABLED" ? "已停用" : value}{detail ? ` · ${detail}` : ""}</span>; }
+function Status({ value, detail }: { value: string; detail?: string | null }) {
+  const good = value === "CONNECTED" || value === "SUCCEEDED";
+  const bad = ["FAILED", "DENIED", "TIMED_OUT", "AUTH_FAILED", "HOST_KEY_BLOCKED", "DISABLED"].includes(value);
+  const labels: Record<string, string> = {
+    CONNECTED: "已连接", CONNECTING: "连接中", DISCONNECTED: "未连接", SUCCEEDED: "成功", FAILED: "失败",
+    DENIED: "已拒绝", TIMED_OUT: "已超时", AUTH_FAILED: "认证失败", HOST_KEY_BLOCKED: "指纹异常", DISABLED: "已停用"
+  };
+  return <span className={`status ${good ? "good" : bad ? "bad" : "idle"}`}><i />{labels[value] ?? value}{detail ? ` · ${detail}` : ""}</span>;
+}
 type Notify = (kind: "ok" | "error", text: string) => void;
 function message(error: unknown): string { return error instanceof Error ? error.message : "操作失败"; }
 function friendlyConnectionError(error: unknown): string {

@@ -1,7 +1,8 @@
 {
   "name": "hoplane",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Local-first MCP gateway for policy-controlled SSH access",
+  "desktopName": "hoplane.desktop",
   "author": "Hoplane",
   "license": "MPL-2.0",
   "private": true,
@@ -25,12 +26,14 @@
     "app": "electron .",
     "build:app": "pnpm build && electron-builder --mac",
     "build:app:win": "pnpm build && electron-builder --win --x64",
+    "build:app:linux": "pnpm build && electron-builder --linux deb --x64 --publish never",
     "typecheck": "tsc -p tsconfig.node.json --noEmit && tsc -p apps/desktop/tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.17.5",
+    "@phosphor-icons/react": "^2.1.10",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-web-links": "^0.12.0",
     "@xterm/addon-webgl": "^0.19.0",
@@ -98,6 +101,23 @@
     },
     "dmg": {
       "artifactName": "${productName}-${version}-macos-${arch}-installer.${ext}"
+    },
+    "linux": {
+      "icon": "build/icon.png",
+      "category": "Development",
+      "maintainer": "Hoplane",
+      "vendor": "Hoplane",
+      "synopsis": "Policy-controlled SSH gateway for AI agents",
+      "syncDesktopName": true,
+      "target": [
+        {
+          "target": "deb",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "${productName}-${version}-ubuntu-${arch}.${ext}"
     },
     "win": {
       "icon": "build/icon-win.png",
