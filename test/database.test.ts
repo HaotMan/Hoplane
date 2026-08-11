@@ -107,8 +107,9 @@ describe("HoplaneDatabase", () => {
     const columns = db.db.prepare("PRAGMA table_info(policies)").all().map((row) => String((row as { name: unknown }).name));
     expect(columns).toEqual(expect.arrayContaining(["schema_version", "enabled", "source_path", "source_status", "source_error", "source_hash"]));
     const hostColumns = db.db.prepare("PRAGMA table_info(hosts)").all().map((row) => String((row as { name: unknown }).name));
-    expect(hostColumns).toEqual(expect.arrayContaining(["monitor_output_enabled", "host_transfer_enabled"]));
+    expect(hostColumns).toEqual(expect.arrayContaining(["monitor_output_enabled", "host_transfer_enabled", "proxy_enabled", "proxy_local_host", "proxy_local_port", "proxy_remote_port"]));
     expect(host.hostTransferEnabled).toBe(false);
+    expect(host).toMatchObject({ proxyEnabled: false, proxyLocalHost: "127.0.0.1", proxyLocalPort: 7890, proxyRemotePort: 7890 });
     const credentialColumns = db.db.prepare("PRAGMA table_info(credentials)").all().map((row) => String((row as { name: unknown }).name));
     expect(credentialColumns).toEqual(expect.arrayContaining(["sudo_mode", "sudo_secret_ref"]));
     db.close();
@@ -154,6 +155,8 @@ describe("HoplaneDatabase", () => {
     expect(renamed.configRevision).toBe(host.configRevision);
     const transferEnabled = db.updateHost(host.id, { hostTransferEnabled: true });
     expect(transferEnabled).toMatchObject({ hostTransferEnabled: true, configRevision: host.configRevision });
+    const proxyEnabled = db.updateHost(host.id, { proxyEnabled: true, proxyLocalHost: "localhost", proxyLocalPort: 7891, proxyRemotePort: 17890 });
+    expect(proxyEnabled).toMatchObject({ proxyEnabled: true, proxyLocalHost: "localhost", proxyLocalPort: 7891, proxyRemotePort: 17890, configRevision: host.configRevision });
     const moved = db.updateHost(host.id, { port: 2222 });
     expect(moved.configRevision).toBe(host.configRevision + 1);
     db.close();

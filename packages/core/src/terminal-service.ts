@@ -93,7 +93,6 @@ export function attachTerminalGateway(server: Server, options: TerminalGatewayOp
     }
 
     options.database.updateAudit(auditId, { status: "EXECUTING" });
-    sendControl(ws, { type: "ready", username: session.username });
 
     let paused = false;
     const forward = (chunk: Buffer) => {
@@ -149,6 +148,8 @@ export function attachTerminalGateway(server: Server, options: TerminalGatewayOp
       finalize("SUCCEEDED");
       session.close();
     });
+    sendControl(ws, { type: "ready", username: session.username });
+    session.initialize();
   }
 
   return {

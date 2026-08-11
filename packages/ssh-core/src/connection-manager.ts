@@ -1,12 +1,21 @@
-import { Client, type ClientChannel, type ConnectConfig, type SFTPWrapper } from "ssh2";
+import {
+  Client,
+  type AcceptConnection,
+  type ClientChannel,
+  type ConnectConfig,
+  type RejectConnection,
+  type SFTPWrapper,
+  type TcpConnectionDetails
+} from "ssh2";
 import { readFile } from "node:fs/promises";
 import { createWriteStream } from "node:fs";
+import { createConnection as createTcpConnection, type Socket } from "node:net";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { basename, dirname, join } from "node:path/posix";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
-import type { CommandResult, Credential, Host, HostStatus } from "../../shared/src/index.js";
+import type { CommandResult, Credential, Host, HostStatus, ProxyTunnelState } from "../../shared/src/index.js";
 import { AppError } from "../../shared/src/index.js";
 import type { HoplaneDatabase } from "../../core/src/database.js";
 import type { CredentialVault } from "../../core/src/vault.js";
@@ -17,9 +26,30 @@ interface ManagedConnection {
   lastUsedAt: number;
 }
 
+interface ProxyConnection {
+  local: Socket;
+  channel: ClientChannel;
+}
+
+interface ManagedProxyTunnel {
+  client: Client;
+  localHost: string;
+  localPort: number;
+  remotePort: number;
+  listener: (details: TcpConnectionDetails, accept: AcceptConnection<ClientChannel>, reject: RejectConnection) => void;
+  connections: Set<ProxyConnection>;
+  pendingSockets: Set<Socket>;
+}
+
+const PROXY_BIND_ADDRESS = "127.0.0.1";
+const PROXY_CONNECT_TIMEOUT_MS = 1_500;
+const PROXY_RETRY_MAX_MS = 30_000;
+const MAX_PROXY_CONNECTIONS_PER_HOST = 128;
+
 export interface ShellSession {
   username: string;
   stream: ClientChannel;
+  initialize(): void;
   setWindow(rows: number, cols: number): void;
   close(): void;
 }
@@ -43,6 +73,13 @@ export class SSHConnectionManager {
   private readonly connections = new Map<string, ManagedConnection>();
   private readonly connecting = new Map<string, Promise<Client>>();
   private readonly statuses = new Map<string, HostStatus>();
+  private readonly proxyStates = new Map<string, ProxyTunnelState>();
+  private readonly proxyTunnels = new Map<string, ManagedProxyTunnel>();
+  private readonly proxyStarting = new Map<string, Promise<void>>();
+  private readonly proxyRetryTimers = new Map<string, NodeJS.Timeout>();
+  private readonly proxyRetryAttempts = new Map<string, number>();
+  private readonly intentionalDisconnects = new WeakSet<Client>();
+  private suppressProxyRetries = false;
 
   constructor(
     private readonly database: HoplaneDatabase,
@@ -54,12 +91,35 @@ export class SSHConnectionManager {
     return this.statuses.get(hostId) ?? "DISCONNECTED";
   }
 
+  getProxyState(hostId: string): ProxyTunnelState {
+    const host = this.database.getHost(hostId);
+    if (!host?.enabled || !host.proxyEnabled) return { status: "DISABLED" };
+    return this.proxyStates.get(hostId) ?? { status: "CONNECTING" };
+  }
+
+  async reconcileConfiguredProxies(): Promise<void> {
+    await Promise.all(this.database.listHosts().map((host) => this.reconcileProxy(host.id)));
+  }
+
+  async reconcileProxy(hostId: string): Promise<void> {
+    const host = this.database.getHost(hostId);
+    if (!host?.enabled || !host.proxyEnabled) {
+      this.cancelProxyRetry(hostId);
+      await this.stopProxyTunnel(hostId);
+      this.proxyStates.set(hostId, { status: "DISABLED" });
+      return;
+    }
+    try {
+      await this.ensureProxyAvailable(hostId);
+    } catch { /* Desired state is retained; runtime state exposes the failure and retry. */ }
+  }
+
   async testConnection(hostId: string): Promise<void> {
     const host = this.requireEnabledHost(hostId);
-    await this.disconnect(hostId);
-    const client = await this.createConnection(host);
+    const credential = host.credentialId ? this.database.getCredential(host.credentialId) : null;
+    if (!credential) throw new AppError("CREDENTIAL_NOT_FOUND", "Host has no usable credential", false, undefined, undefined, 409);
+    const client = await this.establishClient(host, credential, host.username, false);
     client.end();
-    this.statuses.set(hostId, "DISCONNECTED");
   }
 
   async execute(hostId: string, command: string, options: {
@@ -67,11 +127,29 @@ export class SSHConnectionManager {
     timeoutMs: number;
     onStdout?: (chunk: Buffer) => void;
     onStderr?: (chunk: Buffer) => void;
+    useProxy?: boolean;
   }): Promise<Omit<CommandResult, "operationId" | "durationMs">> {
-    const client = await this.getConnection(hostId);
+    let host = this.requireEnabledHost(hostId);
+    if (host.proxyEnabled && options.useProxy !== false) {
+      await this.ensureProxyAvailable(hostId);
+      host = this.requireEnabledHost(hostId);
+    }
+    let client = await this.getConnection(hostId);
+    if (host.proxyEnabled && options.useProxy !== false && !this.isProxyTunnelActive(host, client)) {
+      await this.ensureProxyAvailable(hostId);
+      client = await this.getConnection(hostId);
+      if (!this.isProxyTunnelActive(host, client)) {
+        const error = new AppError("PROXY_TUNNEL_UNAVAILABLE", "The reverse proxy tunnel is not active on the current SSH connection", true, undefined, undefined, 502);
+        this.handleProxyFailure(hostId, error);
+        throw error;
+      }
+    }
     const sudoPassword = findSudoInvocations(command).length > 0 ? await this.resolveSudoPassword(hostId) : null;
     const sudoExecution = prepareSudoExecution(command, sudoPassword !== null);
-    const fullCommand = options.directory ? `cd -- ${shellQuote(options.directory)} && ${sudoExecution.command}` : sudoExecution.command;
+    const requestedCommand = options.directory ? `cd -- ${shellQuote(options.directory)} && ${sudoExecution.command}` : sudoExecution.command;
+    const fullCommand = host.proxyEnabled && options.useProxy !== false
+      ? `${proxyExportCommand(host.proxyRemotePort)} ${requestedCommand}`
+      : requestedCommand;
     return new Promise((resolve, reject) => {
       let settled = false;
       let stdout: Buffer = Buffer.alloc(0);
@@ -156,12 +234,20 @@ export class SSHConnectionManager {
    * configured login and its lifecycle is bound to the returned session.
    */
   async openShellSession(hostId: string, loginId: string, options: { cols: number; rows: number; term?: string }): Promise<ShellSession> {
-    const host = this.requireEnabledHost(hostId);
+    let host = this.requireEnabledHost(hostId);
+    if (host.proxyEnabled) {
+      await this.ensureProxyAvailable(hostId);
+      host = this.requireEnabledHost(hostId);
+    }
     const login = this.database.getHostLogin(loginId);
     if (!login || login.hostId !== hostId) throw new AppError("HOST_LOGIN_NOT_FOUND", "The requested login does not belong to this host", false, undefined, undefined, 404);
     const credential = login.credentialId ? this.database.getCredential(login.credentialId) : null;
     if (!credential) throw new AppError("CREDENTIAL_NOT_FOUND", "The selected login has no usable credential", false, undefined, undefined, 409);
     const client = await this.establishClient(host, credential, login.username, false);
+    if (host.proxyEnabled) {
+      try { await this.ensureProxyAvailable(hostId); }
+      catch (error) { client.end(); throw error; }
+    }
     return new Promise((resolve, reject) => {
       client.shell({ term: options.term ?? "xterm-256color", cols: options.cols, rows: options.rows }, (error, stream) => {
         if (error) {
@@ -169,9 +255,15 @@ export class SSHConnectionManager {
           reject(classifySshError(error));
           return;
         }
+        let initialized = false;
         resolve({
           username: login.username,
           stream,
+          initialize: () => {
+            if (initialized) return;
+            initialized = true;
+            if (host.proxyEnabled) stream.write(`${proxyExportCommand(host.proxyRemotePort)}\n`);
+          },
           setWindow: (rows, cols) => stream.setWindow(rows, cols, 0, 0),
           close: () => { stream.end(); client.end(); }
         });
@@ -432,7 +524,7 @@ export class SSHConnectionManager {
   }
 
   private async runSshStreamCommand(hostId: string, command: string): Promise<Omit<CommandResult, "operationId" | "durationMs">> {
-    try { return await this.execute(hostId, command, { timeoutMs: 30_000 }); }
+    try { return await this.execute(hostId, command, { timeoutMs: 30_000, useProxy: false }); }
     catch (error) { throw classifySshStreamError(error); }
   }
 
@@ -474,7 +566,16 @@ export class SSHConnectionManager {
   }
 
   async disconnect(hostId: string): Promise<void> {
+    const pending = this.proxyStarting.get(hostId);
+    if (pending) await Promise.allSettled([pending]);
+    await this.disconnectTransport(hostId);
+  }
+
+  private async disconnectTransport(hostId: string): Promise<void> {
+    this.cancelProxyRetry(hostId);
     const connection = this.connections.get(hostId);
+    if (connection) this.intentionalDisconnects.add(connection.client);
+    await this.stopProxyTunnel(hostId);
     if (connection) {
       connection.client.end();
       this.connections.delete(hostId);
@@ -483,7 +584,195 @@ export class SSHConnectionManager {
   }
 
   async closeAll(): Promise<void> {
-    for (const hostId of [...this.connections.keys()]) await this.disconnect(hostId);
+    this.suppressProxyRetries = true;
+    for (const hostId of this.proxyRetryTimers.keys()) this.cancelProxyRetry(hostId);
+    await Promise.allSettled([...this.proxyStarting.values()]);
+    for (const hostId of new Set([...this.connections.keys(), ...this.proxyTunnels.keys()])) await this.disconnect(hostId);
+    for (const host of this.database.listHosts()) {
+      if (host.enabled && host.proxyEnabled) {
+        this.proxyStates.set(host.id, { status: "WAITING_FOR_VAULT", errorCode: "VAULT_LOCKED", errorMessage: "Local vault is locked" });
+      }
+    }
+    this.suppressProxyRetries = false;
+  }
+
+  private async ensureProxyAvailable(hostId: string): Promise<void> {
+    try {
+      await this.ensureProxyAvailableUnchecked(hostId);
+    } catch (error) {
+      const appError = proxyTunnelError(error);
+      this.handleProxyFailure(hostId, appError);
+      throw appError;
+    }
+  }
+
+  private async ensureProxyAvailableUnchecked(hostId: string): Promise<void> {
+    const host = this.requireEnabledHost(hostId);
+    if (!host.proxyEnabled) return;
+    const existing = this.proxyTunnels.get(hostId);
+    if (existing && existing.localHost === host.proxyLocalHost && existing.localPort === host.proxyLocalPort && existing.remotePort === host.proxyRemotePort) {
+      await probeLocalProxy(host.proxyLocalHost, host.proxyLocalPort);
+      this.cancelProxyRetry(hostId);
+      this.proxyRetryAttempts.delete(hostId);
+      this.proxyStates.set(hostId, { status: "ACTIVE" });
+      return;
+    }
+    const pending = this.proxyStarting.get(hostId);
+    if (pending) return pending;
+    const start = this.startProxyTunnel(host).finally(() => this.proxyStarting.delete(hostId));
+    this.proxyStarting.set(hostId, start);
+    return start;
+  }
+
+  private async startProxyTunnel(host: Host): Promise<void> {
+    this.proxyStates.set(host.id, { status: "CONNECTING" });
+    await this.stopProxyTunnel(host.id);
+    try {
+      const client = await this.getConnection(host.id);
+      await probeLocalProxy(host.proxyLocalHost, host.proxyLocalPort);
+      const tunnel: ManagedProxyTunnel = {
+        client,
+        localHost: host.proxyLocalHost,
+        localPort: host.proxyLocalPort,
+        remotePort: host.proxyRemotePort,
+        listener: () => undefined,
+        connections: new Set(),
+        pendingSockets: new Set()
+      };
+      tunnel.listener = (details, accept, reject) => this.acceptProxyConnection(host.id, tunnel, details, accept, reject);
+      this.proxyTunnels.set(host.id, tunnel);
+      client.on("tcp connection", tunnel.listener);
+      try {
+        await forwardIn(client, PROXY_BIND_ADDRESS, host.proxyRemotePort);
+      } catch (error) {
+        if (this.proxyTunnels.get(host.id) === tunnel) this.proxyTunnels.delete(host.id);
+        client.off("tcp connection", tunnel.listener);
+        throw error;
+      }
+      if (this.proxyTunnels.get(host.id) !== tunnel) {
+        throw new AppError("PROXY_SSH_CONNECTION_CLOSED", "The SSH connection closed while the proxy tunnel was starting", true, undefined, undefined, 502);
+      }
+      const latest = this.database.getHost(host.id);
+      if (!latest?.enabled || !latest.proxyEnabled || latest.proxyLocalHost !== host.proxyLocalHost || latest.proxyLocalPort !== host.proxyLocalPort || latest.proxyRemotePort !== host.proxyRemotePort) {
+        await this.stopProxyTunnel(host.id);
+        if (latest?.enabled && latest.proxyEnabled) return this.startProxyTunnel(latest);
+        this.proxyStates.set(host.id, { status: "DISABLED" });
+        return;
+      }
+      this.cancelProxyRetry(host.id);
+      this.proxyRetryAttempts.delete(host.id);
+      this.proxyStates.set(host.id, { status: "ACTIVE" });
+    } catch (error) {
+      throw proxyTunnelError(error);
+    }
+  }
+
+  private acceptProxyConnection(
+    hostId: string,
+    tunnel: ManagedProxyTunnel,
+    details: TcpConnectionDetails,
+    accept: AcceptConnection<ClientChannel>,
+    reject: RejectConnection
+  ): void {
+    if (details.destPort !== tunnel.remotePort || this.proxyTunnels.get(hostId) !== tunnel || tunnel.connections.size + tunnel.pendingSockets.size >= MAX_PROXY_CONNECTIONS_PER_HOST) {
+      try { reject(); } catch { /* Forward request already closed. */ }
+      return;
+    }
+    const local = createTcpConnection({ host: tunnel.localHost, port: tunnel.localPort });
+    tunnel.pendingSockets.add(local);
+    let connected = false;
+    const timer = setTimeout(() => local.destroy(new Error("Local proxy connection timed out")), PROXY_CONNECT_TIMEOUT_MS);
+    local.once("connect", () => {
+      connected = true;
+      tunnel.pendingSockets.delete(local);
+      clearTimeout(timer);
+      if (this.proxyTunnels.get(hostId) !== tunnel) {
+        try { reject(); } catch { /* Forward request already closed. */ }
+        local.destroy();
+        return;
+      }
+      let channel: ClientChannel;
+      try { channel = accept(); }
+      catch { local.destroy(); return; }
+      const connection = { local, channel };
+      tunnel.connections.add(connection);
+      const close = () => {
+        tunnel.connections.delete(connection);
+        if (!local.destroyed) local.destroy();
+        if (!channel.destroyed) channel.destroy();
+      };
+      local.once("close", close);
+      channel.once("close", close);
+      local.once("error", close);
+      channel.once("error", close);
+      local.pipe(channel);
+      channel.pipe(local);
+      this.proxyStates.set(hostId, { status: "ACTIVE" });
+    });
+    local.once("error", (error) => {
+      clearTimeout(timer);
+      if (connected) return;
+      tunnel.pendingSockets.delete(local);
+      try { reject(); } catch { /* Forward request already closed. */ }
+      this.handleProxyFailure(hostId, localProxyError(tunnel.localHost, tunnel.localPort, error));
+    });
+  }
+
+  private async stopProxyTunnel(hostId: string): Promise<void> {
+    const tunnel = this.proxyTunnels.get(hostId);
+    if (!tunnel) return;
+    this.proxyTunnels.delete(hostId);
+    tunnel.client.off("tcp connection", tunnel.listener);
+    for (const socket of tunnel.pendingSockets) socket.destroy(new Error("Proxy tunnel stopped"));
+    tunnel.pendingSockets.clear();
+    for (const connection of tunnel.connections) {
+      connection.local.destroy();
+      connection.channel.destroy();
+    }
+    tunnel.connections.clear();
+    await unforwardIn(tunnel.client, PROXY_BIND_ADDRESS, tunnel.remotePort).catch(() => undefined);
+  }
+
+  private handleProxyFailure(hostId: string, error: AppError): void {
+    if (error.code === "VAULT_LOCKED") {
+      this.proxyStates.set(hostId, { status: "WAITING_FOR_VAULT", errorCode: error.code, errorMessage: error.message });
+      return;
+    }
+    if (error.code === "LOCAL_PROXY_UNAVAILABLE") {
+      this.proxyStates.set(hostId, { status: "LOCAL_PROXY_UNAVAILABLE", errorCode: error.code, errorMessage: error.message });
+    } else if (error.retriable) {
+      this.proxyStates.set(hostId, { status: "RETRYING", errorCode: error.code, errorMessage: error.message });
+    } else {
+      this.proxyStates.set(hostId, { status: "FAILED", errorCode: error.code, errorMessage: error.message });
+    }
+    if (error.retriable) this.scheduleProxyRetry(hostId);
+  }
+
+  private scheduleProxyRetry(hostId: string): void {
+    if (this.suppressProxyRetries || this.proxyRetryTimers.has(hostId)) return;
+    const host = this.database.getHost(hostId);
+    if (!host?.enabled || !host.proxyEnabled) return;
+    const attempt = this.proxyRetryAttempts.get(hostId) ?? 0;
+    this.proxyRetryAttempts.set(hostId, attempt + 1);
+    const base = Math.min(PROXY_RETRY_MAX_MS, 1_000 * (2 ** Math.min(attempt, 5)));
+    const delay = base + Math.floor(Math.random() * Math.min(1_000, Math.ceil(base / 4)));
+    const timer = setTimeout(() => {
+      this.proxyRetryTimers.delete(hostId);
+      void this.reconcileProxy(hostId);
+    }, delay);
+    timer.unref();
+    this.proxyRetryTimers.set(hostId, timer);
+  }
+
+  private cancelProxyRetry(hostId: string): void {
+    const timer = this.proxyRetryTimers.get(hostId);
+    if (timer) clearTimeout(timer);
+    this.proxyRetryTimers.delete(hostId);
+  }
+
+  private isProxyTunnelActive(host: Host, client: Client): boolean {
+    const tunnel = this.proxyTunnels.get(host.id);
+    return Boolean(tunnel && tunnel.client === client && tunnel.localHost === host.proxyLocalHost && tunnel.localPort === host.proxyLocalPort && tunnel.remotePort === host.proxyRemotePort);
   }
 
   private async getSftp(hostId: string): Promise<SFTPWrapper> {
@@ -514,7 +803,7 @@ export class SSHConnectionManager {
       existing.lastUsedAt = Date.now();
       return existing.client;
     }
-    if (existing) await this.disconnect(hostId);
+    if (existing) await this.disconnectTransport(hostId);
     const pending = this.connecting.get(hostId);
     if (pending) return pending;
     if (this.connections.size + this.connecting.size >= 20) {
@@ -587,8 +876,19 @@ export class SSHConnectionManager {
       });
       client.on("close", () => {
         if (!trackStatus) return;
-        this.connections.delete(host.id);
+        const current = this.connections.get(host.id);
+        if (current?.client === client) this.connections.delete(host.id);
         if (this.statuses.get(host.id) === "CONNECTED") this.statuses.set(host.id, "DISCONNECTED");
+        const intentional = this.intentionalDisconnects.has(client);
+        this.intentionalDisconnects.delete(client);
+        this.dropProxyTunnel(host.id, client);
+        if (!intentional && !this.suppressProxyRetries) {
+          const desired = this.database.getHost(host.id);
+          if (desired?.enabled && desired.proxyEnabled) {
+            const error = new AppError("PROXY_SSH_CONNECTION_CLOSED", "The SSH connection carrying the proxy tunnel closed", true, undefined, undefined, 502);
+            this.handleProxyFailure(host.id, error);
+          }
+        }
       });
       client.connect(config);
     });
@@ -600,6 +900,81 @@ export class SSHConnectionManager {
     if (!host.enabled) throw new AppError("HOST_DISABLED", "Host is disabled", false, undefined, undefined, 409);
     return host;
   }
+
+  private dropProxyTunnel(hostId: string, client: Client): void {
+    const tunnel = this.proxyTunnels.get(hostId);
+    if (!tunnel || tunnel.client !== client) return;
+    this.proxyTunnels.delete(hostId);
+    client.off("tcp connection", tunnel.listener);
+    for (const socket of tunnel.pendingSockets) socket.destroy(new Error("Proxy tunnel closed"));
+    tunnel.pendingSockets.clear();
+    for (const connection of tunnel.connections) {
+      connection.local.destroy();
+      connection.channel.destroy();
+    }
+    tunnel.connections.clear();
+  }
+}
+
+function proxyExportCommand(remotePort: number): string {
+  const proxyUrl = `socks5h://127.0.0.1:${remotePort}`;
+  return `export ALL_PROXY=${shellQuote(proxyUrl)}; export all_proxy="$ALL_PROXY";`;
+}
+
+function probeLocalProxy(host: string, port: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const socket = createTcpConnection({ host, port });
+    let settled = false;
+    const finish = (error?: AppError) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      if (error) reject(error); else resolve();
+    };
+    const timer = setTimeout(() => finish(localProxyError(host, port, new Error("Connection timed out"))), PROXY_CONNECT_TIMEOUT_MS);
+    socket.once("connect", () => finish());
+    socket.once("error", (error) => finish(localProxyError(host, port, error)));
+  });
+}
+
+function forwardIn(client: Client, bindAddress: string, port: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    try { client.forwardIn(bindAddress, port, (error) => error ? reject(error) : resolve()); }
+    catch (error) { reject(error); }
+  });
+}
+
+function unforwardIn(client: Client, bindAddress: string, port: number): Promise<void> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(finish, 1_000);
+    try { client.unforwardIn(bindAddress, port, finish); }
+    catch { finish(); }
+  });
+}
+
+function localProxyError(host: string, port: number, error: unknown): AppError {
+  const reason = error instanceof Error ? error.message : String(error);
+  return new AppError("LOCAL_PROXY_UNAVAILABLE", `Local SOCKS5 proxy is unavailable on ${host}:${port}`, true, undefined, { host, port, reason }, 502);
+}
+
+function proxyTunnelError(error: unknown): AppError {
+  if (error instanceof AppError) return error;
+  const message = error instanceof Error ? error.message : String(error);
+  if (/administratively prohibited|tcp forwarding.*(?:disabled|prohibited)|forwarding is disabled/iu.test(message)) {
+    return new AppError("PROXY_TUNNEL_FORWARDING_DENIED", "The SSH server does not allow reverse TCP forwarding", false, undefined, { reason: message }, 409);
+  }
+  if (/unable to bind/iu.test(message)) {
+    return new AppError("PROXY_REMOTE_PORT_UNAVAILABLE", "The proxy port could not be bound on the remote host", false, undefined, { reason: message }, 409);
+  }
+  return classifySshError(error);
 }
 
 function appendLimited(current: Buffer, chunk: Buffer, limit: number): { value: Buffer; truncated: boolean } {

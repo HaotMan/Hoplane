@@ -61,6 +61,8 @@ test/                   单元和数据层测试
 
 主机间中继优先建立两端 SFTP；仅当 SFTP 子系统启动失败时，Core 才使用固定生成的 POSIX SSH Exec 命令，以 `cat` 的 stdout/stdin 在两条 SSH 连接之间流式传输。路径、权限和覆盖错误不会触发回退；Exec 或所需基础命令也不可用时返回 `FILE_TRANSFER_TRANSPORT_UNAVAILABLE`。
 
+主机可以单独开启本机 SOCKS5 代理。首次开启会要求配置 `proxyLocalHost`、`proxyLocalPort` 和 `proxyRemotePort`，之后也可在主机编辑页修改。Core 使用池化 SSH 连接在远端 `127.0.0.1:<proxyRemotePort>` 与指定的本机代理端点之间建立反向 TCP 隧道，并为 Hoplane 发起的远端命令和人工交互终端自动注入 `ALL_PROXY=socks5h://127.0.0.1:<proxyRemotePort>`。远端只监听回环地址；隧道或本机代理不可用时命令按 fail-closed 方式失败，不会静默直连。该能力只代理显式读取代理环境变量的 TCP 客户端，不修改远端持久化配置，也不接管 UDP 或整机流量。
+
 上传和下载执行双阶段检查：
 
 ```text

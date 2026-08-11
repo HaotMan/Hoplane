@@ -13,7 +13,11 @@ export const hostInputSchema = z.object({
   enabled: z.boolean().default(true),
   aiAccessEnabled: z.boolean().default(false),
   hostTransferEnabled: z.boolean().default(false),
-  monitorOutputEnabled: z.boolean().default(false)
+  monitorOutputEnabled: z.boolean().default(false),
+  proxyEnabled: z.boolean().default(false),
+  proxyLocalHost: z.string().trim().min(1).max(255).default("127.0.0.1"),
+  proxyLocalPort: z.number().int().min(1).max(65535).default(7890),
+  proxyRemotePort: z.number().int().min(1).max(65535).default(7890)
 });
 
 export const hostPatchSchema = hostInputSchema.partial();

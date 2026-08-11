@@ -1,7 +1,9 @@
 export interface Host {
   id: string; name: string; hostname: string; port: number; username: string; credentialId: string | null; policyId: string | null;
   activeLoginId: string | null;
-  groupName: string | null; tags: string[]; defaultDirectory: string | null; enabled: boolean; aiAccessEnabled: boolean; hostTransferEnabled: boolean; monitorOutputEnabled: boolean; status: string;
+  groupName: string | null; tags: string[]; defaultDirectory: string | null; enabled: boolean; aiAccessEnabled: boolean; hostTransferEnabled: boolean; monitorOutputEnabled: boolean;
+  proxyEnabled: boolean; proxyLocalHost: string; proxyLocalPort: number; proxyRemotePort: number; status: string;
+  proxyState?: { status: "DISABLED" | "WAITING_FOR_VAULT" | "CONNECTING" | "ACTIVE" | "RETRYING" | "LOCAL_PROXY_UNAVAILABLE" | "FAILED"; errorCode?: string; errorMessage?: string };
 }
 export interface HostLogin { id: string; hostId: string; username: string; credentialId: string | null; sudoEnabled: boolean; active: boolean; createdAt: string; updatedAt: string; }
 export interface Credential { id: string; name: string; type: "PASSWORD" | "PRIVATE_KEY" | "SSH_AGENT"; sudoMode: "NONE" | "LOGIN_PASSWORD" | "CUSTOM_PASSWORD"; metadata: { privateKeyPath?: string; agentSocket?: string }; hasSecret: boolean; hasSudoSecret: boolean; }

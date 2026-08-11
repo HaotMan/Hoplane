@@ -101,6 +101,7 @@ function HostsPage({ notify }: { notify: Notify }) {
   const [terminalHostId, setTerminalHostId] = useState<string | null>(null);
   const [testingHostId, setTestingHostId] = useState<string | null>(null);
   const [updatingHostId, setUpdatingHostId] = useState<string | null>(null);
+  const [proxyConfiguringHost, setProxyConfiguringHost] = useState<Host | null>(null);
   const [deletingHost, setDeletingHost] = useState<Host | null>(null);
   const [renamingGroup, setRenamingGroup] = useState<string | null>(null);
   const [deleteBusy, setDeleteBusy] = useState(false);
@@ -247,6 +248,30 @@ function HostsPage({ notify }: { notify: Notify }) {
     } catch (error) { notify("error", message(error)); }
     finally { setUpdatingHostId(null); }
   }
+  async function toggleProxy(host: Host) {
+    if (updatingHostId) return;
+    if (!host.proxyEnabled) {
+      setProxyConfiguringHost(host);
+      return;
+    }
+    setUpdatingHostId(host.id);
+    try {
+      await patch(`/v1/hosts/${host.id}`, { proxyEnabled: false });
+      await load();
+      notify("ok", `${host.name} 已关闭本机代理`);
+    } catch (error) { notify("error", message(error)); }
+    finally { setUpdatingHostId(null); }
+  }
+  async function configureProxy(host: Host, settings: { proxyLocalHost: string; proxyLocalPort: number; proxyRemotePort: number }) {
+    if (updatingHostId) return;
+    setUpdatingHostId(host.id);
+    try {
+      await patch(`/v1/hosts/${host.id}`, { proxyEnabled: true, ...settings });
+      setProxyConfiguringHost(null);
+      await load();
+      notify("ok", `${host.name} 正在通过 ${settings.proxyLocalHost}:${settings.proxyLocalPort} 建立本机代理隧道`);
+    } finally { setUpdatingHostId(null); }
+  }
   async function renameGroup(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!renamingGroup) return;
@@ -318,7 +343,7 @@ function HostsPage({ notify }: { notify: Notify }) {
         const selectedInGroup = groupIds.filter((id) => selectedHostIds.has(id)).length;
         const groupSelected = selectedInGroup === group.hosts.length;
         const collapsed = collapsedGroups.has(group.key);
-        return <GroupRows key={group.key} groupName={group.name} ungrouped={group.ungrouped} hosts={group.hosts} hostLogins={hostLogins} collapsed={collapsed} selectionMode={multiSelectMode} selectedIds={selectedHostIds} groupSelected={groupSelected} groupIndeterminate={selectedInGroup > 0 && !groupSelected} policies={policies} testResults={testResults} testingHostId={testingHostId} updatingHostId={updatingHostId} onToggleGroup={() => toggleGroup(group.key)} onRenameGroup={() => setRenamingGroup(group.name)} onSelectGroup={(selected) => selectHosts(groupIds, selected)} onSelectHost={selectHost} onActivateLogin={activateLogin} onChangePolicy={changePolicy} onToggleSudo={toggleSudo} onToggleHostTransfer={toggleHostTransfer} onOpenTerminal={setTerminalHostId} onMonitor={setMonitorHostId} onTest={test} onToggleHost={toggleHost} onEdit={setEditing} onDelete={setDeletingHost} />;
+        return <GroupRows key={group.key} groupName={group.name} ungrouped={group.ungrouped} hosts={group.hosts} hostLogins={hostLogins} collapsed={collapsed} selectionMode={multiSelectMode} selectedIds={selectedHostIds} groupSelected={groupSelected} groupIndeterminate={selectedInGroup > 0 && !groupSelected} policies={policies} testResults={testResults} testingHostId={testingHostId} updatingHostId={updatingHostId} onToggleGroup={() => toggleGroup(group.key)} onRenameGroup={() => setRenamingGroup(group.name)} onSelectGroup={(selected) => selectHosts(groupIds, selected)} onSelectHost={selectHost} onActivateLogin={activateLogin} onChangePolicy={changePolicy} onToggleSudo={toggleSudo} onToggleHostTransfer={toggleHostTransfer} onToggleProxy={toggleProxy} onOpenTerminal={setTerminalHostId} onMonitor={setMonitorHostId} onTest={test} onToggleHost={toggleHost} onEdit={setEditing} onDelete={setDeletingHost} />;
       })}</tbody></table>{hosts.length === 0 ? <Empty text="还没有主机。添加主机时可以直接填写密码、私钥或 SSH Agent。" /> : filteredHosts.length === 0 && <Empty text="没有符合当前筛选条件的主机。" />}</div>
     {editing && <HostDialog host={editing === "new" ? null : editing} credentials={credentials} policies={policies} groupNames={existingGroupNames} onAccountsChanged={load} onClose={() => setEditing(null)} onSaved={async (saved, created) => {
       setEditing(null);
@@ -326,12 +351,13 @@ function HostsPage({ notify }: { notify: Notify }) {
       notify("ok", created ? "主机已保存，正在自动测试连接…" : "主机已保存");
       if (created) void test(saved);
     }} />}
+    {proxyConfiguringHost && <ProxySettingsDialog host={proxyConfiguringHost} onClose={() => setProxyConfiguringHost(null)} onSave={(settings) => configureProxy(proxyConfiguringHost, settings)} />}
     {renamingGroup && <Modal title="重命名分组" onClose={() => setRenamingGroup(null)}><form onSubmit={renameGroup} className="form-grid"><label className="span-2">新的分组名称<input name="newName" required maxLength={120} autoFocus defaultValue={renamingGroup} /></label><div className="form-actions span-2"><button type="button" onClick={() => setRenamingGroup(null)}>取消</button><button className="primary">保存名称</button></div></form></Modal>}
     {deletingHost && <Modal title="删除主机" onClose={() => !deleteBusy && setDeletingHost(null)}><div className="confirmation-copy"><strong>确定删除“{deletingHost.name}”吗？</strong><p>该主机的连接配置、专属凭据和信任记录会被删除，已有审计记录仍会保留。</p></div><div className="form-actions"><button onClick={() => setDeletingHost(null)} disabled={deleteBusy}>取消</button><button className="danger-button" onClick={() => void confirmDeleteHost()} disabled={deleteBusy}>{deleteBusy ? "删除中…" : "确认删除"}</button></div></Modal>}
   </section>;
 }
 
-function GroupRows({ groupName, ungrouped, hosts, hostLogins, collapsed, selectionMode, selectedIds, groupSelected, groupIndeterminate, policies, testResults, testingHostId, updatingHostId, onToggleGroup, onRenameGroup, onSelectGroup, onSelectHost, onActivateLogin, onChangePolicy, onToggleSudo, onToggleHostTransfer, onOpenTerminal, onMonitor, onTest, onToggleHost, onEdit, onDelete }: { groupName: string; ungrouped: boolean; hosts: Host[]; hostLogins: HostLogin[]; collapsed: boolean; selectionMode: boolean; selectedIds: ReadonlySet<string>; groupSelected: boolean; groupIndeterminate: boolean; policies: Policy[]; testResults: Record<string, { kind: "ok" | "error" | "pending"; text: string }>; testingHostId: string | null; updatingHostId: string | null; onToggleGroup(): void; onRenameGroup(): void; onSelectGroup(selected: boolean): void; onSelectHost(hostId: string, selected: boolean): void; onActivateLogin(host: Host, loginId: string): Promise<void>; onChangePolicy(host: Host, policyId: string): Promise<void>; onToggleSudo(host: Host, login: HostLogin): Promise<void>; onToggleHostTransfer(host: Host): Promise<void>; onOpenTerminal(hostId: string): void; onMonitor(hostId: string): void; onTest(host: Host): Promise<void>; onToggleHost(host: Host): Promise<void>; onEdit(host: Host): void; onDelete(host: Host): void }) {
+function GroupRows({ groupName, ungrouped, hosts, hostLogins, collapsed, selectionMode, selectedIds, groupSelected, groupIndeterminate, policies, testResults, testingHostId, updatingHostId, onToggleGroup, onRenameGroup, onSelectGroup, onSelectHost, onActivateLogin, onChangePolicy, onToggleSudo, onToggleHostTransfer, onToggleProxy, onOpenTerminal, onMonitor, onTest, onToggleHost, onEdit, onDelete }: { groupName: string; ungrouped: boolean; hosts: Host[]; hostLogins: HostLogin[]; collapsed: boolean; selectionMode: boolean; selectedIds: ReadonlySet<string>; groupSelected: boolean; groupIndeterminate: boolean; policies: Policy[]; testResults: Record<string, { kind: "ok" | "error" | "pending"; text: string }>; testingHostId: string | null; updatingHostId: string | null; onToggleGroup(): void; onRenameGroup(): void; onSelectGroup(selected: boolean): void; onSelectHost(hostId: string, selected: boolean): void; onActivateLogin(host: Host, loginId: string): Promise<void>; onChangePolicy(host: Host, policyId: string): Promise<void>; onToggleSudo(host: Host, login: HostLogin): Promise<void>; onToggleHostTransfer(host: Host): Promise<void>; onToggleProxy(host: Host): Promise<void>; onOpenTerminal(hostId: string): void; onMonitor(hostId: string): void; onTest(host: Host): Promise<void>; onToggleHost(host: Host): Promise<void>; onEdit(host: Host): void; onDelete(host: Host): void }) {
   return <>
     <tr className="host-group-row">{selectionMode && <td className="host-select-cell"><SelectionCheckbox label={`选择${groupName}中的全部主机`} checked={groupSelected} indeterminate={groupIndeterminate} onChange={onSelectGroup} /></td>}<td colSpan={6}><div className="host-group-line"><button className="host-group-toggle" aria-expanded={!collapsed} onClick={onToggleGroup}><CaretDown className={`host-group-caret ${collapsed ? "collapsed" : ""}`} size={17} weight="bold" aria-hidden="true" /><strong>{groupName}</strong><span>{hosts.length} 台</span>{selectionMode && hosts.some((host) => selectedIds.has(host.id)) && <em>{hosts.filter((host) => selectedIds.has(host.id)).length} 台已选</em>}</button>{!ungrouped && !selectionMode && <button className="host-group-rename" onClick={onRenameGroup}>重命名</button>}</div></td></tr>
     {!collapsed && hosts.map((host) => {
@@ -343,7 +369,7 @@ function GroupRows({ groupName, ungrouped, hosts, hostLogins, collapsed, selecti
       const toggleLabel = updatingHostId === host.id ? "处理中…" : host.enabled ? "停用主机" : "启用主机";
       return <tr key={host.id} className={`host-member-row ${selectedIds.has(host.id) ? "host-row-selected" : ""}`}>
           {selectionMode && <td className="host-select-cell"><SelectionCheckbox label={`选择主机 ${host.name}`} checked={selectedIds.has(host.id)} onChange={(selected) => onSelectHost(host.id, selected)} /></td>}
-          <td className="host-member-cell"><div className="host-member-main"><div className="host-name-text"><Desktop size={20} weight="regular" aria-hidden="true" /><span><strong>{host.name}</strong><small>{host.hostname}:{host.port}</small></span></div><div className="host-row-switches" aria-label={`${host.name} 快捷开关`}><HostRowSwitch label="启用主机" checked={host.enabled} ariaLabel={`${host.name}：${toggleLabel}`} title={toggleLabel} disabled={testingHostId !== null || updatingHostId !== null} onClick={() => void onToggleHost(host)} />{activeLogin && activeLogin.username !== "root" && <HostRowSwitch label="启用sudo" checked={activeLogin.sudoEnabled} ariaLabel={`${activeLogin.username} 的 sudo 权限`} title={activeLogin.sudoEnabled ? `点击禁止 ${activeLogin.username} 使用 sudo` : `点击允许 ${activeLogin.username} 使用 sudo`} disabled={updatingHostId !== null} onClick={() => void onToggleSudo(host, activeLogin)} />}<HostRowSwitch label="文件传输通道" checked={host.hostTransferEnabled} ariaLabel={`${host.name} 的文件传输`} title={host.hostTransferEnabled ? "关闭主机间文件传输" : "允许主机间文件传输"} disabled={updatingHostId !== null} onClick={() => void onToggleHostTransfer(host)} /></div></div></td>
+          <td className="host-member-cell"><div className="host-member-main"><div className="host-name-text"><Desktop size={20} weight="regular" aria-hidden="true" /><span><strong>{host.name}</strong><small title={host.proxyState?.errorMessage}>{host.hostname}:{host.port}{host.proxyEnabled ? ` · 代理 ${proxyStatusLabel(host.proxyState?.status)} · ${host.proxyLocalHost}:${host.proxyLocalPort}` : ""}</small></span></div><div className="host-row-switches" aria-label={`${host.name} 快捷开关`}><HostRowSwitch label="启用主机" checked={host.enabled} ariaLabel={`${host.name}：${toggleLabel}`} title={toggleLabel} disabled={testingHostId !== null || updatingHostId !== null} onClick={() => void onToggleHost(host)} />{activeLogin && activeLogin.username !== "root" && <HostRowSwitch label="启用sudo" checked={activeLogin.sudoEnabled} ariaLabel={`${activeLogin.username} 的 sudo 权限`} title={activeLogin.sudoEnabled ? `点击禁止 ${activeLogin.username} 使用 sudo` : `点击允许 ${activeLogin.username} 使用 sudo`} disabled={updatingHostId !== null} onClick={() => void onToggleSudo(host, activeLogin)} />}<HostRowSwitch label="文件传输通道" checked={host.hostTransferEnabled} ariaLabel={`${host.name} 的文件传输`} title={host.hostTransferEnabled ? "关闭主机间文件传输" : "允许主机间文件传输"} disabled={updatingHostId !== null} onClick={() => void onToggleHostTransfer(host)} /><HostRowSwitch label="使用本机代理" checked={host.proxyEnabled} ariaLabel={`${host.name} 的本机代理`} title={host.proxyEnabled ? `关闭本机代理（${proxyStatusLabel(host.proxyState?.status)}${host.proxyState?.errorMessage ? `：${host.proxyState.errorMessage}` : ""}）` : "配置本机 SOCKS5 代理并开启反向隧道"} disabled={!host.enabled || updatingHostId !== null} onClick={() => void onToggleProxy(host)} /></div></div></td>
           <td className="host-status-cell"><div className="host-status-line"><Status value={host.enabled ? host.status : "DISABLED"} /><button className="host-action-icon host-status-test" aria-label={`${host.name}：${testLabel}`} data-tooltip={testLabel} disabled={!host.enabled || testingHostId !== null || updatingHostId !== null} onClick={() => void onTest(host)}><ArrowClockwise size={16} aria-hidden="true" /></button></div>{testResults[host.id] && <small className={`test-result ${testResults[host.id]!.kind}`}>{testResults[host.id]!.text}</small>}</td>
           <td><span className={host.enabled && host.aiAccessEnabled ? "access-state allow" : "access-state"}>{host.enabled && host.aiAccessEnabled ? <CheckCircle size={17} weight="regular" /> : null}{!host.enabled ? "主机停用" : host.aiAccessEnabled ? "允许" : "未允许"}</span></td>
           <td className="host-user-cell"><div className="host-inline-select-shell host-user-select-shell"><span className="host-select-badge" aria-hidden="true">SSH</span><select className="host-inline-select" title="切换 AI 使用的 SSH 登录用户" aria-label={`${host.name} 当前登录用户`} value={activeLoginAvailable ? host.activeLoginId! : ""} disabled={updatingHostId !== null || availableLogins.length === 0} onChange={(event) => void onActivateLogin(host, event.target.value)}>{!activeLoginAvailable && <option value="" disabled>{availableLogins.length === 0 ? "暂无可用用户" : "请选择登录用户"}</option>}{availableLogins.map((login) => <option key={login.id} value={login.id}>{login.username}</option>)}</select><CaretDown size={14} weight="bold" aria-hidden="true" /></div></td>
@@ -361,6 +387,36 @@ function GroupRows({ groupName, ungrouped, hosts, hostLogins, collapsed, selecti
 
 function HostRowSwitch({ label, checked, ariaLabel, title, disabled, onClick }: { label: string; checked: boolean; ariaLabel: string; title: string; disabled: boolean; onClick(): void }) {
   return <button type="button" role="switch" aria-checked={checked} aria-label={ariaLabel} className={`host-row-switch ${checked ? "on" : ""}`} title={title} disabled={disabled} onClick={onClick}><span className="host-row-switch-label">{label}</span><span className="host-row-switch-track" aria-hidden="true"><span /></span></button>;
+}
+
+function ProxySettingsDialog({ host, onClose, onSave }: { host: Host; onClose(): void; onSave(settings: { proxyLocalHost: string; proxyLocalPort: number; proxyRemotePort: number }): Promise<void> }) {
+  const [busy, setBusy] = useState(false);
+  const [errorText, setErrorText] = useState("");
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setBusy(true);
+    setErrorText("");
+    const data = new FormData(event.currentTarget);
+    try {
+      await onSave({
+        proxyLocalHost: String(data.get("proxyLocalHost") ?? "").trim(),
+        proxyLocalPort: Number(data.get("proxyLocalPort")),
+        proxyRemotePort: Number(data.get("proxyRemotePort"))
+      });
+    } catch (error) {
+      setErrorText(message(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+  return <Modal title={`配置 ${host.name} 的本机代理`} onClose={() => !busy && onClose()}><form onSubmit={submit} className="form-grid">
+    <label className="span-2">本机代理地址<input name="proxyLocalHost" required maxLength={255} defaultValue={host.proxyLocalHost || "127.0.0.1"} placeholder="127.0.0.1" autoFocus /></label>
+    <label>本机代理端口<input name="proxyLocalPort" type="number" min="1" max="65535" required defaultValue={host.proxyLocalPort || 7890} /></label>
+    <label>远端监听端口<input name="proxyRemotePort" type="number" min="1" max="65535" required defaultValue={host.proxyRemotePort || 7890} /></label>
+    <p className="form-hint span-2">远端只监听 <code>127.0.0.1:远端端口</code>，并自动注入 <code>ALL_PROXY=socks5h://127.0.0.1:远端端口</code>；流量通过 SSH 隧道转发到上面的本机代理地址和端口。</p>
+    {errorText && <div className="form-error span-2" role="alert">{errorText}</div>}
+    <div className="form-actions span-2"><button type="button" disabled={busy} onClick={onClose}>取消</button><button className="primary" disabled={busy}>{busy ? "开启中…" : "保存并开启"}</button></div>
+  </form></Modal>;
 }
 
 function SelectionCheckbox({ label, checked, indeterminate = false, disabled = false, onChange }: { label: string; checked: boolean; indeterminate?: boolean; disabled?: boolean; onChange(selected: boolean): void }) {
@@ -530,6 +586,7 @@ function HostDialog({ host, credentials, policies, groupNames, onAccountsChanged
   const [authMode, setAuthMode] = useState<"PASSWORD" | "PRIVATE_KEY" | "SSH_AGENT">(currentCredential?.type ?? "PASSWORD");
   const [sudoMode, setSudoMode] = useState<"NONE" | "LOGIN_PASSWORD" | "CUSTOM_PASSWORD">(currentCredential?.sudoMode ?? "NONE");
   const [sudoEnabled, setSudoEnabled] = useState(false);
+  const [proxyEnabled, setProxyEnabled] = useState(host?.proxyEnabled ?? false);
   const [newUsername, setNewUsername] = useState("root");
   const [busy, setBusy] = useState(false);
   const [loginEditorActive, setLoginEditorActive] = useState(false);
@@ -560,7 +617,11 @@ function HostDialog({ host, credentials, policies, groupNames, onAccountsChanged
       policyId: data.get("policyId") || null, groupName: data.get("groupName") || null,
       tags: String(data.get("tags") ?? "").split(",").map(v => v.trim()).filter(Boolean), defaultDirectory: data.get("defaultDirectory") || null,
       enabled: data.get("enabled") === "on", aiAccessEnabled: data.get("aiAccessEnabled") === "on",
-      hostTransferEnabled: data.get("hostTransferEnabled") === "on"
+      hostTransferEnabled: data.get("hostTransferEnabled") === "on",
+      proxyEnabled,
+      proxyLocalHost: String(data.get("proxyLocalHost") ?? "").trim(),
+      proxyLocalPort: Number(data.get("proxyLocalPort")),
+      proxyRemotePort: Number(data.get("proxyRemotePort"))
     };
     try {
       const saved = host ? await patch<Host>(`/v1/hosts/${host.id}`, payload) : await post<Host>("/v1/hosts", payload);
@@ -599,6 +660,16 @@ function HostDialog({ host, credentials, policies, groupNames, onAccountsChanged
     <label className="check"><input name="aiAccessEnabled" type="checkbox" defaultChecked={host?.aiAccessEnabled ?? false} />允许 AI 访问</label>
     <label className="check span-2"><input name="hostTransferEnabled" type="checkbox" defaultChecked={host?.hostTransferEnabled ?? false} />允许主机间文件传输</label>
     <p className="form-hint span-2">文件传输开关属于当前主机且默认关闭；路径、大小、上传下载和覆盖限制仍由所选策略控制。</p>
+    <div className="span-2 auth-section">
+      <label className="check"><input name="proxyEnabled" type="checkbox" checked={proxyEnabled} onChange={(event) => setProxyEnabled(event.target.checked)} />使用本机 SOCKS5 代理</label>
+      {proxyEnabled && <div className="auth-fields">
+        <label>本机代理地址<input name="proxyLocalHost" required maxLength={255} defaultValue={host?.proxyLocalHost ?? "127.0.0.1"} placeholder="127.0.0.1" /></label>
+        <label>本机代理端口<input name="proxyLocalPort" type="number" min="1" max="65535" required defaultValue={host?.proxyLocalPort ?? 7890} /></label>
+        <label>远端监听端口<input name="proxyRemotePort" type="number" min="1" max="65535" required defaultValue={host?.proxyRemotePort ?? 7890} /></label>
+      </div>}
+      {!proxyEnabled && <><input name="proxyLocalHost" type="hidden" value={host?.proxyLocalHost ?? "127.0.0.1"} /><input name="proxyLocalPort" type="hidden" value={host?.proxyLocalPort ?? 7890} /><input name="proxyRemotePort" type="hidden" value={host?.proxyRemotePort ?? 7890} /></>}
+      <p className="form-hint">开启后，Hoplane 将远端回环端口映射到指定的本机代理地址和端口，并为远端命令和交互终端注入 <code>ALL_PROXY=socks5h://127.0.0.1:远端端口</code>。隧道不可用时命令会失败，不会静默直连。</p>
+    </div>
     <p className="form-hint span-2">AI 和 MCP 只会收到主机 ID，不会得到密码、私钥、口令或保险库内容。</p>
     {errorText && <div className="form-error span-2" role="alert">{errorText}</div>}
   </form>{host && <HostLoginsEditor host={host} onChanged={onAccountsChanged} onEditingChange={setLoginEditorActive} />}
@@ -1209,6 +1280,12 @@ function Status({ value, detail }: { value: string; detail?: string | null }) {
     DENIED: "已拒绝", TIMED_OUT: "已超时", AUTH_FAILED: "认证失败", HOST_KEY_BLOCKED: "指纹异常", DISABLED: "已停用"
   };
   return <span className={`status ${good ? "good" : bad ? "bad" : "idle"}`}><i />{labels[value] ?? value}{detail ? ` · ${detail}` : ""}</span>;
+}
+function proxyStatusLabel(value?: NonNullable<Host["proxyState"]>["status"]): string {
+  return ({
+    DISABLED: "已关闭", WAITING_FOR_VAULT: "等待解锁", CONNECTING: "连接中", ACTIVE: "已连接", RETRYING: "重连中",
+    LOCAL_PROXY_UNAVAILABLE: "本机端口不可用", FAILED: "失败"
+  } as Record<string, string>)[value ?? "CONNECTING"] ?? value ?? "连接中";
 }
 type Notify = (kind: "ok" | "error", text: string) => void;
 function message(error: unknown): string { return error instanceof Error ? error.message : "操作失败"; }

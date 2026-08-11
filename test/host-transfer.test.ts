@@ -50,6 +50,7 @@ async function fixture(sourceTransferEnabled = true, destinationTransferEnabled 
   const relayFile = vi.fn(async () => ({ bytesTransferred: 2048, transport: "SFTP" as const }));
   const ssh = {
     getStatus: () => "CONNECTED",
+    getProxyState: () => ({ status: "DISABLED" }),
     resolveRemotePathForRelay: async (_hostId: string, path: string) => path,
     getRemoteRegularFileInfoForRelay: async () => ({ size: 2048 }),
     relayFile

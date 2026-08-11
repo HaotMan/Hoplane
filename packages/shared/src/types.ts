@@ -8,6 +8,21 @@ export type HostStatus =
   | "AUTH_FAILED"
   | "HOST_KEY_BLOCKED";
 
+export type ProxyTunnelStatus =
+  | "DISABLED"
+  | "WAITING_FOR_VAULT"
+  | "CONNECTING"
+  | "ACTIVE"
+  | "RETRYING"
+  | "LOCAL_PROXY_UNAVAILABLE"
+  | "FAILED";
+
+export interface ProxyTunnelState {
+  status: ProxyTunnelStatus;
+  errorCode?: string;
+  errorMessage?: string;
+}
+
 export type PolicyDecision = "ALLOW" | "DENY";
 export type PolicySourceStatus = "SYNCED" | "ERROR" | "MISSING" | "DISABLED";
 
@@ -52,10 +67,15 @@ export interface Host {
   aiAccessEnabled: boolean;
   hostTransferEnabled: boolean;
   monitorOutputEnabled: boolean;
+  proxyEnabled: boolean;
+  proxyLocalHost: string;
+  proxyLocalPort: number;
+  proxyRemotePort: number;
   configRevision: number;
   createdAt: string;
   updatedAt: string;
   status?: HostStatus;
+  proxyState?: ProxyTunnelState;
 }
 
 export interface HostLogin {

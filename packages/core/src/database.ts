@@ -48,6 +48,10 @@ const MIGRATIONS = [
     ai_access_enabled INTEGER NOT NULL DEFAULT 0,
     host_transfer_enabled INTEGER NOT NULL DEFAULT 0,
     monitor_output_enabled INTEGER NOT NULL DEFAULT 0,
+    proxy_enabled INTEGER NOT NULL DEFAULT 0,
+    proxy_local_host TEXT NOT NULL DEFAULT '127.0.0.1',
+    proxy_local_port INTEGER NOT NULL DEFAULT 7890 CHECK(proxy_local_port BETWEEN 1 AND 65535),
+    proxy_remote_port INTEGER NOT NULL DEFAULT 7890 CHECK(proxy_remote_port BETWEEN 1 AND 65535),
     config_revision INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -127,13 +131,19 @@ const HOST_LOGINS_MIGRATION = 9;
 const POLICY_V4_MIGRATION = 10;
 const AUDIT_PEER_HOST_MIGRATION = 11;
 const HOST_TRANSFER_ENABLED_MIGRATION = 12;
+const HOST_PROXY_MIGRATION = 13;
+const HOST_PROXY_ENDPOINT_MIGRATION = 14;
 export const POLICY_TEMPLATE_CONSOLIDATION_CLEANUP_SETTING = "policy.v3TemplateConsolidationCleanup";
 const LEGACY_READONLY_TEMPLATE_NAMES = new Set(["Docker 排障（只读）", "Kubernetes 排障（只读）"]);
 const LEGACY_OPERATIONS_TEMPLATE_NAMES = new Set(["Docker 运维（受限）", "Kubernetes 应用运维（受限）"]);
 
-type CreateHostInput = Omit<Host, "id" | "createdAt" | "updatedAt" | "configRevision" | "status" | "monitorOutputEnabled" | "hostTransferEnabled" | "activeLoginId"> & {
+type CreateHostInput = Omit<Host, "id" | "createdAt" | "updatedAt" | "configRevision" | "status" | "proxyState" | "monitorOutputEnabled" | "hostTransferEnabled" | "proxyEnabled" | "proxyLocalHost" | "proxyLocalPort" | "proxyRemotePort" | "activeLoginId"> & {
   monitorOutputEnabled?: boolean;
   hostTransferEnabled?: boolean;
+  proxyEnabled?: boolean;
+  proxyLocalHost?: string;
+  proxyLocalPort?: number;
+  proxyRemotePort?: number;
   activeLoginId?: string | null;
   sudoEnabled?: boolean;
 };
@@ -331,6 +341,32 @@ export class HoplaneDatabase {
         throw error;
       }
     }
+    const hostProxyColumns = new Set((this.db.prepare("PRAGMA table_info(hosts)").all() as Row[]).map((row) => String(row.name)));
+    if (!applied.has(HOST_PROXY_MIGRATION) || ["proxy_enabled", "proxy_local_port", "proxy_remote_port"].some((column) => !hostProxyColumns.has(column))) {
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        if (!hostProxyColumns.has("proxy_enabled")) this.db.exec("ALTER TABLE hosts ADD COLUMN proxy_enabled INTEGER NOT NULL DEFAULT 0");
+        if (!hostProxyColumns.has("proxy_local_port")) this.db.exec("ALTER TABLE hosts ADD COLUMN proxy_local_port INTEGER NOT NULL DEFAULT 7890 CHECK(proxy_local_port BETWEEN 1 AND 65535)");
+        if (!hostProxyColumns.has("proxy_remote_port")) this.db.exec("ALTER TABLE hosts ADD COLUMN proxy_remote_port INTEGER NOT NULL DEFAULT 7890 CHECK(proxy_remote_port BETWEEN 1 AND 65535)");
+        this.db.prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(HOST_PROXY_MIGRATION, now());
+        this.db.exec("COMMIT");
+      } catch (error) {
+        this.db.exec("ROLLBACK");
+        throw error;
+      }
+    }
+    const hostProxyEndpointColumns = new Set((this.db.prepare("PRAGMA table_info(hosts)").all() as Row[]).map((row) => String(row.name)));
+    if (!applied.has(HOST_PROXY_ENDPOINT_MIGRATION) || !hostProxyEndpointColumns.has("proxy_local_host")) {
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        if (!hostProxyEndpointColumns.has("proxy_local_host")) this.db.exec("ALTER TABLE hosts ADD COLUMN proxy_local_host TEXT NOT NULL DEFAULT '127.0.0.1'");
+        this.db.prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(HOST_PROXY_ENDPOINT_MIGRATION, now());
+        this.db.exec("COMMIT");
+      } catch (error) {
+        this.db.exec("ROLLBACK");
+        throw error;
+      }
+    }
     return resetToV2;
   }
 
@@ -439,10 +475,11 @@ export class HoplaneDatabase {
     const id = randomUUID();
     const timestamp = now();
     this.db.prepare(`INSERT INTO hosts
-      (id,name,hostname,port,username,credential_id,active_login_id,policy_id,group_name,tags_json,default_directory,enabled,ai_access_enabled,host_transfer_enabled,monitor_output_enabled,config_revision,created_at,updated_at)
-      VALUES (?,?,?,?,?,?,NULL,?,?,?,?,?,?,?,?,1,?,?)`).run(
+      (id,name,hostname,port,username,credential_id,active_login_id,policy_id,group_name,tags_json,default_directory,enabled,ai_access_enabled,host_transfer_enabled,monitor_output_enabled,proxy_enabled,proxy_local_host,proxy_local_port,proxy_remote_port,config_revision,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,NULL,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)`).run(
       id, input.name, input.hostname, input.port, input.username, input.credentialId, input.policyId,
-      input.groupName, JSON.stringify(input.tags), input.defaultDirectory, bool(input.enabled), bool(input.aiAccessEnabled), bool(input.hostTransferEnabled ?? false), bool(input.monitorOutputEnabled ?? false), timestamp, timestamp
+      input.groupName, JSON.stringify(input.tags), input.defaultDirectory, bool(input.enabled), bool(input.aiAccessEnabled), bool(input.hostTransferEnabled ?? false), bool(input.monitorOutputEnabled ?? false),
+      bool(input.proxyEnabled ?? false), input.proxyLocalHost ?? "127.0.0.1", input.proxyLocalPort ?? 7890, input.proxyRemotePort ?? 7890, timestamp, timestamp
     );
     const login = this.createHostLogin(id, input.username, input.credentialId, input.sudoEnabled ?? input.username === "root");
     this.db.prepare("UPDATE hosts SET active_login_id=? WHERE id=?").run(login.id, id);
@@ -453,9 +490,10 @@ export class HoplaneDatabase {
     const current = this.requireHost(id);
     const next = { ...current, ...patch, id: current.id };
     const connectionChanged = current.hostname !== next.hostname || current.port !== next.port || current.username !== next.username || current.credentialId !== next.credentialId;
-    this.db.prepare(`UPDATE hosts SET name=?,hostname=?,port=?,username=?,credential_id=?,active_login_id=?,policy_id=?,group_name=?,tags_json=?,default_directory=?,enabled=?,ai_access_enabled=?,host_transfer_enabled=?,monitor_output_enabled=?,config_revision=config_revision+?,updated_at=? WHERE id=?`).run(
+    this.db.prepare(`UPDATE hosts SET name=?,hostname=?,port=?,username=?,credential_id=?,active_login_id=?,policy_id=?,group_name=?,tags_json=?,default_directory=?,enabled=?,ai_access_enabled=?,host_transfer_enabled=?,monitor_output_enabled=?,proxy_enabled=?,proxy_local_host=?,proxy_local_port=?,proxy_remote_port=?,config_revision=config_revision+?,updated_at=? WHERE id=?`).run(
       next.name, next.hostname, next.port, next.username, next.credentialId, next.activeLoginId, next.policyId, next.groupName,
-      JSON.stringify(next.tags), next.defaultDirectory, bool(next.enabled), bool(next.aiAccessEnabled), bool(next.hostTransferEnabled), bool(next.monitorOutputEnabled), connectionChanged ? 1 : 0, now(), id
+      JSON.stringify(next.tags), next.defaultDirectory, bool(next.enabled), bool(next.aiAccessEnabled), bool(next.hostTransferEnabled), bool(next.monitorOutputEnabled),
+      bool(next.proxyEnabled), next.proxyLocalHost, next.proxyLocalPort, next.proxyRemotePort, connectionChanged ? 1 : 0, now(), id
     );
     if (current.activeLoginId && (current.username !== next.username || current.credentialId !== next.credentialId)) {
       this.db.prepare("UPDATE host_logins SET username=?,credential_id=?,updated_at=? WHERE id=?")
@@ -743,7 +781,8 @@ function mapHost(row: Row): Host {
     id: String(row.id), name: String(row.name), hostname: String(row.hostname), port: Number(row.port), username: String(row.username),
     credentialId: nullable(row.credential_id), activeLoginId: nullable(row.active_login_id), policyId: nullable(row.policy_id), groupName: nullable(row.group_name),
     tags: JSON.parse(String(row.tags_json)) as string[], defaultDirectory: nullable(row.default_directory),
-    enabled: Boolean(row.enabled), aiAccessEnabled: Boolean(row.ai_access_enabled), hostTransferEnabled: Boolean(row.host_transfer_enabled), monitorOutputEnabled: Boolean(row.monitor_output_enabled), configRevision: Number(row.config_revision),
+    enabled: Boolean(row.enabled), aiAccessEnabled: Boolean(row.ai_access_enabled), hostTransferEnabled: Boolean(row.host_transfer_enabled), monitorOutputEnabled: Boolean(row.monitor_output_enabled),
+    proxyEnabled: Boolean(row.proxy_enabled), proxyLocalHost: String(row.proxy_local_host), proxyLocalPort: Number(row.proxy_local_port), proxyRemotePort: Number(row.proxy_remote_port), configRevision: Number(row.config_revision),
     createdAt: String(row.created_at), updatedAt: String(row.updated_at)
   };
 }

@@ -17,6 +17,11 @@ Use Hoplane's MCP tools for every remote operation so credentials remain hidden 
 6. Use `execute_command`, `upload_file`, or `download_file` as requested. For a file moving directly between two Hoplane hosts, use `transfer_file` so the Core streams it without exposing contents to the Agent or staging it on the local filesystem. Both hosts must advertise the corresponding `transfer_source` / `transfer_destination` capability, which requires their host-level transfer switches plus policy file constraints. Hoplane prefers SFTP and automatically uses its fixed POSIX SSH stream only when SFTP is unavailable; report the returned `transport`. Preserve both host IDs and paths; do not broaden an operation after a denial.
 7. Return stdout, stderr, exit code, duration, or transfer size concisely. Explain policy denials using the returned reason code.
 
+## Host proxy tunnels
+
+- `list_hosts` reports `proxyEnabled` and `proxyState`. When proxy access is enabled, Hoplane automatically establishes the reverse tunnel and injects `ALL_PROXY` into `execute_command`; do not add proxy exports, edit shell profiles, or persist proxy settings yourself.
+- A proxy-enabled command fails closed when the local SOCKS5 endpoint or reverse tunnel is unavailable. Report the returned proxy error; ask the user to unlock the vault, start their local proxy, or inspect the host's proxy settings as appropriate. Do not retry the command without the proxy.
+
 ## Privileged commands (sudo)
 
 - `list_hosts` reports a `sudo` field per host. When `sudo.available` is true, run privileged commands with `sudo` as usual — anywhere in the command, including chains such as `sudo apt-get update && sudo apt-get install -y nginx` or `cd /opt && sudo make install`. Hoplane authenticates every sudo invocation automatically and non-interactively — no password prompt will appear and you must never ask the user for one.
@@ -28,5 +33,6 @@ Use Hoplane's MCP tools for every remote operation so credentials remain hidden 
 - Never request, read, print, or copy SSH passwords, private keys, passphrases, Core tokens, or vault contents.
 - Never bypass Hoplane with `ssh`, `scp`, `sftp`, raw Core HTTP calls, or a separately written request script.
 - Never modify Hoplane policy, AI-access settings, credentials, or trusted host keys on the user's behalf.
+- Never enable, disable, or reconfigure a host proxy tunnel on the user's behalf.
 - Treat command execution and file transfer as remote side effects. Confirm destructive or materially ambiguous actions before calling a tool.
 - If Hoplane reports that the vault is locked, ask the user to unlock it in the App.

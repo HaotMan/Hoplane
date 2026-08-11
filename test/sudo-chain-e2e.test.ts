@@ -91,7 +91,8 @@ function buildFixtures(port: number) {
     id: "11111111-1111-4111-8111-111111111111", name: "fake", hostname: "127.0.0.1", port,
     username: "haot", credentialId: "cred-1", activeLoginId: "login-1", policyId: null,
     groupName: null, tags: [], defaultDirectory: null, enabled: true, aiAccessEnabled: true, hostTransferEnabled: false,
-    monitorOutputEnabled: false, configRevision: 1, createdAt: now, updatedAt: now
+    monitorOutputEnabled: false, proxyEnabled: false, proxyLocalHost: "127.0.0.1", proxyLocalPort: 7890, proxyRemotePort: 7890,
+    configRevision: 1, createdAt: now, updatedAt: now
   };
   const login: HostLogin = {
     id: "login-1", hostId: host.id, username: "haot", credentialId: "cred-1",

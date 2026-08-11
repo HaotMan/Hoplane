@@ -25,6 +25,7 @@ export class OperationService {
       return {
         ...host,
         status: this.ssh.getStatus(host.id),
+        proxyState: this.ssh.getProxyState(host.id),
         capabilities: caps,
         sudo: {
           available: sudoAvailable,

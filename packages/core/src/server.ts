@@ -131,6 +131,7 @@ await new Promise<void>((resolve, reject) => {
 });
 await writeFile(config.pidPath, `${process.pid}\n`, { mode: 0o600 });
 process.stderr.write(`Hoplane Core listening on http://${config.host}:${config.port}\n`);
+void ssh.reconcileConfiguredProxies();
 
 if (options.registerProcessSignals) {
   for (const signal of ["SIGINT", "SIGTERM"] as const) {
@@ -262,12 +263,14 @@ async function routeApi(request: IncomingMessage, response: ServerResponse, url:
     const input = z.object({ password: z.string().min(10).max(1024) }).parse(await body(request));
     const state = await vault.setupLocal(input.password);
     mcpService.clearTokenCache();
+    void ssh.reconcileConfiguredProxies();
     return json(response, 200, state);
   }
   if (method === "POST" && url.pathname === "/v1/vault/unlock") {
     const input = z.object({ password: z.string().min(1).max(1024) }).parse(await body(request));
     const state = await vault.unlockLocal(input.password);
     mcpService.clearTokenCache();
+    void ssh.reconcileConfiguredProxies();
     return json(response, 200, state);
   }
   if (method === "POST" && url.pathname === "/v1/vault/lock") {
@@ -340,12 +343,14 @@ async function routeApi(request: IncomingMessage, response: ServerResponse, url:
       ? await prepareCredentialBinding(null, raw.credential, input.name)
       : { credentialId: null, createdCredentialId: null };
     try {
-      return json(response, 201, database.createHost({
+      const created = database.createHost({
         ...input,
         credentialId: bindingResult.credentialId, policyId: input.policyId ?? null, groupName: input.groupName ?? null,
         defaultDirectory: input.defaultDirectory ?? null,
         sudoEnabled: input.username === "root" ? true : raw.sudoEnabled ?? false
-      }));
+      });
+      void ssh.reconcileProxy(created.id);
+      return json(response, 201, { ...created, status: ssh.getStatus(created.id), proxyState: ssh.getProxyState(created.id) });
     } catch (error) {
       if (bindingResult.createdCredentialId) await removeUnusedCredential(bindingResult.createdCredentialId);
       throw error;
@@ -401,7 +406,8 @@ async function routeApi(request: IncomingMessage, response: ServerResponse, url:
     if (before && (before.hostname !== updated.hostname || before.port !== updated.port || before.username !== updated.username || before.credentialId !== updated.credentialId || !updated.enabled)) {
       await ssh.disconnect(updated.id);
     }
-    return json(response, 200, updated);
+    void ssh.reconcileProxy(updated.id);
+    return json(response, 200, { ...updated, status: ssh.getStatus(updated.id), proxyState: ssh.getProxyState(updated.id) });
   }
   if (hostMatch && method === "DELETE") {
     const existing = database.getHost(hostMatch[1]!);
@@ -452,7 +458,10 @@ async function routeApi(request: IncomingMessage, response: ServerResponse, url:
       if (binding.createdCredentialId) await removeUnusedCredential(binding.createdCredentialId);
       throw error;
     }
-    if (login.active) await ssh.disconnect(host.id);
+    if (login.active) {
+      await ssh.disconnect(host.id);
+      void ssh.reconcileProxy(host.id);
+    }
     if (previousCredentialId && previousCredentialId !== updated.credentialId) await removeUnusedCredential(previousCredentialId);
     return json(response, 200, updated);
   }
@@ -476,6 +485,7 @@ async function routeApi(request: IncomingMessage, response: ServerResponse, url:
   if (activateLoginMatch && method === "POST") {
     const updated = database.activateHostLogin(activateLoginMatch[1]!, activateLoginMatch[2]!);
     await ssh.disconnect(updated.id);
+    void ssh.reconcileProxy(updated.id);
     return json(response, 200, updated);
   }
   const testMatch = url.pathname.match(/^\/v1\/hosts\/([0-9a-f-]+)\/test$/u);
@@ -494,6 +504,7 @@ async function routeApi(request: IncomingMessage, response: ServerResponse, url:
     const input = z.object({ fingerprint: z.string().min(8).max(512) }).parse(await body(request));
     database.trustHostKey(trustMatch[1]!, input.fingerprint);
     await ssh.disconnect(trustMatch[1]!);
+    void ssh.reconcileProxy(trustMatch[1]!);
     return json(response, 200, { trusted: true });
   }
 
@@ -573,7 +584,10 @@ async function routeApi(request: IncomingMessage, response: ServerResponse, url:
     if (sudoMode === "CUSTOM_PASSWORD" && !sudoSecretRef) throw new AppError("INVALID_ARGUMENT", "Sudo password is required");
     const updated = database.updateCredential(current.id, input.name ?? current.name, input.type ?? current.type, secretRef, input.metadata ?? current.metadata, sudoMode, sudoSecretRef);
     if (current.sudoSecretRef && current.sudoSecretRef !== sudoSecretRef) await vault.delete(current.sudoSecretRef);
-    for (const host of database.listHosts().filter((candidate) => candidate.credentialId === current.id)) await ssh.disconnect(host.id);
+    for (const host of database.listHosts().filter((candidate) => candidate.credentialId === current.id)) {
+      await ssh.disconnect(host.id);
+      void ssh.reconcileProxy(host.id);
+    }
     return json(response, 200, publicCredential(updated));
   }
   if (credentialMatch && method === "DELETE") {
