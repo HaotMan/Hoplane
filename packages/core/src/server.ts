@@ -106,7 +106,7 @@ const server = createServer(async (request, response) => {
   try {
     applySecurityHeaders(response);
     const url = new URL(request.url ?? "/", `http://${config.host}:${config.port}`);
-    if (url.pathname === "/health" && request.method === "GET") return json(response, 200, { status: "ok", version: "0.1.4", uiBuildId, mcpEnabled: mcpService.isEnabled() });
+    if (url.pathname === "/health" && request.method === "GET") return json(response, 200, { status: "ok", version: "0.1.5", uiBuildId, mcpEnabled: mcpService.isEnabled() });
     if (url.pathname === "/mcp") {
       const parsed = request.method === "POST" ? await body(request) : undefined;
       return await mcpService.handle(request, response, parsed);
@@ -150,7 +150,7 @@ async function performShutdown(): Promise<void> {
   const closed = new Promise<void>((resolve) => server.close(() => resolve()));
   server.closeAllConnections();
   await closed;
-  await ssh.closeAll();
+  await ssh.shutdown();
   await policySources.close();
   vault.local.lock();
   database.close();
@@ -403,7 +403,7 @@ async function routeApi(request: IncomingMessage, response: ServerResponse, url:
     }
     if (previousCredentialId && previousCredentialId !== updated.credentialId) await removeUnusedCredential(previousCredentialId);
     if (before.monitorOutputEnabled && !updated.monitorOutputEnabled) monitor.clearOutput(updated.id);
-    if (before && (before.hostname !== updated.hostname || before.port !== updated.port || before.username !== updated.username || before.credentialId !== updated.credentialId || !updated.enabled)) {
+    if (before && (before.hostname !== updated.hostname || before.port !== updated.port || before.username !== updated.username || before.credentialId !== updated.credentialId || before.jumpHostId !== updated.jumpHostId || !updated.enabled)) {
       await ssh.disconnect(updated.id);
     }
     void ssh.reconcileProxy(updated.id);
@@ -412,6 +412,7 @@ async function routeApi(request: IncomingMessage, response: ServerResponse, url:
   if (hostMatch && method === "DELETE") {
     const existing = database.getHost(hostMatch[1]!);
     if (!existing) throw new AppError("HOST_NOT_FOUND", "Host not found", false, undefined, undefined, 404);
+    database.assertHostDeletable(existing.id);
     const credentialIds = database.listHostLogins(existing.id).flatMap((login) => login.credentialId ? [login.credentialId] : []);
     await ssh.disconnect(hostMatch[1]!);
     database.deleteHost(hostMatch[1]!);
@@ -508,19 +509,26 @@ async function routeApi(request: IncomingMessage, response: ServerResponse, url:
     return json(response, 200, { trusted: true });
   }
 
-  const revealCredentialMatch = url.pathname.match(/^\/v1\/hosts\/([0-9a-f-]+)\/credential\/reveal$/u);
+  const revealCredentialMatch = url.pathname.match(/^\/v1\/hosts\/([0-9a-f-]+)(?:\/logins\/([0-9a-f-]+))?\/credential\/reveal$/u);
   if (revealCredentialMatch && method === "POST") {
     requireSameOriginUi(request);
     const input = z.object({ masterPassword: z.string().min(1).max(1024) }).parse(await body(request));
     const host = database.getHost(revealCredentialMatch[1]!);
     if (!host) throw new AppError("HOST_NOT_FOUND", "Host not found", false, undefined, undefined, 404);
-    if (!host.credentialId) throw new AppError("CREDENTIAL_NOT_FOUND", "Host has no assigned credential", false, undefined, undefined, 404);
-    const credential = database.getCredential(host.credentialId);
+    const loginId = revealCredentialMatch[2];
+    const login = loginId ? database.getHostLogin(loginId) : null;
+    if (loginId && (!login || login.hostId !== host.id)) {
+      throw new AppError("HOST_LOGIN_NOT_FOUND", "Host login not found", false, undefined, undefined, 404);
+    }
+    const credentialId = login ? login.credentialId : host.credentialId;
+    if (!credentialId) throw new AppError("CREDENTIAL_NOT_FOUND", "Host login has no assigned credential", false, undefined, undefined, 404);
+    const credential = database.getCredential(credentialId);
     if (!credential) throw new AppError("CREDENTIAL_NOT_FOUND", "Credential not found", false, undefined, undefined, 404);
     const auditId = randomUUID();
+    const subject = login ? `${login.username} 的` : "";
     database.createAudit({
       id: auditId, clientType: "UI", clientId: "desktop", hostId: host.id, hostNameSnapshot: host.name,
-      operationType: "REVEAL_CREDENTIAL", requestSummary: credential.type === "PASSWORD" ? "查看登录密码" : credential.type === "PRIVATE_KEY" ? "查看私钥认证信息" : "查看 SSH Agent 配置"
+      operationType: "REVEAL_CREDENTIAL", requestSummary: credential.type === "PASSWORD" ? `查看${subject}登录密码` : credential.type === "PRIVATE_KEY" ? `查看${subject}私钥认证信息` : `查看${subject}SSH Agent 配置`
     });
     try {
       await vault.verifyLocalPassword(input.masterPassword);

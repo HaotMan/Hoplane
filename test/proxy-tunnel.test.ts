@@ -19,6 +19,7 @@ function proxyHost(overrides: Partial<Host> = {}): Host {
     username: "tester",
     credentialId: "credential-1",
     activeLoginId: "login-1",
+    jumpHostId: null,
     policyId: null,
     groupName: null,
     tags: [],

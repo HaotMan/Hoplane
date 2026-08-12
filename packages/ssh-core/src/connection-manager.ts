@@ -80,6 +80,8 @@ export class SSHConnectionManager {
   private readonly proxyRetryAttempts = new Map<string, number>();
   private readonly intentionalDisconnects = new WeakSet<Client>();
   private suppressProxyRetries = false;
+  private shuttingDown = false;
+  private shutdownPromise: Promise<void> | null = null;
 
   constructor(
     private readonly database: HoplaneDatabase,
@@ -566,6 +568,16 @@ export class SSHConnectionManager {
   }
 
   async disconnect(hostId: string): Promise<void> {
+    await this.disconnectCascade(hostId, new Set());
+  }
+
+  private async disconnectCascade(hostId: string, visited: Set<string>): Promise<void> {
+    if (visited.has(hostId)) return;
+    visited.add(hostId);
+    const dependents = typeof this.database.listHosts === "function"
+      ? this.database.listHosts().filter((host) => host.jumpHostId === hostId)
+      : [];
+    for (const dependent of dependents) await this.disconnectCascade(dependent.id, visited);
     const pending = this.proxyStarting.get(hostId);
     if (pending) await Promise.allSettled([pending]);
     await this.disconnectTransport(hostId);
@@ -585,15 +597,26 @@ export class SSHConnectionManager {
 
   async closeAll(): Promise<void> {
     this.suppressProxyRetries = true;
-    for (const hostId of this.proxyRetryTimers.keys()) this.cancelProxyRetry(hostId);
-    await Promise.allSettled([...this.proxyStarting.values()]);
-    for (const hostId of new Set([...this.connections.keys(), ...this.proxyTunnels.keys()])) await this.disconnect(hostId);
-    for (const host of this.database.listHosts()) {
-      if (host.enabled && host.proxyEnabled) {
-        this.proxyStates.set(host.id, { status: "WAITING_FOR_VAULT", errorCode: "VAULT_LOCKED", errorMessage: "Local vault is locked" });
+    try {
+      for (const hostId of this.proxyRetryTimers.keys()) this.cancelProxyRetry(hostId);
+      await Promise.allSettled([...this.proxyStarting.values()]);
+      for (const hostId of new Set([...this.connections.keys(), ...this.proxyTunnels.keys()])) await this.disconnect(hostId);
+      if (!this.shuttingDown) {
+        for (const host of this.database.listHosts()) {
+          if (host.enabled && host.proxyEnabled) {
+            this.proxyStates.set(host.id, { status: "WAITING_FOR_VAULT", errorCode: "VAULT_LOCKED", errorMessage: "Local vault is locked" });
+          }
+        }
       }
+    } finally {
+      if (!this.shuttingDown) this.suppressProxyRetries = false;
     }
-    this.suppressProxyRetries = false;
+  }
+
+  shutdown(): Promise<void> {
+    this.shuttingDown = true;
+    this.shutdownPromise ??= this.closeAll();
+    return this.shutdownPromise;
   }
 
   private async ensureProxyAvailable(hostId: string): Promise<void> {
@@ -796,7 +819,13 @@ export class SSHConnectionManager {
     return this.vault.resolve(credential.sudoSecretRef);
   }
 
-  private async getConnection(hostId: string): Promise<Client> {
+  private async getConnection(hostId: string, ancestry: readonly string[] = []): Promise<Client> {
+    if (this.shuttingDown) {
+      throw new AppError("SSH_MANAGER_SHUTTING_DOWN", "SSH connection manager is shutting down", false, undefined, undefined, 503);
+    }
+    if (ancestry.includes(hostId)) {
+      throw new AppError("JUMP_HOST_CYCLE", "Jump host configuration contains a cycle", false, undefined, { hostId, path: [...ancestry, hostId] }, 409);
+    }
     const host = this.requireEnabledHost(hostId);
     const existing = this.connections.get(hostId);
     if (existing?.revision === host.configRevision) {
@@ -805,26 +834,49 @@ export class SSHConnectionManager {
     }
     if (existing) await this.disconnectTransport(hostId);
     const pending = this.connecting.get(hostId);
-    if (pending) return pending;
+    if (pending) {
+      const client = await pending;
+      if (this.shuttingDown) {
+        this.intentionalDisconnects.add(client);
+        client.end();
+        throw new AppError("SSH_MANAGER_SHUTTING_DOWN", "SSH connection manager is shutting down", false, undefined, undefined, 503);
+      }
+      return client;
+    }
     if (this.connections.size + this.connecting.size >= 20) {
       throw new AppError("CONNECTION_LIMIT_REACHED", "The maximum of 20 concurrent SSH connections has been reached", true, undefined, undefined, 429);
     }
-    const promise = this.createConnection(host).finally(() => this.connecting.delete(hostId));
+    const promise = this.createConnection(host, ancestry).finally(() => this.connecting.delete(hostId));
     this.connecting.set(hostId, promise);
     const client = await promise;
+    if (this.shuttingDown) {
+      this.intentionalDisconnects.add(client);
+      client.end();
+      throw new AppError("SSH_MANAGER_SHUTTING_DOWN", "SSH connection manager is shutting down", false, undefined, undefined, 503);
+    }
     this.connections.set(hostId, { client, revision: host.configRevision, lastUsedAt: Date.now() });
     return client;
   }
 
-  private async createConnection(host: Host): Promise<Client> {
+  private async createConnection(host: Host, ancestry: readonly string[]): Promise<Client> {
     this.statuses.set(host.id, "CONNECTING");
     const credential = host.credentialId ? this.database.getCredential(host.credentialId) : null;
     if (!credential) throw new AppError("CREDENTIAL_NOT_FOUND", "Host has no usable credential", false, undefined, undefined, 409);
-    return this.establishClient(host, credential, host.username, true);
+    try {
+      return await this.establishClient(host, credential, host.username, true, ancestry);
+    } catch (error) {
+      const appError = error instanceof AppError ? error : classifySshError(error);
+      if (appError.details?.hostId !== host.id || this.statuses.get(host.id) === "CONNECTING") this.statuses.set(host.id, "FAILED");
+      throw appError;
+    }
   }
 
   /** Connects a new ssh2 client. `trackStatus` ties the client to the pooled host status; shell sessions pass false. */
-  private async establishClient(host: Host, credential: Credential, username: string, trackStatus: boolean): Promise<Client> {
+  private async establishClient(host: Host, credential: Credential, username: string, trackStatus: boolean, ancestry: readonly string[] = []): Promise<Client> {
+    if (ancestry.includes(host.id)) {
+      throw new AppError("JUMP_HOST_CYCLE", "Jump host configuration contains a cycle", false, undefined, { hostId: host.id, path: [...ancestry, host.id] }, 409);
+    }
+    const connectionPath = [...ancestry, host.id];
     const trustedFingerprint = this.database.getTrustedHostKey(host.id);
     let observedFingerprint: string | undefined;
     const config: ConnectConfig = {
@@ -854,25 +906,60 @@ export class SSHConnectionManager {
       if (!config.agent) throw new AppError("CREDENTIAL_NOT_FOUND", "SSH Agent socket is unavailable");
     }
 
+    if (host.jumpHostId) {
+      const jumpHost = this.requireEnabledHost(host.jumpHostId);
+      const jumpClient = await this.getConnection(jumpHost.id, connectionPath);
+      config.sock = await new Promise<ClientChannel>((resolve, reject) => {
+        jumpClient.forwardOut("127.0.0.1", 0, host.hostname, host.port, (error, channel) => {
+          if (error) {
+            reject(new AppError("JUMP_HOST_FORWARD_FAILED", `Jump host \"${jumpHost.name}\" could not reach ${host.hostname}:${host.port}`, true, undefined, {
+              hostId: host.id,
+              hostName: host.name,
+              jumpHostId: jumpHost.id,
+              jumpHostName: jumpHost.name
+            }, 502));
+            return;
+          }
+          resolve(channel);
+        });
+      });
+    }
+
     return new Promise((resolve, reject) => {
       const client = new Client();
+      let connectionSettled = false;
       client.once("ready", () => {
+        if (connectionSettled) return;
+        connectionSettled = true;
         if (trackStatus) this.statuses.set(host.id, "CONNECTED");
         resolve(client);
       });
-      client.once("error", (error: Error & { level?: string }) => {
+      client.on("error", (error: Error & { level?: string }) => {
+        // ssh2 may emit a connection error (for example ECONNRESET) after it
+        // already reported the authentication failure that rejected this
+        // promise. Keep the listener for the client's full lifetime so a
+        // follow-up error cannot escape as an uncaught EventEmitter error.
+        if (connectionSettled) return;
+        connectionSettled = true;
         if (observedFingerprint && observedFingerprint !== trustedFingerprint) {
           const changed = Boolean(trustedFingerprint);
           if (trackStatus) this.statuses.set(host.id, "HOST_KEY_BLOCKED");
           reject(new AppError(changed ? "SSH_HOST_KEY_CHANGED" : "SSH_HOST_KEY_UNTRUSTED", changed ? "SSH host key changed" : "SSH host key is not trusted yet", false, undefined, {
+            hostId: host.id,
+            hostName: host.name,
             observedFingerprint,
             ...(trustedFingerprint ? { trustedFingerprint } : {})
           }, 409));
           return;
         }
         const classified = classifySshError(error);
+        const contextual = new AppError(classified.code, classified.message, classified.retriable, classified.operationId, {
+          ...classified.details,
+          hostId: host.id,
+          hostName: host.name
+        }, classified.statusCode);
         if (trackStatus) this.statuses.set(host.id, classified.code === "SSH_AUTH_FAILED" ? "AUTH_FAILED" : "FAILED");
-        reject(classified);
+        reject(contextual);
       });
       client.on("close", () => {
         if (!trackStatus) return;
@@ -882,7 +969,7 @@ export class SSHConnectionManager {
         const intentional = this.intentionalDisconnects.has(client);
         this.intentionalDisconnects.delete(client);
         this.dropProxyTunnel(host.id, client);
-        if (!intentional && !this.suppressProxyRetries) {
+        if (!intentional && !this.suppressProxyRetries && !this.shuttingDown) {
           const desired = this.database.getHost(host.id);
           if (desired?.enabled && desired.proxyEnabled) {
             const error = new AppError("PROXY_SSH_CONNECTION_CLOSED", "The SSH connection carrying the proxy tunnel closed", true, undefined, undefined, 502);

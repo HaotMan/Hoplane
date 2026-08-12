@@ -5,7 +5,7 @@ import type { Host } from "../apps/desktop/src/types.js";
 function host(id: string, name: string, groupName: string | null): Host {
   return {
     id, name, groupName, hostname: `${id}.example.test`, port: 22, username: "root",
-    credentialId: null, policyId: null, tags: [], defaultDirectory: null,
+    credentialId: null, policyId: null, jumpHostId: null, tags: [], defaultDirectory: null,
     enabled: true, aiAccessEnabled: true, hostTransferEnabled: false, monitorOutputEnabled: false,
     proxyEnabled: false, proxyLocalHost: "127.0.0.1", proxyLocalPort: 7890, proxyRemotePort: 7890, status: "DISCONNECTED"
   };

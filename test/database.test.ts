@@ -107,9 +107,9 @@ describe("HoplaneDatabase", () => {
     const columns = db.db.prepare("PRAGMA table_info(policies)").all().map((row) => String((row as { name: unknown }).name));
     expect(columns).toEqual(expect.arrayContaining(["schema_version", "enabled", "source_path", "source_status", "source_error", "source_hash"]));
     const hostColumns = db.db.prepare("PRAGMA table_info(hosts)").all().map((row) => String((row as { name: unknown }).name));
-    expect(hostColumns).toEqual(expect.arrayContaining(["monitor_output_enabled", "host_transfer_enabled", "proxy_enabled", "proxy_local_host", "proxy_local_port", "proxy_remote_port"]));
+    expect(hostColumns).toEqual(expect.arrayContaining(["monitor_output_enabled", "host_transfer_enabled", "proxy_enabled", "proxy_local_host", "proxy_local_port", "proxy_remote_port", "jump_host_id"]));
     expect(host.hostTransferEnabled).toBe(false);
-    expect(host).toMatchObject({ proxyEnabled: false, proxyLocalHost: "127.0.0.1", proxyLocalPort: 7890, proxyRemotePort: 7890 });
+    expect(host).toMatchObject({ proxyEnabled: false, proxyLocalHost: "127.0.0.1", proxyLocalPort: 7890, proxyRemotePort: 7890, jumpHostId: null });
     const credentialColumns = db.db.prepare("PRAGMA table_info(credentials)").all().map((row) => String((row as { name: unknown }).name));
     expect(credentialColumns).toEqual(expect.arrayContaining(["sudo_mode", "sudo_secret_ref"]));
     db.close();
@@ -159,6 +159,22 @@ describe("HoplaneDatabase", () => {
     expect(proxyEnabled).toMatchObject({ proxyEnabled: true, proxyLocalHost: "localhost", proxyLocalPort: 7891, proxyRemotePort: 17890, configRevision: host.configRevision });
     const moved = db.updateHost(host.id, { port: 2222 });
     expect(moved.configRevision).toBe(host.configRevision + 1);
+    db.close();
+  });
+  it("stores jump hosts, rejects cycles, and prevents deleting an in-use jump host", async () => {
+    const db = await database();
+    const policy = db.listPolicies()[0]!;
+    const jump = db.createHost({ name: "jump", hostname: "jump.example", port: 22, username: "root", credentialId: null, policyId: policy.id, groupName: null, tags: [], defaultDirectory: null, enabled: true, aiAccessEnabled: false });
+    const target = db.createHost({ name: "target", hostname: "target.internal", port: 22, username: "deploy", credentialId: null, jumpHostId: jump.id, policyId: policy.id, groupName: null, tags: [], defaultDirectory: null, enabled: true, aiAccessEnabled: true });
+
+    expect(target).toMatchObject({ jumpHostId: jump.id });
+    expect(() => db.updateHost(jump.id, { jumpHostId: jump.id })).toThrowError(expect.objectContaining({ code: "JUMP_HOST_CYCLE" }));
+    expect(() => db.updateHost(jump.id, { jumpHostId: target.id })).toThrowError(expect.objectContaining({ code: "JUMP_HOST_CYCLE" }));
+    expect(() => db.deleteHost(jump.id)).toThrowError(expect.objectContaining({ code: "JUMP_HOST_IN_USE", details: { dependentHosts: [{ id: target.id, name: target.name }] } }));
+
+    const direct = db.updateHost(target.id, { jumpHostId: null });
+    expect(direct).toMatchObject({ jumpHostId: null, configRevision: target.configRevision + 1 });
+    expect(() => db.deleteHost(jump.id)).not.toThrow();
     db.close();
   });
   it("requires a host key to be observed before trust", async () => {

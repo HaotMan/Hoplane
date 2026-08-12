@@ -90,6 +90,7 @@ function buildFixtures(port: number) {
   const host: Host = {
     id: "11111111-1111-4111-8111-111111111111", name: "fake", hostname: "127.0.0.1", port,
     username: "haot", credentialId: "cred-1", activeLoginId: "login-1", policyId: null,
+    jumpHostId: null,
     groupName: null, tags: [], defaultDirectory: null, enabled: true, aiAccessEnabled: true, hostTransferEnabled: false,
     monitorOutputEnabled: false, proxyEnabled: false, proxyLocalHost: "127.0.0.1", proxyLocalPort: 7890, proxyRemotePort: 7890,
     configRevision: 1, createdAt: now, updatedAt: now

@@ -6,6 +6,7 @@ export const hostInputSchema = z.object({
   port: z.number().int().min(1).max(65535).default(22),
   username: z.string().trim().min(1).max(128),
   credentialId: z.string().uuid().nullable().optional(),
+  jumpHostId: z.string().uuid().nullable().default(null),
   policyId: z.string().uuid().nullable().optional(),
   groupName: z.string().trim().max(120).nullable().optional(),
   tags: z.array(z.string().trim().min(1).max(64)).max(32).default([]),

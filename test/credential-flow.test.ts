@@ -127,6 +127,20 @@ describe("host-owned credential flow", () => {
       });
       expect(backupLoginResponse.status).toBe(201);
       const backupLogin = await backupLoginResponse.json() as { id: string };
+      const backupReveal = await fetch(`${runtime.url}/v1/hosts/${host.id}/logins/${backupLogin.id}/credential/reveal`, {
+        method: "POST",
+        headers: { origin: runtime.url, "content-type": "application/json" },
+        body: JSON.stringify({ masterPassword: "correct horse battery staple" })
+      });
+      expect(backupReveal.status).toBe(200);
+      expect(await backupReveal.json()).toMatchObject({ secret: "observer-password", privateKey: null, expiresInSeconds: 30 });
+      const wrongHostReveal = await fetch(`${runtime.url}/v1/hosts/${keyHost.id}/logins/${backupLogin.id}/credential/reveal`, {
+        method: "POST",
+        headers: { origin: runtime.url, "content-type": "application/json" },
+        body: JSON.stringify({ masterPassword: "correct horse battery staple" })
+      });
+      expect(wrongHostReveal.status).toBe(404);
+      expect(await wrongHostReveal.json()).toMatchObject({ code: "HOST_LOGIN_NOT_FOUND" });
       const activated = await fetch(`${runtime.url}/v1/hosts/${host.id}/logins/${backupLogin.id}/activate`, {
         method: "POST", headers: authorizedHeaders
       });

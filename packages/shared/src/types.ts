@@ -59,6 +59,7 @@ export interface Host {
   username: string;
   credentialId: string | null;
   activeLoginId: string | null;
+  jumpHostId: string | null;
   policyId: string | null;
   groupName: string | null;
   tags: string[];

@@ -5,6 +5,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { TerminalWindow } from "@phosphor-icons/react";
 import "@xterm/xterm/css/xterm.css";
+import { AppSelect } from "./app-select";
 import { Breadcrumb, PageHeader } from "./page-chrome";
 import type { Host, HostLogin } from "./types";
 
@@ -140,12 +141,7 @@ export function HostTerminalPage({ host, logins, onBack }: { host: Host; logins:
         <TerminalWindow size={18} aria-hidden="true" />
         <span>{connected && activeUsername ? `${activeUsername}@${host.hostname}:${host.port}` : `${host.hostname}:${host.port}`}</span>
         <div className="terminal-output-control interactive-terminal-controls">
-          <label className="terminal-login-picker">登录用户
-            <select aria-label="终端登录用户" value={loginId} disabled={connected || busy || logins.length === 0} onChange={(event) => setLoginId(event.target.value)}>
-              {logins.length === 0 && <option value="">暂无可用用户</option>}
-              {logins.map((login) => <option key={login.id} value={login.id}>{login.username}{login.active ? "（AI 当前）" : ""}</option>)}
-            </select>
-          </label>
+          <div className="terminal-login-picker"><span>登录用户</span><AppSelect ariaLabel="终端登录用户" value={loginId} disabled={connected || busy || logins.length === 0} onChange={setLoginId} options={logins.length === 0 ? [{ value: "", label: "暂无可用用户" }] : logins.map((login) => ({ value: login.id, label: `${login.username}${login.active ? "（AI 当前）" : ""}` }))} /></div>
           {connected || busy
             ? <button className="danger-button" disabled={busy} onClick={disconnect}>{busy ? "连接中…" : "断开连接"}</button>
             : <button className="primary" disabled={!loginId} onClick={() => connect(loginId)}>{connection === "IDLE" ? "连接" : "重新连接"}</button>}

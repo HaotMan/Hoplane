@@ -52,6 +52,7 @@ const MIGRATIONS = [
     proxy_local_host TEXT NOT NULL DEFAULT '127.0.0.1',
     proxy_local_port INTEGER NOT NULL DEFAULT 7890 CHECK(proxy_local_port BETWEEN 1 AND 65535),
     proxy_remote_port INTEGER NOT NULL DEFAULT 7890 CHECK(proxy_remote_port BETWEEN 1 AND 65535),
+    jump_host_id TEXT REFERENCES hosts(id) ON DELETE RESTRICT,
     config_revision INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -133,17 +134,19 @@ const AUDIT_PEER_HOST_MIGRATION = 11;
 const HOST_TRANSFER_ENABLED_MIGRATION = 12;
 const HOST_PROXY_MIGRATION = 13;
 const HOST_PROXY_ENDPOINT_MIGRATION = 14;
+const HOST_JUMP_MIGRATION = 15;
 export const POLICY_TEMPLATE_CONSOLIDATION_CLEANUP_SETTING = "policy.v3TemplateConsolidationCleanup";
 const LEGACY_READONLY_TEMPLATE_NAMES = new Set(["Docker 排障（只读）", "Kubernetes 排障（只读）"]);
 const LEGACY_OPERATIONS_TEMPLATE_NAMES = new Set(["Docker 运维（受限）", "Kubernetes 应用运维（受限）"]);
 
-type CreateHostInput = Omit<Host, "id" | "createdAt" | "updatedAt" | "configRevision" | "status" | "proxyState" | "monitorOutputEnabled" | "hostTransferEnabled" | "proxyEnabled" | "proxyLocalHost" | "proxyLocalPort" | "proxyRemotePort" | "activeLoginId"> & {
+type CreateHostInput = Omit<Host, "id" | "createdAt" | "updatedAt" | "configRevision" | "status" | "proxyState" | "monitorOutputEnabled" | "hostTransferEnabled" | "proxyEnabled" | "proxyLocalHost" | "proxyLocalPort" | "proxyRemotePort" | "activeLoginId" | "jumpHostId"> & {
   monitorOutputEnabled?: boolean;
   hostTransferEnabled?: boolean;
   proxyEnabled?: boolean;
   proxyLocalHost?: string;
   proxyLocalPort?: number;
   proxyRemotePort?: number;
+  jumpHostId?: string | null;
   activeLoginId?: string | null;
   sudoEnabled?: boolean;
 };
@@ -367,6 +370,18 @@ export class HoplaneDatabase {
         throw error;
       }
     }
+    const hostJumpColumns = new Set((this.db.prepare("PRAGMA table_info(hosts)").all() as Row[]).map((row) => String(row.name)));
+    if (!applied.has(HOST_JUMP_MIGRATION) || !hostJumpColumns.has("jump_host_id")) {
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        if (!hostJumpColumns.has("jump_host_id")) this.db.exec("ALTER TABLE hosts ADD COLUMN jump_host_id TEXT REFERENCES hosts(id) ON DELETE RESTRICT");
+        this.db.prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(HOST_JUMP_MIGRATION, now());
+        this.db.exec("COMMIT");
+      } catch (error) {
+        this.db.exec("ROLLBACK");
+        throw error;
+      }
+    }
     return resetToV2;
   }
 
@@ -474,10 +489,11 @@ export class HoplaneDatabase {
   createHost(input: CreateHostInput): Host {
     const id = randomUUID();
     const timestamp = now();
+    this.assertValidJumpHost(id, input.jumpHostId ?? null);
     this.db.prepare(`INSERT INTO hosts
-      (id,name,hostname,port,username,credential_id,active_login_id,policy_id,group_name,tags_json,default_directory,enabled,ai_access_enabled,host_transfer_enabled,monitor_output_enabled,proxy_enabled,proxy_local_host,proxy_local_port,proxy_remote_port,config_revision,created_at,updated_at)
-      VALUES (?,?,?,?,?,?,NULL,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)`).run(
-      id, input.name, input.hostname, input.port, input.username, input.credentialId, input.policyId,
+      (id,name,hostname,port,username,credential_id,active_login_id,jump_host_id,policy_id,group_name,tags_json,default_directory,enabled,ai_access_enabled,host_transfer_enabled,monitor_output_enabled,proxy_enabled,proxy_local_host,proxy_local_port,proxy_remote_port,config_revision,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)`).run(
+      id, input.name, input.hostname, input.port, input.username, input.credentialId, input.jumpHostId ?? null, input.policyId,
       input.groupName, JSON.stringify(input.tags), input.defaultDirectory, bool(input.enabled), bool(input.aiAccessEnabled), bool(input.hostTransferEnabled ?? false), bool(input.monitorOutputEnabled ?? false),
       bool(input.proxyEnabled ?? false), input.proxyLocalHost ?? "127.0.0.1", input.proxyLocalPort ?? 7890, input.proxyRemotePort ?? 7890, timestamp, timestamp
     );
@@ -489,9 +505,10 @@ export class HoplaneDatabase {
   updateHost(id: string, patch: Partial<Omit<Host, "id" | "createdAt" | "updatedAt" | "configRevision" | "status">>): Host {
     const current = this.requireHost(id);
     const next = { ...current, ...patch, id: current.id };
-    const connectionChanged = current.hostname !== next.hostname || current.port !== next.port || current.username !== next.username || current.credentialId !== next.credentialId;
-    this.db.prepare(`UPDATE hosts SET name=?,hostname=?,port=?,username=?,credential_id=?,active_login_id=?,policy_id=?,group_name=?,tags_json=?,default_directory=?,enabled=?,ai_access_enabled=?,host_transfer_enabled=?,monitor_output_enabled=?,proxy_enabled=?,proxy_local_host=?,proxy_local_port=?,proxy_remote_port=?,config_revision=config_revision+?,updated_at=? WHERE id=?`).run(
-      next.name, next.hostname, next.port, next.username, next.credentialId, next.activeLoginId, next.policyId, next.groupName,
+    this.assertValidJumpHost(id, next.jumpHostId);
+    const connectionChanged = current.hostname !== next.hostname || current.port !== next.port || current.username !== next.username || current.credentialId !== next.credentialId || current.jumpHostId !== next.jumpHostId;
+    this.db.prepare(`UPDATE hosts SET name=?,hostname=?,port=?,username=?,credential_id=?,active_login_id=?,jump_host_id=?,policy_id=?,group_name=?,tags_json=?,default_directory=?,enabled=?,ai_access_enabled=?,host_transfer_enabled=?,monitor_output_enabled=?,proxy_enabled=?,proxy_local_host=?,proxy_local_port=?,proxy_remote_port=?,config_revision=config_revision+?,updated_at=? WHERE id=?`).run(
+      next.name, next.hostname, next.port, next.username, next.credentialId, next.activeLoginId, next.jumpHostId, next.policyId, next.groupName,
       JSON.stringify(next.tags), next.defaultDirectory, bool(next.enabled), bool(next.aiAccessEnabled), bool(next.hostTransferEnabled), bool(next.monitorOutputEnabled),
       bool(next.proxyEnabled), next.proxyLocalHost, next.proxyLocalPort, next.proxyRemotePort, connectionChanged ? 1 : 0, now(), id
     );
@@ -503,14 +520,39 @@ export class HoplaneDatabase {
   }
 
   deleteHost(id: string): void {
+    this.assertHostDeletable(id);
     const result = this.db.prepare("DELETE FROM hosts WHERE id = ?").run(id);
     if (result.changes === 0) throw new AppError("HOST_NOT_FOUND", "Host not found", false, undefined, undefined, 404);
+  }
+
+  assertHostDeletable(id: string): void {
+    const dependents = this.db.prepare("SELECT id,name FROM hosts WHERE jump_host_id=? ORDER BY name").all(id) as Row[];
+    if (dependents.length > 0) {
+      throw new AppError("JUMP_HOST_IN_USE", "Host is still configured as a jump host", false, undefined, {
+        dependentHosts: dependents.map((row) => ({ id: String(row.id), name: String(row.name) }))
+      }, 409);
+    }
   }
 
   private requireHost(id: string): Host {
     const host = this.getHost(id);
     if (!host) throw new AppError("HOST_NOT_FOUND", "Host not found", false, undefined, undefined, 404);
     return host;
+  }
+
+  private assertValidJumpHost(hostId: string, jumpHostId: string | null): void {
+    if (!jumpHostId) return;
+    const visited = new Set<string>();
+    let currentId: string | null = jumpHostId;
+    while (currentId) {
+      if (currentId === hostId || visited.has(currentId)) {
+        throw new AppError("JUMP_HOST_CYCLE", "Jump host configuration contains a cycle", false, undefined, { hostId, jumpHostId }, 409);
+      }
+      visited.add(currentId);
+      const current = this.getHost(currentId);
+      if (!current) throw new AppError("JUMP_HOST_NOT_FOUND", "Configured jump host does not exist", false, undefined, { jumpHostId: currentId }, 409);
+      currentId = current.jumpHostId;
+    }
   }
 
   listHostLogins(hostId?: string): HostLogin[] {
@@ -779,7 +821,7 @@ function bool(value: boolean): number { return value ? 1 : 0; }
 function mapHost(row: Row): Host {
   return {
     id: String(row.id), name: String(row.name), hostname: String(row.hostname), port: Number(row.port), username: String(row.username),
-    credentialId: nullable(row.credential_id), activeLoginId: nullable(row.active_login_id), policyId: nullable(row.policy_id), groupName: nullable(row.group_name),
+    credentialId: nullable(row.credential_id), activeLoginId: nullable(row.active_login_id), jumpHostId: nullable(row.jump_host_id), policyId: nullable(row.policy_id), groupName: nullable(row.group_name),
     tags: JSON.parse(String(row.tags_json)) as string[], defaultDirectory: nullable(row.default_directory),
     enabled: Boolean(row.enabled), aiAccessEnabled: Boolean(row.ai_access_enabled), hostTransferEnabled: Boolean(row.host_transfer_enabled), monitorOutputEnabled: Boolean(row.monitor_output_enabled),
     proxyEnabled: Boolean(row.proxy_enabled), proxyLocalHost: String(row.proxy_local_host), proxyLocalPort: Number(row.proxy_local_port), proxyRemotePort: Number(row.proxy_remote_port), configRevision: Number(row.config_revision),

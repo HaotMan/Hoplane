@@ -1,6 +1,7 @@
 export interface Host {
   id: string; name: string; hostname: string; port: number; username: string; credentialId: string | null; policyId: string | null;
   activeLoginId: string | null;
+  jumpHostId: string | null;
   groupName: string | null; tags: string[]; defaultDirectory: string | null; enabled: boolean; aiAccessEnabled: boolean; hostTransferEnabled: boolean; monitorOutputEnabled: boolean;
   proxyEnabled: boolean; proxyLocalHost: string; proxyLocalPort: number; proxyRemotePort: number; status: string;
   proxyState?: { status: "DISABLED" | "WAITING_FOR_VAULT" | "CONNECTING" | "ACTIVE" | "RETRYING" | "LOCAL_PROXY_UNAVAILABLE" | "FAILED"; errorCode?: string; errorMessage?: string };
