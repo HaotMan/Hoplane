@@ -274,6 +274,7 @@ async function routeApi(request: IncomingMessage, response: ServerResponse, url:
     return json(response, 200, state);
   }
   if (method === "POST" && url.pathname === "/v1/vault/lock") {
+    terminalGateway.disconnectAll();
     await ssh.closeAll();
     monitor.clearAllOutput();
     const state = await vault.lockLocal();

@@ -17,6 +17,7 @@ interface TerminalGatewayOptions {
 }
 
 export interface TerminalGateway {
+  disconnectAll(): void;
   closeAll(): void;
 }
 
@@ -153,6 +154,9 @@ export function attachTerminalGateway(server: Server, options: TerminalGatewayOp
   }
 
   return {
+    disconnectAll() {
+      for (const client of wss.clients) client.terminate();
+    },
     closeAll() {
       for (const client of wss.clients) client.terminate();
       wss.close();

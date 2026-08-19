@@ -23,13 +23,14 @@ import { parseDocument, stringify } from "yaml";
 import { api, ApiError, patch, post, put, remove } from "./api";
 import { AppCombobox, AppSelect } from "./app-select";
 import { groupHosts, selectedHostCopyText } from "./host-list";
-import { HostTerminalPage } from "./host-terminal";
+import { TerminalWorkspace, type TerminalOpenRequest } from "./host-terminal";
 import { Breadcrumb, PageHeader } from "./page-chrome";
 import type { AuditLog, Credential, Host, HostLogin, HostMonitorEvent, Policy, PolicyCommandRule, PolicyDocument, RevealedCredential } from "./types";
 
-type Page = "hosts" | "policies" | "audit" | "settings";
+type Page = "hosts" | "terminal" | "policies" | "audit" | "settings";
 type ThemePreference = "system" | "dark" | "light";
 type IntegrationChannel = "codex" | "cursor" | "claude-code" | "workbuddy" | "other";
+type HostTestOutcome = "ok" | "error";
 const JSON_AGENT_NAMES = { cursor: "Cursor", "claude-code": "Claude Code", workbuddy: "WorkBuddy" } as const;
 type JsonAgentChannel = keyof typeof JSON_AGENT_NAMES;
 function agentStateKey(agent: JsonAgentChannel): "cursor" | "claudeCode" | "workbuddy" {
@@ -39,12 +40,15 @@ interface VaultState { localInitialized: boolean; unlocked: boolean }
 const THEME_STORAGE_KEY = "hoplane.theme";
 const pages: Array<{ id: Page; label: string }> = [
   { id: "hosts", label: "主机" },
+  { id: "terminal", label: "终端" },
   { id: "policies", label: "策略" }, { id: "audit", label: "审计" },
   { id: "settings", label: "接入" }
 ];
 
 export function App() {
   const [page, setPage] = useState<Page>("hosts");
+  const [terminalOpenRequest, setTerminalOpenRequest] = useState<TerminalOpenRequest | null>(null);
+  const terminalRequestId = useRef(0);
   const [themePreference, setThemePreference] = useState<ThemePreference>(() => {
     const saved = window.localStorage.getItem(THEME_STORAGE_KEY);
     return saved === "system" || saved === "dark" || saved === "light" ? saved : "system";
@@ -65,6 +69,10 @@ export function App() {
     document.documentElement.dataset.themePreference = themePreference;
   }, [themePreference, systemDark]);
   useEffect(() => { void api<VaultState>("/v1/vault-settings").then(setVaultState).catch((error) => notify("error", message(error))); }, [notify]);
+  const openTerminal = useCallback((hostId: string) => {
+    setTerminalOpenRequest({ id: ++terminalRequestId.current, hostId });
+    setPage("terminal");
+  }, []);
   return <div className="app-shell">
     <header className="topbar">
       <button type="button" className="brand" onClick={() => setPage("hosts")} aria-label="返回主机页面">Hoplane</button>
@@ -74,11 +82,12 @@ export function App() {
         <ThemeCycleButton value={themePreference} onChange={setThemePreference} />
       </div>
     </header>
-    <main>
-      {page === "hosts" && <HostsPage notify={notify} />}
+    <main className={page === "terminal" ? "terminal-main" : undefined}>
+      {page === "hosts" && <HostsPage notify={notify} onOpenTerminal={openTerminal} />}
       {page === "policies" && <PoliciesPage notify={notify} />}
       {page === "audit" && <AuditPage notify={notify} />}
       {page === "settings" && <SettingsPage notify={notify} vaultState={vaultState} onVaultChanged={setVaultState} />}
+      <div className="terminal-workspace-mount" hidden={page !== "terminal"}><TerminalWorkspace active={page === "terminal"} openRequest={terminalOpenRequest} notify={notify} /></div>
     </main>
     {vaultState && !vaultState.unlocked && <VaultGate state={vaultState} notify={notify} onReady={setVaultState} />}
     {notice && <div className={`toast ${notice.kind}`}>{notice.text}</div>}
@@ -95,15 +104,17 @@ function ThemeCycleButton({ value, onChange }: { value: ThemePreference; onChang
   </button>;
 }
 
-function HostsPage({ notify }: { notify: Notify }) {
+function HostsPage({ notify, onOpenTerminal }: { notify: Notify; onOpenTerminal(hostId: string): void }) {
   const [hosts, setHosts] = useState<Host[]>([]);
   const [hostLogins, setHostLogins] = useState<HostLogin[]>([]);
   const [credentials, setCredentials] = useState<Credential[]>([]);
   const [policies, setPolicies] = useState<Policy[]>([]);
   const [editing, setEditing] = useState<Host | "new" | null>(null);
   const [monitorHostId, setMonitorHostId] = useState<string | null>(null);
-  const [terminalHostId, setTerminalHostId] = useState<string | null>(null);
-  const [testingHostId, setTestingHostId] = useState<string | null>(null);
+  const [testingHostIds, setTestingHostIds] = useState<Set<string>>(() => new Set());
+  const testingHostIdsRef = useRef<Set<string>>(new Set());
+  const [testingAll, setTestingAll] = useState(false);
+  const testingAllRef = useRef(false);
   const [updatingHostId, setUpdatingHostId] = useState<string | null>(null);
   const [proxyConfiguringHost, setProxyConfiguringHost] = useState<Host | null>(null);
   const [deletingHost, setDeletingHost] = useState<Host | null>(null);
@@ -164,37 +175,84 @@ function HostsPage({ notify }: { notify: Notify }) {
     } catch { notify("error", "无法写入剪贴板，请检查系统剪贴板权限"); }
   }
 
-  async function test(host: Host) {
-    if (testingHostId) return;
-    setTestingHostId(host.id);
+  function beginHostTest(hostId: string): boolean {
+    if (testingHostIdsRef.current.has(hostId)) return false;
+    const next = new Set(testingHostIdsRef.current);
+    next.add(hostId);
+    testingHostIdsRef.current = next;
+    setTestingHostIds(next);
+    return true;
+  }
+  function finishHostTest(hostId: string) {
+    const next = new Set(testingHostIdsRef.current);
+    next.delete(hostId);
+    testingHostIdsRef.current = next;
+    setTestingHostIds(next);
+  }
+  async function runHostTest(host: Host, showNotification: boolean): Promise<HostTestOutcome | null> {
+    if (!beginHostTest(host.id)) return null;
     setTestResults(current => ({ ...current, [host.id]: { kind: "pending", text: "正在连接…" } }));
     try {
       const result = await post<{ durationMs: number }>(`/v1/hosts/${host.id}/test`, { clientType: "UI", clientId: "desktop" });
       setTestResults(current => ({ ...current, [host.id]: { kind: "ok", text: `连接成功 · ${result.durationMs} ms` } }));
-      notify("ok", `${host.name} 连接成功（${result.durationMs} ms）`);
-      await load();
+      if (showNotification) notify("ok", `${host.name} 连接成功（${result.durationMs} ms）`);
+      return "ok";
     }
     catch (error) {
+      let finalError = error;
       if (error instanceof ApiError && (error.code === "SSH_HOST_KEY_UNTRUSTED" || error.code === "SSH_HOST_KEY_CHANGED")) {
         const fingerprint = String(error.details?.observedFingerprint ?? "");
         const fingerprintHostId = String(error.details?.hostId ?? host.id);
         const fingerprintHostName = String(error.details?.hostName ?? host.name);
         const warning = error.code === "SSH_HOST_KEY_CHANGED" ? "警告：主机指纹发生变化。确认服务器已合法更换密钥后才能继续。" : "首次连接需要信任主机指纹。";
         if (fingerprint && window.confirm(`${warning}\n\n主机：${fingerprintHostName}\nSHA256: ${fingerprint}\n\n是否信任？`)) {
-          await post(`/v1/hosts/${fingerprintHostId}/trust-key`, { fingerprint });
-          setTestResults(current => ({ ...current, [host.id]: { kind: "pending", text: "指纹已信任，正在重试…" } }));
-          const result = await post<{ durationMs: number }>(`/v1/hosts/${host.id}/test`, { clientType: "UI", clientId: "desktop" });
-          setTestResults(current => ({ ...current, [host.id]: { kind: "ok", text: `连接成功 · ${result.durationMs} ms` } }));
-          notify("ok", `${host.name} 指纹已信任，连接成功（${result.durationMs} ms）`);
-          await load();
-          return;
+          try {
+            await post(`/v1/hosts/${fingerprintHostId}/trust-key`, { fingerprint });
+            setTestResults(current => ({ ...current, [host.id]: { kind: "pending", text: "指纹已信任，正在重试…" } }));
+            const result = await post<{ durationMs: number }>(`/v1/hosts/${host.id}/test`, { clientType: "UI", clientId: "desktop" });
+            setTestResults(current => ({ ...current, [host.id]: { kind: "ok", text: `连接成功 · ${result.durationMs} ms` } }));
+            if (showNotification) notify("ok", `${host.name} 指纹已信任，连接成功（${result.durationMs} ms）`);
+            return "ok";
+          } catch (retryError) {
+            finalError = retryError;
+          }
         }
       }
-      const text = friendlyConnectionError(error);
+      const text = friendlyConnectionError(finalError);
       setTestResults(current => ({ ...current, [host.id]: { kind: "error", text } }));
-      notify("error", `${host.name}：${text}`);
+      if (showNotification) notify("error", `${host.name}：${text}`);
+      return "error";
     } finally {
-      setTestingHostId(null);
+      finishHostTest(host.id);
+    }
+  }
+  async function test(host: Host): Promise<void> {
+    if (testingAllRef.current) return;
+    const outcome = await runHostTest(host, true);
+    if (outcome) await load();
+  }
+  async function testAllHosts(): Promise<void> {
+    if (testingAllRef.current) return;
+    if (testingHostIdsRef.current.size > 0) {
+      notify("error", "请等待当前连接测试完成后再测试全部主机");
+      return;
+    }
+    const candidates = hosts.filter((host) => host.enabled && !testingHostIdsRef.current.has(host.id));
+    if (candidates.length === 0) {
+      notify("error", hosts.some((host) => host.enabled) ? "所有已启用主机都正在测试" : "没有可测试的已启用主机");
+      return;
+    }
+    testingAllRef.current = true;
+    setTestingAll(true);
+    try {
+      const outcomes = await Promise.all(candidates.map((host) => runHostTest(host, false)));
+      const succeeded = outcomes.filter((outcome) => outcome === "ok").length;
+      const failed = outcomes.filter((outcome) => outcome === "error").length;
+      await load();
+      notify(failed === 0 ? "ok" : "error", `全部测试完成：${succeeded} 台成功${failed > 0 ? `，${failed} 台失败` : ""}`);
+    } finally {
+      testingAllRef.current = false;
+      setTestingAll(false);
     }
   }
   async function toggleHost(host: Host) {
@@ -334,8 +392,6 @@ function HostsPage({ notify }: { notify: Notify }) {
   }
   const monitoredHost = monitorHostId ? hosts.find((host) => host.id === monitorHostId) : undefined;
   if (monitorHostId && monitoredHost) return <HostMonitorPage host={monitoredHost} onBack={() => setMonitorHostId(null)} onHostChanged={load} notify={notify} />;
-  const terminalHost = terminalHostId ? hosts.find((host) => host.id === terminalHostId) : undefined;
-  if (terminalHostId && terminalHost) return <HostTerminalPage key={terminalHost.id} host={terminalHost} logins={hostLogins.filter((login) => login.hostId === terminalHost.id)} onBack={() => setTerminalHostId(null)} />;
   const normalizedQuery = query.trim().toLocaleLowerCase("zh-CN");
   const filteredHosts = hosts.filter((host) => {
     const activeLogin = hostLogins.find((login) => login.hostId === host.id && login.id === host.activeLoginId);
@@ -360,7 +416,8 @@ function HostsPage({ notify }: { notify: Notify }) {
   const tags = [...new Set(hosts.flatMap((host) => host.tags))].sort((left, right) => left.localeCompare(right, "zh-CN"));
   const connectedCount = hosts.filter((host) => host.status === "CONNECTED").length;
   const aiAllowedCount = hosts.filter((host) => host.enabled && host.aiAccessEnabled).length;
-  return <section><PageHeader title="SSH 主机"><button className="primary" onClick={() => setEditing("new")}>添加主机</button></PageHeader>
+  const enabledHostCount = hosts.filter((host) => host.enabled).length;
+  return <section><PageHeader title="SSH 主机"><div className="header-actions"><button className="test-all-button" title={testingHostIds.size > 0 && !testingAll ? "请等待当前连接测试完成" : "并发测试全部已启用主机"} disabled={enabledHostCount === 0 || testingAll || testingHostIds.size > 0} onClick={() => void testAllHosts()}><ArrowClockwise className={testingAll ? "testing-icon" : ""} size={17} aria-hidden="true" />{testingAll ? "全部测试中…" : "全部测试"}</button><button className="primary" onClick={() => setEditing("new")}>添加主机</button></div></PageHeader>
     <p className="host-summary">{hosts.length} 台主机，{connectedCount} 台已连接，{aiAllowedCount} 台允许 AI 访问 · 数据仅保存在本地 Core。</p>
     <div className="host-filter-bar" aria-label="主机筛选">
       <label className="host-search"><MagnifyingGlass size={19} weight="regular" aria-hidden="true" /><span className="sr-only">搜索主机</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索主机、地址或用户" /></label>
@@ -378,7 +435,7 @@ function HostsPage({ notify }: { notify: Notify }) {
         const selectedInGroup = groupIds.filter((id) => selectedHostIds.has(id)).length;
         const groupSelected = selectedInGroup === group.hosts.length;
         const collapsed = collapsedGroups.has(group.key);
-        return <GroupRows key={group.key} groupName={group.name} ungrouped={group.ungrouped} hosts={group.hosts} allHosts={hosts} hostLogins={hostLogins} collapsed={collapsed} selectionMode={multiSelectMode} selectedIds={selectedHostIds} groupSelected={groupSelected} groupIndeterminate={selectedInGroup > 0 && !groupSelected} policies={policies} testResults={testResults} testingHostId={testingHostId} updatingHostId={updatingHostId} renaming={groupRename?.original === group.name} renameValue={groupRename?.original === group.name ? groupRename.value : group.name} renameBusy={groupRename?.original === group.name && groupRename.busy} onToggleGroup={() => toggleGroup(group.key)} onStartRename={() => setGroupRename({ original: group.name, value: group.name, busy: false })} onRenameValueChange={(value) => setGroupRename((current) => current?.original === group.name ? { ...current, value } : current)} onCommitRename={() => void commitGroupRename()} onCancelRename={() => setGroupRename(null)} onSelectGroup={(selected) => selectHosts(groupIds, selected)} onSelectHost={selectHost} onActivateLogin={activateLogin} onChangeJumpHost={changeJumpHost} onChangePolicy={changePolicy} onToggleSudo={toggleSudo} onToggleHostTransfer={toggleHostTransfer} onToggleProxy={toggleProxy} onOpenTerminal={setTerminalHostId} onMonitor={setMonitorHostId} onTest={test} onToggleHost={toggleHost} onEdit={setEditing} onDelete={setDeletingHost} />;
+        return <GroupRows key={group.key} groupName={group.name} ungrouped={group.ungrouped} hosts={group.hosts} allHosts={hosts} hostLogins={hostLogins} collapsed={collapsed} selectionMode={multiSelectMode} selectedIds={selectedHostIds} groupSelected={groupSelected} groupIndeterminate={selectedInGroup > 0 && !groupSelected} policies={policies} testResults={testResults} testingHostIds={testingHostIds} testingAll={testingAll} updatingHostId={updatingHostId} renaming={groupRename?.original === group.name} renameValue={groupRename?.original === group.name ? groupRename.value : group.name} renameBusy={groupRename?.original === group.name && groupRename.busy} onToggleGroup={() => toggleGroup(group.key)} onStartRename={() => setGroupRename({ original: group.name, value: group.name, busy: false })} onRenameValueChange={(value) => setGroupRename((current) => current?.original === group.name ? { ...current, value } : current)} onCommitRename={() => void commitGroupRename()} onCancelRename={() => setGroupRename(null)} onSelectGroup={(selected) => selectHosts(groupIds, selected)} onSelectHost={selectHost} onActivateLogin={activateLogin} onChangeJumpHost={changeJumpHost} onChangePolicy={changePolicy} onToggleSudo={toggleSudo} onToggleHostTransfer={toggleHostTransfer} onToggleProxy={toggleProxy} onOpenTerminal={onOpenTerminal} onMonitor={setMonitorHostId} onTest={test} onToggleHost={toggleHost} onEdit={setEditing} onDelete={setDeletingHost} />;
       })}</tbody></table>{hosts.length === 0 ? <Empty text="还没有主机。添加主机时可以直接填写密码、私钥或 SSH Agent。" /> : filteredHosts.length === 0 && <Empty text="没有符合当前筛选条件的主机。" />}</div>
     {editing && <HostDialog host={editing === "new" ? null : editing} hosts={hosts} credentials={credentials} policies={policies} groupNames={existingGroupNames} onAccountsChanged={load} onClose={() => setEditing(null)} onSaved={async (saved, created) => {
       setEditing(null);
@@ -391,7 +448,7 @@ function HostsPage({ notify }: { notify: Notify }) {
   </section>;
 }
 
-function GroupRows({ groupName, ungrouped, hosts, allHosts, hostLogins, collapsed, selectionMode, selectedIds, groupSelected, groupIndeterminate, policies, testResults, testingHostId, updatingHostId, renaming, renameValue, renameBusy, onToggleGroup, onStartRename, onRenameValueChange, onCommitRename, onCancelRename, onSelectGroup, onSelectHost, onActivateLogin, onChangeJumpHost, onChangePolicy, onToggleSudo, onToggleHostTransfer, onToggleProxy, onOpenTerminal, onMonitor, onTest, onToggleHost, onEdit, onDelete }: { groupName: string; ungrouped: boolean; hosts: Host[]; allHosts: Host[]; hostLogins: HostLogin[]; collapsed: boolean; selectionMode: boolean; selectedIds: ReadonlySet<string>; groupSelected: boolean; groupIndeterminate: boolean; policies: Policy[]; testResults: Record<string, { kind: "ok" | "error" | "pending"; text: string }>; testingHostId: string | null; updatingHostId: string | null; renaming: boolean; renameValue: string; renameBusy: boolean; onToggleGroup(): void; onStartRename(): void; onRenameValueChange(value: string): void; onCommitRename(): void; onCancelRename(): void; onSelectGroup(selected: boolean): void; onSelectHost(hostId: string, selected: boolean): void; onActivateLogin(host: Host, loginId: string): Promise<void>; onChangeJumpHost(host: Host, jumpHostId: string): Promise<void>; onChangePolicy(host: Host, policyId: string): Promise<void>; onToggleSudo(host: Host, login: HostLogin): Promise<void>; onToggleHostTransfer(host: Host): Promise<void>; onToggleProxy(host: Host): Promise<void>; onOpenTerminal(hostId: string): void; onMonitor(hostId: string): void; onTest(host: Host): Promise<void>; onToggleHost(host: Host): Promise<void>; onEdit(host: Host): void; onDelete(host: Host): void }) {
+function GroupRows({ groupName, ungrouped, hosts, allHosts, hostLogins, collapsed, selectionMode, selectedIds, groupSelected, groupIndeterminate, policies, testResults, testingHostIds, testingAll, updatingHostId, renaming, renameValue, renameBusy, onToggleGroup, onStartRename, onRenameValueChange, onCommitRename, onCancelRename, onSelectGroup, onSelectHost, onActivateLogin, onChangeJumpHost, onChangePolicy, onToggleSudo, onToggleHostTransfer, onToggleProxy, onOpenTerminal, onMonitor, onTest, onToggleHost, onEdit, onDelete }: { groupName: string; ungrouped: boolean; hosts: Host[]; allHosts: Host[]; hostLogins: HostLogin[]; collapsed: boolean; selectionMode: boolean; selectedIds: ReadonlySet<string>; groupSelected: boolean; groupIndeterminate: boolean; policies: Policy[]; testResults: Record<string, { kind: "ok" | "error" | "pending"; text: string }>; testingHostIds: ReadonlySet<string>; testingAll: boolean; updatingHostId: string | null; renaming: boolean; renameValue: string; renameBusy: boolean; onToggleGroup(): void; onStartRename(): void; onRenameValueChange(value: string): void; onCommitRename(): void; onCancelRename(): void; onSelectGroup(selected: boolean): void; onSelectHost(hostId: string, selected: boolean): void; onActivateLogin(host: Host, loginId: string): Promise<void>; onChangeJumpHost(host: Host, jumpHostId: string): Promise<void>; onChangePolicy(host: Host, policyId: string): Promise<void>; onToggleSudo(host: Host, login: HostLogin): Promise<void>; onToggleHostTransfer(host: Host): Promise<void>; onToggleProxy(host: Host): Promise<void>; onOpenTerminal(hostId: string): void; onMonitor(hostId: string): void; onTest(host: Host): Promise<void>; onToggleHost(host: Host): Promise<void>; onEdit(host: Host): void; onDelete(host: Host): void }) {
   return <>
     <tr className="host-group-row">{selectionMode && <td className="host-select-cell"><SelectionCheckbox label={`选择${groupName}中的全部主机`} checked={groupSelected} indeterminate={groupIndeterminate} onChange={onSelectGroup} /></td>}<td colSpan={7}><div className="host-group-line"><button className="host-group-toggle" aria-expanded={!collapsed} aria-label={`${collapsed ? "展开" : "收起"}分组 ${groupName}`} onClick={onToggleGroup}><CaretDown className={`host-group-caret ${collapsed ? "collapsed" : ""}`} size={17} weight="bold" aria-hidden="true" />{!renaming && <strong>{groupName}</strong>}</button>{renaming && <input className="host-group-rename-input" aria-label={`${groupName} 新名称`} value={renameValue} maxLength={120} autoFocus disabled={renameBusy} onFocus={(event) => event.currentTarget.select()} onChange={(event) => onRenameValueChange(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); onCommitRename(); } else if (event.key === "Escape") { event.preventDefault(); onCancelRename(); } }} />}{!ungrouped && !selectionMode && <button type="button" className={`host-group-rename ${renaming ? "confirm" : ""}`} title={renaming ? "确认重命名" : "重命名分组"} aria-label={renaming ? `确认将分组 ${groupName} 重命名` : `重命名分组 ${groupName}`} disabled={renameBusy} onClick={renaming ? onCommitRename : onStartRename}>{renaming ? <Check size={15} weight="bold" aria-hidden="true" /> : <PencilSimple size={14} aria-hidden="true" />}</button>}<span className="host-group-count">{hosts.length} 台</span>{selectionMode && hosts.some((host) => selectedIds.has(host.id)) && <em>{hosts.filter((host) => selectedIds.has(host.id)).length} 台已选</em>}</div></td></tr>
     {!collapsed && hosts.map((host) => {
@@ -401,12 +458,13 @@ function GroupRows({ groupName, ungrouped, hosts, allHosts, hostLogins, collapse
       const jumpHost = allHosts.find((candidate) => candidate.id === host.jumpHostId);
       const jumpHostCandidates = allHosts.filter((candidate) => candidate.id !== host.id && !wouldCreateJumpHostCycle(allHosts, host.id, candidate.id));
       const terminalLabel = host.enabled ? "打开终端" : "打开终端（主机已停用）";
-      const testLabel = testingHostId === host.id ? "测试中…" : "测试连接";
+      const hostTesting = testingHostIds.has(host.id);
+      const testLabel = hostTesting ? "测试中…" : testingAll ? "全部测试进行中…" : "测试连接";
       const toggleLabel = updatingHostId === host.id ? "处理中…" : host.enabled ? "停用主机" : "启用主机";
       return <tr key={host.id} className={`host-member-row ${selectedIds.has(host.id) ? "host-row-selected" : ""}`}>
           {selectionMode && <td className="host-select-cell"><SelectionCheckbox label={`选择主机 ${host.name}`} checked={selectedIds.has(host.id)} onChange={(selected) => onSelectHost(host.id, selected)} /></td>}
-          <td className="host-member-cell"><div className="host-member-main"><div className="host-name-text"><Desktop size={20} weight="regular" aria-hidden="true" /><span><strong>{host.name}</strong><small title={host.proxyState?.errorMessage}>{host.hostname}:{host.port}{jumpHost ? ` · 经 ${jumpHost.name}` : ""}{host.proxyEnabled ? ` · 代理 ${proxyStatusLabel(host.proxyState?.status)} · ${host.proxyLocalHost}:${host.proxyLocalPort}` : ""}</small></span></div><div className="host-row-switches" aria-label={`${host.name} 快捷开关`}><HostRowSwitch label="启用主机" checked={host.enabled} ariaLabel={`${host.name}：${toggleLabel}`} title={toggleLabel} disabled={testingHostId !== null || updatingHostId !== null} onClick={() => void onToggleHost(host)} />{activeLogin && activeLogin.username !== "root" && <HostRowSwitch label="启用sudo" checked={activeLogin.sudoEnabled} ariaLabel={`${activeLogin.username} 的 sudo 权限`} title={activeLogin.sudoEnabled ? `点击禁止 ${activeLogin.username} 使用 sudo` : `点击允许 ${activeLogin.username} 使用 sudo`} disabled={updatingHostId !== null} onClick={() => void onToggleSudo(host, activeLogin)} />}<HostRowSwitch label="文件传输通道" checked={host.hostTransferEnabled} ariaLabel={`${host.name} 的文件传输`} title={host.hostTransferEnabled ? "关闭主机间文件传输" : "允许主机间文件传输"} disabled={updatingHostId !== null} onClick={() => void onToggleHostTransfer(host)} /><HostRowSwitch label="使用本机代理" checked={host.proxyEnabled} ariaLabel={`${host.name} 的本机代理`} title={host.proxyEnabled ? `关闭本机代理（${proxyStatusLabel(host.proxyState?.status)}${host.proxyState?.errorMessage ? `：${host.proxyState.errorMessage}` : ""}）` : "配置本机 SOCKS5 代理并开启反向隧道"} disabled={!host.enabled || updatingHostId !== null} onClick={() => void onToggleProxy(host)} /></div></div></td>
-          <td className="host-status-cell"><div className="host-status-line"><Status value={host.enabled ? host.status : "DISABLED"} /><button className="host-action-icon host-status-test" aria-label={`${host.name}：${testLabel}`} data-tooltip={testLabel} disabled={!host.enabled || testingHostId !== null || updatingHostId !== null} onClick={() => void onTest(host)}><ArrowClockwise size={16} aria-hidden="true" /></button></div>{testResults[host.id] && <small className={`test-result ${testResults[host.id]!.kind}`}>{testResults[host.id]!.text}</small>}</td>
+          <td className="host-member-cell"><div className="host-member-main"><div className="host-name-text"><Desktop size={20} weight="regular" aria-hidden="true" /><span><strong>{host.name}</strong><small title={host.proxyState?.errorMessage}>{host.hostname}:{host.port}{jumpHost ? ` · 经 ${jumpHost.name}` : ""}{host.proxyEnabled ? ` · 代理 ${proxyStatusLabel(host.proxyState?.status)} · ${host.proxyLocalHost}:${host.proxyLocalPort}` : ""}</small></span></div><div className="host-row-switches" aria-label={`${host.name} 快捷开关`}><HostRowSwitch label="启用主机" checked={host.enabled} ariaLabel={`${host.name}：${toggleLabel}`} title={toggleLabel} disabled={hostTesting || updatingHostId !== null} onClick={() => void onToggleHost(host)} />{activeLogin && activeLogin.username !== "root" && <HostRowSwitch label="启用sudo" checked={activeLogin.sudoEnabled} ariaLabel={`${activeLogin.username} 的 sudo 权限`} title={activeLogin.sudoEnabled ? `点击禁止 ${activeLogin.username} 使用 sudo` : `点击允许 ${activeLogin.username} 使用 sudo`} disabled={updatingHostId !== null} onClick={() => void onToggleSudo(host, activeLogin)} />}<HostRowSwitch label="文件传输通道" checked={host.hostTransferEnabled} ariaLabel={`${host.name} 的文件传输`} title={host.hostTransferEnabled ? "关闭主机间文件传输" : "允许主机间文件传输"} disabled={updatingHostId !== null} onClick={() => void onToggleHostTransfer(host)} /><HostRowSwitch label="使用本机代理" checked={host.proxyEnabled} ariaLabel={`${host.name} 的本机代理`} title={host.proxyEnabled ? `关闭本机代理（${proxyStatusLabel(host.proxyState?.status)}${host.proxyState?.errorMessage ? `：${host.proxyState.errorMessage}` : ""}）` : "配置本机 SOCKS5 代理并开启反向隧道"} disabled={!host.enabled || updatingHostId !== null} onClick={() => void onToggleProxy(host)} /></div></div></td>
+          <td className="host-status-cell"><div className="host-status-line"><Status value={host.enabled ? host.status : "DISABLED"} /><button className={`host-action-icon host-status-test ${hostTesting ? "testing" : ""}`} aria-label={`${host.name}：${testLabel}`} data-tooltip={testLabel} disabled={!host.enabled || hostTesting || testingAll || updatingHostId !== null} onClick={() => void onTest(host)}><ArrowClockwise size={16} aria-hidden="true" /></button></div>{testResults[host.id] && <small className={`test-result ${testResults[host.id]!.kind}`}>{testResults[host.id]!.text}</small>}</td>
           <td><span className={host.enabled && host.aiAccessEnabled ? "access-state allow" : "access-state"}>{host.enabled && host.aiAccessEnabled ? <CheckCircle size={17} weight="regular" /> : null}{!host.enabled ? "主机停用" : host.aiAccessEnabled ? "允许" : "未允许"}</span></td>
           <td className="host-user-cell"><AppSelect className="host-inline-select" prefix="SSH" title="切换 AI 使用的 SSH 登录用户" ariaLabel={`${host.name} 当前登录用户`} value={activeLoginAvailable ? host.activeLoginId! : ""} disabled={updatingHostId !== null || availableLogins.length === 0} onChange={(loginId) => void onActivateLogin(host, loginId)} options={[...(!activeLoginAvailable ? [{ value: "", label: availableLogins.length === 0 ? "暂无可用用户" : "请选择登录用户", disabled: true }] : []), ...availableLogins.map((login) => ({ value: login.id, label: login.username }))]} /></td>
           <td className="host-jump-cell"><AppSelect className="host-inline-select" prefix="跳板" title="切换连接该主机使用的跳板机" ariaLabel={`${host.name} 跳板机`} value={host.jumpHostId ?? ""} disabled={updatingHostId !== null} onChange={(jumpHostId) => void onChangeJumpHost(host, jumpHostId)} options={[{ value: "", label: "直连" }, ...jumpHostCandidates.map((candidate) => ({ value: candidate.id, label: `${candidate.name}${candidate.enabled ? "" : "（已停用）"}` }))]} /></td>
@@ -414,8 +472,8 @@ function GroupRows({ groupName, ungrouped, hosts, allHosts, hostLogins, collapse
           <td className="host-actions-column"><div className="host-inline-actions" aria-label={`${host.name} 操作`}>
             <button className="host-action-icon" aria-label={`${host.name}：${terminalLabel}`} data-tooltip={terminalLabel} disabled={!host.enabled} onClick={() => onOpenTerminal(host.id)}><TerminalWindow size={18} aria-hidden="true" /></button>
             <button className="host-action-icon" aria-label={`${host.name}：指令记录`} data-tooltip="指令记录" onClick={() => onMonitor(host.id)}><ClockCounterClockwise size={18} aria-hidden="true" /></button>
-            <button className="host-action-icon" aria-label={`${host.name}：编辑`} data-tooltip="编辑" disabled={testingHostId === host.id || updatingHostId === host.id} onClick={() => onEdit(host)}><PencilSimple size={18} aria-hidden="true" /></button>
-            <button className="host-action-icon danger-link" aria-label={`${host.name}：删除`} data-tooltip="删除" disabled={testingHostId === host.id || updatingHostId === host.id} onClick={() => onDelete(host)}><Trash size={18} aria-hidden="true" /></button>
+            <button className="host-action-icon" aria-label={`${host.name}：编辑`} data-tooltip="编辑" disabled={hostTesting || updatingHostId === host.id} onClick={() => onEdit(host)}><PencilSimple size={18} aria-hidden="true" /></button>
+            <button className="host-action-icon danger-link" aria-label={`${host.name}：删除`} data-tooltip="删除" disabled={hostTesting || updatingHostId === host.id} onClick={() => onDelete(host)}><Trash size={18} aria-hidden="true" /></button>
           </div></td>
         </tr>;
     })}
