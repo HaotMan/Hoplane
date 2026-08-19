@@ -120,6 +120,7 @@ main > section { min-width: 0; }
 .page-header { min-height: 50px; display: flex; align-items: flex-start; justify-content: space-between; gap: 28px; margin-bottom: 6px; }
 .page-header h1 { margin: 0; color: var(--text); font-size: clamp(28px, 3vw, 38px); line-height: 1.16; font-weight: 720; letter-spacing: -.035em; }
 .header-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+.header-actions button { display: inline-flex; align-items: center; gap: 7px; }
 .eyebrow { display: none; }
 
 button {
@@ -430,6 +431,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .filter { width: 170px; }
 
 .vault-setting { margin-top: 28px; padding: 20px 22px; display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+.vault-setting-actions button { display: inline-flex; align-items: center; gap: 6px; }
 .vault-setting h2, .setting h2, .mcp-hero h2, .codex-integration h2 { margin: 6px 0; color: var(--text); font-size: 18px; }
 .vault-setting p, .setting p, .mcp-hero p, .codex-integration p { margin: 0; color: var(--text-secondary); font-size: 12px; line-height: 1.6; }
 .vault-setting-actions { display: flex; align-items: center; gap: 8px; }

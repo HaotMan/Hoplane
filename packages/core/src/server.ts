@@ -22,6 +22,7 @@ import { McpServiceManager } from "./mcp-service.js";
 import { HostMonitor } from "./host-monitor.js";
 import { CodexIntegrationService, JsonAgentIntegrationService } from "./codex-integration.js";
 import { PolicySourceService } from "./policy-source.js";
+import { ConfigTransferService } from "./config-transfer.js";
 import { attachTerminalGateway } from "./terminal-service.js";
 
 const credentialBindingSchema = z.discriminatedUnion("mode", [
@@ -77,6 +78,19 @@ export async function computeUiBuildId(staticRoot: string): Promise<string | nul
   }
 }
 
+async function readPrivateKeyFile(path: string): Promise<string> {
+  const resolved = path === "~" ? homedir() : path.startsWith("~/") ? join(homedir(), path.slice(2)) : path;
+  try {
+    const file = await stat(resolved);
+    if (!file.isFile()) throw new Error("Not a regular file");
+    if (file.size > 1024 * 1024) throw new AppError("PRIVATE_KEY_TOO_LARGE", "Private key file exceeds 1 MiB", false, undefined, undefined, 413);
+    return await readFile(resolved, "utf8");
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    throw new AppError("PRIVATE_KEY_READ_FAILED", "Configured private key file could not be read", false, undefined, undefined, 409);
+  }
+}
+
 export async function startCore(options: { staticRoot?: string; registerProcessSignals?: boolean } = {}): Promise<CoreRuntime> {
 const config = loadConfig();
 await ensurePrivateDirectory(config.dataDir);
@@ -86,6 +100,7 @@ const policySources = new PolicySourceService(config, database);
 await policySources.initialize();
 database.interruptStaleOperations();
 const vault = new LocalCredentialVaultManager(config);
+const configTransfer = new ConfigTransferService(config, database, vault, policySources, readPrivateKeyFile);
 const ssh = new SSHConnectionManager(database, vault, config.outputLimitBytes);
 const monitor = new HostMonitor(500, vault.local);
 const operations = new OperationService(database, new PolicyService(), ssh, monitor);
@@ -280,6 +295,46 @@ async function routeApi(request: IncomingMessage, response: ServerResponse, url:
     const state = await vault.lockLocal();
     mcpService.clearTokenCache();
     return json(response, 200, state);
+  }
+  if (method === "POST" && url.pathname === "/v1/config/export") {
+    const input = z.object({ password: z.string().min(10).max(1024) }).parse(await body(request));
+    const auditId = randomUUID();
+    database.createAudit({
+      id: auditId, clientType: "UI", clientId: "desktop",
+      operationType: "EXPORT_CONFIG", requestSummary: "导出工作区配置"
+    });
+    try {
+      const result = await configTransfer.exportBundle(input.password);
+      database.updateAudit(auditId, { status: "SUCCEEDED", finished: true });
+      return json(response, 200, result);
+    } catch (error) {
+      const appError = asAppError(error, "CONFIG_EXPORT_FAILED");
+      database.updateAudit(auditId, { status: "FAILED", errorCode: appError.code, errorMessage: appError.message, finished: true });
+      throw error;
+    }
+  }
+  if (method === "POST" && url.pathname === "/v1/config/import") {
+    const input = z.object({
+      password: z.string().min(10).max(1024),
+      document: z.unknown()
+    }).parse(await body(request, 16 * 1024 * 1024));
+    const auditId = randomUUID();
+    database.createAudit({
+      id: auditId, clientType: "UI", clientId: "desktop",
+      operationType: "IMPORT_CONFIG", requestSummary: "导入工作区配置"
+    });
+    try {
+      const result = await configTransfer.importBundle(input.password, input.document);
+      for (const hostId of result.hostIds) await ssh.disconnect(hostId);
+      void ssh.reconcileConfiguredProxies();
+      database.updateAudit(auditId, { status: "SUCCEEDED", finished: true });
+      const { hostIds: _hostIds, ...publicResult } = result;
+      return json(response, 200, publicResult);
+    } catch (error) {
+      const appError = asAppError(error, "CONFIG_IMPORT_FAILED");
+      database.updateAudit(auditId, { status: "FAILED", errorCode: appError.code, errorMessage: appError.message, finished: true });
+      throw error;
+    }
   }
   if (method === "GET" && url.pathname === "/v1/mcp-settings") {
     return json(response, 200, await mcpService.getState());
@@ -714,13 +769,13 @@ function equalSecret(left: string, right: string): boolean {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
-async function body(request: IncomingMessage): Promise<unknown> {
+async function body(request: IncomingMessage, maxBytes = 1024 * 1024): Promise<unknown> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of request) {
     const value = Buffer.from(chunk as Uint8Array);
     size += value.length;
-    if (size > 1024 * 1024) throw new AppError("REQUEST_TOO_LARGE", "Request body exceeds 1 MiB", false, undefined, undefined, 413);
+    if (size > maxBytes) throw new AppError("REQUEST_TOO_LARGE", "Request body exceeds the allowed size", false, undefined, undefined, 413);
     chunks.push(value);
   }
   if (chunks.length === 0) throw new AppError("INVALID_ARGUMENT", "JSON request body is required");
@@ -778,19 +833,6 @@ function mime(extension: string): string {
 function publicCredential(credential: Credential): Omit<Credential, "secretRef" | "sudoSecretRef"> {
   const { secretRef: _secretRef, sudoSecretRef: _sudoSecretRef, ...value } = credential;
   return value;
-}
-
-async function readPrivateKeyFile(path: string): Promise<string> {
-  const resolved = path === "~" ? homedir() : path.startsWith("~/") ? join(homedir(), path.slice(2)) : path;
-  try {
-    const file = await stat(resolved);
-    if (!file.isFile()) throw new Error("Not a regular file");
-    if (file.size > 1024 * 1024) throw new AppError("PRIVATE_KEY_TOO_LARGE", "Private key file exceeds 1 MiB", false, undefined, undefined, 413);
-    return await readFile(resolved, "utf8");
-  } catch (error) {
-    if (error instanceof AppError) throw error;
-    throw new AppError("PRIVATE_KEY_READ_FAILED", "Configured private key file could not be read", false, undefined, undefined, 409);
-  }
 }
 
 return { url: `http://${config.host}:${config.port}`, server, close: shutdown };

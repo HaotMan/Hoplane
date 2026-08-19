@@ -647,6 +647,80 @@ export class HoplaneDatabase {
     return this.getCredential(id)!;
   }
 
+  upsertImportedCredential(input: {
+    id: string; name: string; type: CredentialType; secretRef: string | null; sudoMode: SudoAuthMode;
+    sudoSecretRef: string | null; metadata: Credential["metadata"];
+  }): Credential {
+    if (this.getCredential(input.id)) {
+      return this.updateCredential(input.id, input.name, input.type, input.secretRef, input.metadata, input.sudoMode, input.sudoSecretRef);
+    }
+    const timestamp = now();
+    this.db.prepare("INSERT INTO credentials(id,name,type,secret_ref,sudo_mode,sudo_secret_ref,metadata_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)")
+      .run(input.id, input.name, input.type, input.secretRef, input.sudoMode, input.sudoSecretRef, JSON.stringify(input.metadata), timestamp, timestamp);
+    return this.getCredential(input.id)!;
+  }
+
+  upsertImportedHost(input: {
+    id: string; name: string; hostname: string; port: number; username: string; credentialId: string | null;
+    activeLoginId: string | null; jumpHostId: string | null; policyId: string | null; groupName: string | null;
+    tags: string[]; defaultDirectory: string | null; enabled: boolean; aiAccessEnabled: boolean;
+    hostTransferEnabled: boolean; monitorOutputEnabled: boolean; proxyEnabled: boolean;
+    proxyLocalHost: string; proxyLocalPort: number; proxyRemotePort: number;
+  }): "created" | "updated" {
+    this.assertValidJumpHost(input.id, input.jumpHostId);
+    const timestamp = now();
+    if (this.getHost(input.id)) {
+      this.db.prepare(`UPDATE hosts SET name=?,hostname=?,port=?,username=?,credential_id=?,active_login_id=?,jump_host_id=?,policy_id=?,group_name=?,tags_json=?,default_directory=?,enabled=?,ai_access_enabled=?,host_transfer_enabled=?,monitor_output_enabled=?,proxy_enabled=?,proxy_local_host=?,proxy_local_port=?,proxy_remote_port=?,config_revision=config_revision+1,updated_at=? WHERE id=?`).run(
+        input.name, input.hostname, input.port, input.username, input.credentialId, input.activeLoginId, input.jumpHostId,
+        input.policyId, input.groupName, JSON.stringify(input.tags), input.defaultDirectory, bool(input.enabled),
+        bool(input.aiAccessEnabled), bool(input.hostTransferEnabled), bool(input.monitorOutputEnabled), bool(input.proxyEnabled),
+        input.proxyLocalHost, input.proxyLocalPort, input.proxyRemotePort, timestamp, input.id
+      );
+      return "updated";
+    }
+    this.db.prepare(`INSERT INTO hosts
+      (id,name,hostname,port,username,credential_id,active_login_id,jump_host_id,policy_id,group_name,tags_json,default_directory,enabled,ai_access_enabled,host_transfer_enabled,monitor_output_enabled,proxy_enabled,proxy_local_host,proxy_local_port,proxy_remote_port,config_revision,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)`).run(
+      input.id, input.name, input.hostname, input.port, input.username, input.credentialId, input.activeLoginId, input.jumpHostId,
+      input.policyId, input.groupName, JSON.stringify(input.tags), input.defaultDirectory, bool(input.enabled),
+      bool(input.aiAccessEnabled), bool(input.hostTransferEnabled), bool(input.monitorOutputEnabled), bool(input.proxyEnabled),
+      input.proxyLocalHost, input.proxyLocalPort, input.proxyRemotePort, timestamp, timestamp
+    );
+    return "created";
+  }
+
+  upsertImportedLogin(input: { id: string; hostId: string; username: string; credentialId: string | null; sudoEnabled: boolean }): { id: string; created: boolean } {
+    this.requireHost(input.hostId);
+    const timestamp = now();
+    if (this.getHostLogin(input.id)) {
+      this.updateHostLogin(input.id, { username: input.username, credentialId: input.credentialId, sudoEnabled: input.sudoEnabled });
+      return { id: input.id, created: false };
+    }
+    const existing = this.listHostLogins(input.hostId).find((login) => login.username === input.username);
+    if (existing) {
+      this.updateHostLogin(existing.id, { credentialId: input.credentialId, sudoEnabled: input.sudoEnabled });
+      return { id: existing.id, created: false };
+    }
+    this.db.prepare("INSERT INTO host_logins(id,host_id,username,credential_id,sudo_enabled,created_at,updated_at) VALUES (?,?,?,?,?,?,?)")
+      .run(input.id, input.hostId, input.username, input.credentialId, bool(input.sudoEnabled), timestamp, timestamp);
+    return { id: input.id, created: true };
+  }
+
+  listTrustedHostKeys(): Array<{ hostId: string; algorithm: string; fingerprint: string }> {
+    return (this.db.prepare("SELECT host_id,algorithm,fingerprint FROM host_keys WHERE status='TRUSTED' ORDER BY host_id").all() as Row[])
+      .map((row) => ({ hostId: String(row.host_id), algorithm: String(row.algorithm), fingerprint: String(row.fingerprint) }));
+  }
+
+  importTrustedHostKey(hostId: string, fingerprint: string, algorithm = "sha256"): void {
+    this.requireHost(hostId);
+    const timestamp = now();
+    this.db.prepare("UPDATE host_keys SET status='REVOKED' WHERE host_id=? AND status='TRUSTED' AND fingerprint!=?").run(hostId, fingerprint);
+    this.db.prepare(`INSERT INTO host_keys(id,host_id,algorithm,fingerprint,status,first_seen_at,last_seen_at,trusted_at)
+      VALUES (?,?,?,?,'TRUSTED',?,?,?)
+      ON CONFLICT(host_id,fingerprint) DO UPDATE SET status='TRUSTED',algorithm=excluded.algorithm,last_seen_at=excluded.last_seen_at,trusted_at=excluded.trusted_at`)
+      .run(randomUUID(), hostId, algorithm, fingerprint, timestamp, timestamp, timestamp);
+  }
+
   updateCredential(id: string, name: string, type: CredentialType, secretRef: string | null, metadata: Credential["metadata"], sudoMode?: SudoAuthMode, sudoSecretRef?: string | null): Credential {
     const current = this.getCredential(id);
     if (!current) throw new AppError("CREDENTIAL_NOT_FOUND", "Credential not found", false, undefined, undefined, 404);

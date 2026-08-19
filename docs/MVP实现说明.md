@@ -136,6 +136,8 @@ GET            /v1/vault-settings
 POST           /v1/vault/setup
 POST           /v1/vault/unlock
 POST           /v1/vault/lock
+POST           /v1/config/export
+POST           /v1/config/import
 ```
 
 操作接口：

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useId, useRef, useState, type ChangeEvent, type FormEvent } from "react";
 import {
   ArrowClockwise,
   CaretDown,
@@ -6,6 +6,7 @@ import {
   CheckCircle,
   ClockCounterClockwise,
   Desktop,
+  DownloadSimple,
   Eye,
   EyeSlash,
   MagnifyingGlass,
@@ -15,6 +16,7 @@ import {
   Tag,
   TerminalWindow,
   Trash,
+  UploadSimple,
   X
 } from "@phosphor-icons/react";
 import { COMMAND_BLACKLIST_CATALOG, DEFAULT_POLICY_TEMPLATE, findPolicyTemplate, findPolicyTemplateByName, POLICY_TEMPLATES } from "../../../packages/shared/src/policy-templates";
@@ -57,6 +59,8 @@ export function App() {
   const [notice, setNotice] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
   const notify = useCallback((kind: "ok" | "error", text: string) => { setNotice({ kind, text }); window.setTimeout(() => setNotice(null), 4500); }, []);
   const [vaultState, setVaultState] = useState<VaultState | null>(null);
+  const [configTransfer, setConfigTransfer] = useState<"export" | "import" | null>(null);
+  const [workspaceRevision, setWorkspaceRevision] = useState(0);
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
     const changed = (event: MediaQueryListEvent) => setSystemDark(event.matches);
@@ -83,13 +87,15 @@ export function App() {
       </div>
     </header>
     <main className={page === "terminal" ? "terminal-main" : undefined}>
-      {page === "hosts" && <HostsPage notify={notify} onOpenTerminal={openTerminal} />}
+      {page === "hosts" && <HostsPage notify={notify} workspaceRevision={workspaceRevision} onOpenTerminal={openTerminal} onExportConfig={() => setConfigTransfer("export")} onImportConfig={() => setConfigTransfer("import")} />}
       {page === "policies" && <PoliciesPage notify={notify} />}
       {page === "audit" && <AuditPage notify={notify} />}
-      {page === "settings" && <SettingsPage notify={notify} vaultState={vaultState} onVaultChanged={setVaultState} />}
+      {page === "settings" && <SettingsPage notify={notify} vaultState={vaultState} onVaultChanged={setVaultState} onExportConfig={() => setConfigTransfer("export")} onImportConfig={() => setConfigTransfer("import")} />}
       <div className="terminal-workspace-mount" hidden={page !== "terminal"}><TerminalWorkspace active={page === "terminal"} openRequest={terminalOpenRequest} notify={notify} /></div>
     </main>
     {vaultState && !vaultState.unlocked && <VaultGate state={vaultState} notify={notify} onReady={setVaultState} />}
+    {configTransfer === "export" && <ExportConfigDialog notify={notify} onClose={() => setConfigTransfer(null)} />}
+    {configTransfer === "import" && <ImportConfigDialog notify={notify} onClose={() => setConfigTransfer(null)} onImported={() => setWorkspaceRevision((value) => value + 1)} />}
     {notice && <div className={`toast ${notice.kind}`}>{notice.text}</div>}
   </div>;
 }
@@ -104,7 +110,7 @@ function ThemeCycleButton({ value, onChange }: { value: ThemePreference; onChang
   </button>;
 }
 
-function HostsPage({ notify, onOpenTerminal }: { notify: Notify; onOpenTerminal(hostId: string): void }) {
+function HostsPage({ notify, workspaceRevision, onOpenTerminal, onExportConfig, onImportConfig }: { notify: Notify; workspaceRevision: number; onOpenTerminal(hostId: string): void; onExportConfig(): void; onImportConfig(): void }) {
   const [hosts, setHosts] = useState<Host[]>([]);
   const [hostLogins, setHostLogins] = useState<HostLogin[]>([]);
   const [credentials, setCredentials] = useState<Credential[]>([]);
@@ -135,7 +141,7 @@ function HostsPage({ notify, onOpenTerminal }: { notify: Notify; onOpenTerminal(
       setHosts(h); setHostLogins(l); setCredentials(c); setPolicies(p);
     } catch (error) { notify("error", message(error)); }
   }, [notify]);
-  useEffect(() => { void load(); const timer = window.setInterval(() => void load(), 10_000); return () => window.clearInterval(timer); }, [load]);
+  useEffect(() => { void load(); const timer = window.setInterval(() => void load(), 10_000); return () => window.clearInterval(timer); }, [load, workspaceRevision]);
   useEffect(() => {
     const available = new Set(hosts.map((host) => host.id));
     setSelectedHostIds((current) => new Set([...current].filter((id) => available.has(id))));
@@ -417,7 +423,7 @@ function HostsPage({ notify, onOpenTerminal }: { notify: Notify; onOpenTerminal(
   const connectedCount = hosts.filter((host) => host.status === "CONNECTED").length;
   const aiAllowedCount = hosts.filter((host) => host.enabled && host.aiAccessEnabled).length;
   const enabledHostCount = hosts.filter((host) => host.enabled).length;
-  return <section><PageHeader title="SSH 主机"><div className="header-actions"><button className="test-all-button" title={testingHostIds.size > 0 && !testingAll ? "请等待当前连接测试完成" : "并发测试全部已启用主机"} disabled={enabledHostCount === 0 || testingAll || testingHostIds.size > 0} onClick={() => void testAllHosts()}><ArrowClockwise className={testingAll ? "testing-icon" : ""} size={17} aria-hidden="true" />{testingAll ? "全部测试中…" : "全部测试"}</button><button className="primary" onClick={() => setEditing("new")}>添加主机</button></div></PageHeader>
+  return <section><PageHeader title="SSH 主机"><div className="header-actions"><button type="button" title="导出主机、凭据和策略" onClick={onExportConfig}><DownloadSimple size={17} aria-hidden="true" />导出配置</button><button type="button" title="从另一台电脑导入配置" onClick={onImportConfig}><UploadSimple size={17} aria-hidden="true" />导入配置</button><button className="test-all-button" title={testingHostIds.size > 0 && !testingAll ? "请等待当前连接测试完成" : "并发测试全部已启用主机"} disabled={enabledHostCount === 0 || testingAll || testingHostIds.size > 0} onClick={() => void testAllHosts()}><ArrowClockwise className={testingAll ? "testing-icon" : ""} size={17} aria-hidden="true" />{testingAll ? "全部测试中…" : "全部测试"}</button><button className="primary" onClick={() => setEditing("new")}>添加主机</button></div></PageHeader>
     <p className="host-summary">{hosts.length} 台主机，{connectedCount} 台已连接，{aiAllowedCount} 台允许 AI 访问 · 数据仅保存在本地 Core。</p>
     <div className="host-filter-bar" aria-label="主机筛选">
       <label className="host-search"><MagnifyingGlass size={19} weight="regular" aria-hidden="true" /><span className="sr-only">搜索主机</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索主机、地址或用户" /></label>
@@ -1150,7 +1156,7 @@ function VaultGate({ state, notify, onReady }: { state: VaultState; notify: Noti
   </form></div></div>;
 }
 
-function SettingsPage({ notify, vaultState, onVaultChanged }: { notify: Notify; vaultState: VaultState | null; onVaultChanged(state: VaultState): void }) {
+function SettingsPage({ notify, vaultState, onVaultChanged, onExportConfig, onImportConfig }: { notify: Notify; vaultState: VaultState | null; onVaultChanged(state: VaultState): void; onExportConfig(): void; onImportConfig(): void }) {
   const [settings, setSettings] = useState<McpSettings | null>(null);
   const [codex, setCodex] = useState<CodexIntegrationState | null>(null);
   const [agentIntegrations, setAgentIntegrations] = useState<AgentIntegrationsState | null>(null);
@@ -1310,6 +1316,7 @@ function SettingsPage({ notify, vaultState, onVaultChanged }: { notify: Notify; 
   return <section><PageHeader eyebrow="Integrations" title="Agent 接入">
     <span className={`service-state ${(integrationChannel === "codex" ? codex?.installed : integrationChannel === "other" ? settings?.enabled : selectedAgentInstalled) ? "on" : "off"}`}><i />{integrationChannel === "codex" ? codex?.installed ? "Codex 已配置" : "Codex 未配置" : integrationChannel === "other" ? settings?.enabled ? "本地 MCP 已开启" : "本地 MCP 未开启" : selectedAgentInstalled ? "一键集成已安装" : "一键集成未安装"}</span>
   </PageHeader>
+    <article className="panel vault-setting"><div><span className="eyebrow">Workspace transfer</span><h2>配置导出 / 导入</h2><p>把主机、登录用户、凭据和策略导出为加密文件，即可在另一台电脑上导入后直接使用。文件用单独的导出密码保护，不包含 MCP Token 或本机 Agent 路径。</p></div><div className="vault-setting-actions"><button type="button" disabled={!vaultState?.unlocked} onClick={onExportConfig}><DownloadSimple size={16} aria-hidden="true" />导出配置</button><button type="button" className="primary" disabled={!vaultState?.unlocked} onClick={onImportConfig}><UploadSimple size={16} aria-hidden="true" />导入配置</button></div></article>
     <article className="panel vault-setting"><div><span className="eyebrow">Credential storage</span><h2>凭据存储</h2><p>凭据统一存储在受主密码保护的本地 AES-256-GCM 加密文件中，派生密钥仅保留在内存中。</p></div><div className="vault-setting-actions"><span className="badge allow">本地加密保险库</span><button disabled={busy || !vaultState?.unlocked} onClick={() => void lockVault()}>立即锁定</button></div></article>
     <div className="integration-tabs" role="tablist" aria-label="Agent 接入方式">{integrationTabs.map((tab) => <button key={tab.id} type="button" role="tab" aria-selected={integrationChannel === tab.id} aria-controls={`integration-panel-${tab.id}`} id={`integration-tab-${tab.id}`} className={integrationChannel === tab.id ? "selected" : ""} onClick={() => setIntegrationChannel(tab.id)}><strong>{tab.label}</strong><span>{tab.detail}</span></button>)}</div>
     {integrationChannel === "codex" && <article className="panel codex-integration" id="integration-panel-codex" role="tabpanel" aria-labelledby="integration-tab-codex">
@@ -1381,6 +1388,91 @@ function AgentOneClickIntegration({ channel, integration, busy, manualDirectory,
   </article>;
 }
 
+function ExportConfigDialog({ notify, onClose }: { notify: Notify; onClose(): void }) {
+  const [busy, setBusy] = useState(false);
+  const [errorText, setErrorText] = useState("");
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    const password = String(data.get("password") ?? "");
+    const confirmation = String(data.get("confirmation") ?? "");
+    if (password !== confirmation) { setErrorText("两次输入的导出密码不一致"); return; }
+    setBusy(true); setErrorText("");
+    try {
+      const result = await post<{ filename: string; document: unknown; warnings: string[] }>("/v1/config/export", { password });
+      downloadJson(result.filename, result.document);
+      onClose();
+      notify("ok", result.warnings.length > 0 ? `已导出 ${result.filename}，${result.warnings[0]}` : `已导出 ${result.filename}`);
+    } catch (error) { setErrorText(message(error)); }
+    finally { setBusy(false); }
+  }
+  return <Modal title="导出配置" onClose={() => !busy && onClose()}>
+    <form onSubmit={submit} className="form-grid">
+      <p className="form-hint span-2">导出会包含主机、登录用户、策略，以及保险库中的密码和私钥。请设置一个仅用于该文件的导出密码，不要使用主密码。</p>
+      <label>导出密码<input name="password" type="password" minLength={10} maxLength={1024} required autoFocus autoComplete="new-password" /></label>
+      <label>确认导出密码<input name="confirmation" type="password" minLength={10} maxLength={1024} required autoComplete="new-password" /></label>
+      {errorText && <div className="form-error span-2" role="alert">{errorText}</div>}
+      <div className="form-actions span-2"><button type="button" onClick={onClose} disabled={busy}>取消</button><button type="submit" className="primary" disabled={busy}>{busy ? "导出中…" : "导出加密文件"}</button></div>
+    </form>
+  </Modal>;
+}
+
+function ImportConfigDialog({ notify, onClose, onImported }: { notify: Notify; onClose(): void; onImported(): void }) {
+  const [busy, setBusy] = useState(false);
+  const [errorText, setErrorText] = useState("");
+  const [fileName, setFileName] = useState("");
+  const [bundle, setBundle] = useState<unknown>(null);
+  async function chooseFile(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    setErrorText("");
+    try {
+      const parsed = JSON.parse(await file.text()) as { kind?: unknown };
+      if (parsed.kind !== "hoplane-config") throw new Error("invalid");
+      setBundle(parsed);
+      setFileName(file.name);
+    } catch { setBundle(null); setFileName(""); setErrorText("请选择由 Hoplane 导出的 .hoplane 文件"); }
+  }
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const password = String(new FormData(event.currentTarget).get("password") ?? "");
+    if (!bundle) { setErrorText("请先选择要导入的配置文件"); return; }
+    setBusy(true); setErrorText("");
+    try {
+      const result = await post<{ hosts: number; credentials: number; policies: number; warnings: string[] }>("/v1/config/import", { password, document: bundle });
+      onImported();
+      onClose();
+      notify("ok", result.warnings.length > 0
+        ? `已导入 ${result.hosts} 台主机、${result.policies} 个策略。${result.warnings[0]}`
+        : `已导入 ${result.hosts} 台主机、${result.credentials} 个凭据、${result.policies} 个策略`);
+    } catch (error) { setErrorText(message(error)); }
+    finally { setBusy(false); }
+  }
+  return <Modal title="导入配置" onClose={() => !busy && onClose()}>
+    <form onSubmit={submit} className="form-grid">
+      <p className="form-hint span-2">导入按 ID 合并：相同 ID 的主机、凭据和策略会被覆盖，现有其他主机会保留。目标电脑需要先解锁本地保险库。使用 SSH Agent 的主机仍需本机 Agent 可用。</p>
+      <label className="span-2">配置文件
+        <input type="file" accept=".hoplane,application/json" onChange={(event) => void chooseFile(event)} />
+        {fileName && <small className="field-recommendation">已选择 {fileName}</small>}
+      </label>
+      <label className="span-2">导出密码<input name="password" type="password" minLength={10} maxLength={1024} required autoComplete="current-password" /></label>
+      {errorText && <div className="form-error span-2" role="alert">{errorText}</div>}
+      <div className="form-actions span-2"><button type="button" onClick={onClose} disabled={busy}>取消</button><button type="submit" className="primary" disabled={busy || !bundle}>{busy ? "导入中…" : "导入并覆盖同 ID 配置"}</button></div>
+    </form>
+  </Modal>;
+}
+
+function downloadJson(filename: string, value: unknown): void {
+  const blob = new Blob([JSON.stringify(value, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = window.document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
 function Modal({ title, onClose, children }: { title: string; onClose(): void; children: React.ReactNode }) {
   const titleId = useId();
   useEffect(() => {
@@ -1421,6 +1513,11 @@ function wouldCreateJumpHostCycle(hosts: Host[], hostId: string | null, candidat
 type Notify = (kind: "ok" | "error", text: string) => void;
 function message(error: unknown): string {
   if (error instanceof ApiError) {
+    if (error.code === "CONFIG_EXPORT_UNLOCK_FAILED") return "导出密码不正确，或配置文件已损坏。";
+    if (error.code === "CONFIG_EXPORT_INVALID") return "这不是有效的 Hoplane 配置文件。";
+    if (error.code === "CONFIG_EXPORT_PASSWORD_INVALID") return "导出密码需要 10 到 1024 个字符。";
+    if (error.code === "CONFIG_EXPORT_UNSUPPORTED") return "该配置文件使用了不受支持的加密参数。";
+    if (error.code === "VAULT_LOCKED") return "请先解锁本地保险库，再导出或导入配置。";
     if (error.code === "JUMP_HOST_CYCLE") return "跳板机配置存在循环依赖，请选择其他主机。";
     if (error.code === "JUMP_HOST_NOT_FOUND") return "所选跳板机已不存在，请刷新主机列表后重新选择。";
     if (error.code === "JUMP_HOST_IN_USE") {

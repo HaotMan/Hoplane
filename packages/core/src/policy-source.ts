@@ -92,6 +92,12 @@ export class PolicySourceService {
     return this.database.updatePolicySourceState(id, { enabled: true, sourcePath: path, sourceStatus: "SYNCED", sourceError: null, sourceHash: hash(yaml) });
   }
 
+  async persistPolicy(id: string): Promise<Policy> {
+    const policy = this.requirePolicy(id);
+    await this.persistExisting(policy);
+    return this.requirePolicy(id);
+  }
+
   async rescan(): Promise<{ scanned: number; updated: number; errors: number }> {
     const { readdir } = await import("node:fs/promises");
     const entries = await readdir(this.config.policyDir, { withFileTypes: true });
