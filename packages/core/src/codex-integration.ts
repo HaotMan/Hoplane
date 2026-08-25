@@ -587,7 +587,7 @@ export function renderMcpConfig(runtime: StdioRuntime): string {
     `args = [${tomlString(runtime.adapterEntry)}]`,
     ...(runtime.electronRunAsNode ? ["env = { ELECTRON_RUN_AS_NODE = \"1\" }"] : []),
     "startup_timeout_sec = 30",
-    "tool_timeout_sec = 310"
+    "tool_timeout_sec = 3600"
   ];
   return lines.join("\n");
 }

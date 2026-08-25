@@ -23,6 +23,7 @@ describe("Codex integration", () => {
     expect(updated).toContain(`[mcp_servers.other]`);
     expect(updated).not.toContain("Authorization");
     expect(updated).toContain(renderMcpConfig(runtime));
+    expect(updated).toContain("tool_timeout_sec = 3600");
     expect(upsertHoplaneMcpConfig(updated, runtime)).toBe(updated);
   });
 

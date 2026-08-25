@@ -1,4 +1,4 @@
-import { app, BrowserWindow, Menu, Tray, ipcMain, nativeImage, shell } from "electron";
+import { app, BrowserWindow, Menu, Tray, clipboard, ipcMain, nativeImage, shell } from "electron";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { CoreConfig } from "../../../packages/core/src/config.js";
@@ -38,6 +38,11 @@ const startup = app.whenReady().then(async () => {
     process.stderr.write(`Reusing Hoplane Core with matching UI build ${expectedUiBuildId}\n`);
   }
   ipcMain.handle("hoplane:open-policies-directory", async () => { await shell.openPath(config.policyDir); });
+  ipcMain.handle("hoplane:clipboard-write", (_event, text: unknown) => {
+    if (typeof text !== "string") throw new Error("clipboard text must be a string");
+    clipboard.writeText(text);
+  });
+  ipcMain.handle("hoplane:clipboard-read", () => clipboard.readText());
   createWindow();
   createTray();
 });

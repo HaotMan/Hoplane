@@ -138,6 +138,14 @@ const server = createServer(async (request, response) => {
   }
 });
 
+/*
+ * Uploads/downloads hold this HTTP request open until SFTP finishes. Node's
+ * default requestTimeout is 300s, which aborts around ~245MB on a typical SSH
+ * path. Core is localhost-only, so disable idle request limits.
+ */
+server.requestTimeout = 0;
+server.headersTimeout = 0;
+server.timeout = 0;
 server.on("clientError", (_error, socket) => socket.end("HTTP/1.1 400 Bad Request\r\n\r\n"));
 const terminalGateway = attachTerminalGateway(server, { database, ssh, isSameOriginUiRequest });
 await new Promise<void>((resolve, reject) => {

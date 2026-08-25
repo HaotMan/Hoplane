@@ -26,7 +26,11 @@ export interface HostMonitorEvent {
 
 declare global {
   interface Window {
-    hoplane?: { openPoliciesDirectory(): Promise<void> };
+    hoplane?: {
+      openPoliciesDirectory(): Promise<void>;
+      writeClipboard(text: string): Promise<void>;
+      readClipboard(): Promise<string>;
+    };
   }
 }
 import type { Policy as SharedPolicy, PolicyCommandRule as SharedPolicyCommandRule, PolicyDocument as SharedPolicyDocument } from "../../../packages/shared/src/types";

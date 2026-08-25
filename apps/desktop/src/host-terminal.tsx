@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { Terminal, type ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
@@ -8,6 +9,13 @@ import "@xterm/xterm/css/xterm.css";
 import { api } from "./api";
 import { AppSelect } from "./app-select";
 import { groupHosts } from "./host-list";
+import {
+  contextMenuPosition,
+  copyTerminalSelection,
+  pasteTerminalClipboard,
+  terminalEditAction,
+  terminalShortcutLabel
+} from "./terminal-clipboard";
 import type { Host, HostLogin } from "./types";
 
 type TerminalConnection = "IDLE" | "CONNECTING" | "CONNECTED" | "CLOSED" | "ERROR";
@@ -153,6 +161,54 @@ export function TerminalWorkspace({ active, openRequest, notify }: {
   </section>;
 }
 
+interface TerminalContextMenuState {
+  x: number;
+  y: number;
+  canCopy: boolean;
+}
+
+function TerminalContextMenu({ menu, onCopy, onPaste, onSelectAll, onClose }: {
+  menu: TerminalContextMenuState;
+  onCopy(): void;
+  onPaste(): void;
+  onSelectAll(): void;
+  onClose(): void;
+}) {
+  const menuRef = useRef<HTMLDivElement>(null);
+  const [position, setPosition] = useState({ left: menu.x, top: menu.y });
+
+  useLayoutEffect(() => {
+    const node = menuRef.current;
+    if (!node) return;
+    setPosition(contextMenuPosition(menu.x, menu.y, node.offsetWidth, node.offsetHeight, window.innerWidth, window.innerHeight));
+  }, [menu.x, menu.y]);
+
+  useEffect(() => {
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      if (!menuRef.current?.contains(event.target as Node)) onClose();
+    };
+    const closeOnKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    document.addEventListener("pointerdown", closeOnOutsidePointer, true);
+    window.addEventListener("keydown", closeOnKey);
+    window.addEventListener("resize", onClose);
+    window.addEventListener("blur", onClose);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsidePointer, true);
+      window.removeEventListener("keydown", closeOnKey);
+      window.removeEventListener("resize", onClose);
+      window.removeEventListener("blur", onClose);
+    };
+  }, [onClose]);
+
+  return createPortal(<div ref={menuRef} className="terminal-context-menu" role="menu" aria-label="终端编辑菜单" style={{ left: position.left, top: position.top }}>
+    <button type="button" role="menuitem" disabled={!menu.canCopy} onPointerDown={(event) => event.preventDefault()} onClick={() => { onCopy(); onClose(); }}><span>复制</span><kbd>{terminalShortcutLabel("copy")}</kbd></button>
+    <button type="button" role="menuitem" onPointerDown={(event) => event.preventDefault()} onClick={() => { onPaste(); onClose(); }}><span>粘贴</span><kbd>{terminalShortcutLabel("paste")}</kbd></button>
+    <button type="button" role="menuitem" onPointerDown={(event) => event.preventDefault()} onClick={() => { onSelectAll(); onClose(); }}><span>全选</span><kbd>{terminalShortcutLabel("selectAll")}</kbd></button>
+  </div>, document.body);
+}
+
 function TerminalSession({ tabId, host, logins, active, onConnectionChange }: {
   tabId: string;
   host: Host;
@@ -169,8 +225,28 @@ function TerminalSession({ tabId, host, logins, active, onConnectionChange }: {
   const [connection, setConnection] = useState<TerminalConnection>("IDLE");
   const [errorText, setErrorText] = useState("");
   const [activeUsername, setActiveUsername] = useState("");
+  const [contextMenu, setContextMenu] = useState<TerminalContextMenuState | null>(null);
 
   useEffect(() => onConnectionChange(tabId, connection), [connection, onConnectionChange, tabId]);
+  useEffect(() => { if (!active) setContextMenu(null); }, [active]);
+
+  const clipboardBridge = typeof window === "undefined" ? undefined : window.hoplane;
+
+  const copySelection = useCallback(() => {
+    const term = termRef.current;
+    if (term) void copyTerminalSelection(term, clipboardBridge);
+  }, [clipboardBridge]);
+
+  const pasteClipboard = useCallback(() => {
+    const term = termRef.current;
+    if (term) void pasteTerminalClipboard(term, clipboardBridge);
+  }, [clipboardBridge]);
+
+  const selectAll = useCallback(() => {
+    termRef.current?.selectAll();
+  }, []);
+
+  const closeContextMenu = useCallback(() => setContextMenu(null), []);
 
   const fitTerminal = useCallback(() => {
     const screen = screenRef.current;
@@ -206,11 +282,19 @@ function TerminalSession({ tabId, host, logins, active, onConnectionChange }: {
       const ws = wsRef.current;
       if (ws?.readyState === WebSocket.OPEN) ws.send(encoder.encode(data));
     });
+    term.attachCustomKeyEventHandler((event) => !terminalEditAction(event, term.hasSelection()));
+    const onContextMenu = (event: MouseEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      setContextMenu({ x: event.clientX, y: event.clientY, canCopy: term.hasSelection() });
+    };
+    screen.addEventListener("contextmenu", onContextMenu, true);
     const resizeObserver = new ResizeObserver(fitTerminal);
     resizeObserver.observe(screen);
 
     return () => {
       dataListener.dispose();
+      screen.removeEventListener("contextmenu", onContextMenu, true);
       resizeObserver.disconnect();
       wsRef.current?.close();
       wsRef.current = null;
@@ -226,7 +310,26 @@ function TerminalSession({ tabId, host, logins, active, onConnectionChange }: {
       fitTerminal();
       termRef.current?.focus();
     });
-    return () => window.cancelAnimationFrame(frame);
+    const onKeyDown = (event: KeyboardEvent) => {
+      const term = termRef.current;
+      const screen = screenRef.current;
+      if (!term || !screen) return;
+      const target = event.target;
+      const focused = (target instanceof Node && screen.contains(target)) || screen.contains(document.activeElement);
+      if (!focused) return;
+      const action = terminalEditAction(event, term.hasSelection());
+      if (!action) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      if (action === "copy") void copyTerminalSelection(term, window.hoplane);
+      else if (action === "paste") void pasteTerminalClipboard(term, window.hoplane);
+      else term.selectAll();
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("keydown", onKeyDown, true);
+    };
   }, [active, fitTerminal]);
 
   const connect = useCallback((targetLoginId: string) => {
@@ -303,7 +406,8 @@ function TerminalSession({ tabId, host, logins, active, onConnectionChange }: {
       </div>
       {connection === "ERROR" && errorText && <div className="terminal-error-banner" role="alert">{errorText}</div>}
       <div className="interactive-terminal-screen" ref={screenRef} aria-label={`${host.name} 交互终端`} />
-      <div className="terminal-session-footnote">人工会话 · {selectedLogin?.username ?? "所选用户"} · 不经过 AI 策略 · 输入与输出不保存</div>
+      {active && contextMenu && <TerminalContextMenu menu={contextMenu} onCopy={copySelection} onPaste={pasteClipboard} onSelectAll={selectAll} onClose={closeContextMenu} />}
+      <div className="terminal-session-footnote">人工会话 · {selectedLogin?.username ?? "所选用户"} · 右键复制粘贴 · {terminalShortcutLabel("copy")} 复制 · 输入与输出不保存</div>
     </div>
   </div>;
 }

@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { request as httpRequest } from "node:http";
 import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,21 +16,20 @@ export class CoreApiClient {
     let token: string;
     try { token = (await readFile(this.config.tokenPath, "utf8")).trim(); }
     catch { throw new AppError("CORE_UNAVAILABLE", "Core token is unavailable. Start Hoplane Core first.", true, undefined, undefined, 503); }
-    let response: Response;
-    try {
-      response = await fetch(`http://${this.config.host}:${this.config.port}${path}`, {
-        method,
-        headers: { authorization: `Bearer ${token}`, ...(payload === undefined ? {} : { "content-type": "application/json" }) },
-        ...(payload === undefined ? {} : { body: JSON.stringify(payload) })
-      });
-    } catch {
-      throw new AppError("CORE_UNAVAILABLE", "Could not connect to Hoplane Core", true, undefined, undefined, 503);
+    const body = payload === undefined ? undefined : JSON.stringify(payload);
+    const result = await requestJson(
+      method,
+      `http://${this.config.host}:${this.config.port}${path}`,
+      {
+        authorization: `Bearer ${token}`,
+        ...(body === undefined ? {} : { "content-type": "application/json" })
+      },
+      body
+    );
+    if (result.status < 200 || result.status >= 300) {
+      throw new AppError(String(result.json.code ?? "CORE_ERROR"), String(result.json.message ?? "Core request failed"), Boolean(result.json.retriable), result.json.operationId ? String(result.json.operationId) : undefined, result.json.details as Record<string, unknown> | undefined, result.status);
     }
-    const result = await response.json() as Record<string, unknown>;
-    if (!response.ok) {
-      throw new AppError(String(result.code ?? "CORE_ERROR"), String(result.message ?? "Core request failed"), Boolean(result.retriable), result.operationId ? String(result.operationId) : undefined, result.details as Record<string, unknown> | undefined, response.status);
-    }
-    return result as T;
+    return result.json as T;
   }
 
   private async ensureRunning(): Promise<void> {
@@ -51,4 +51,40 @@ export class CoreApiClient {
       return response.ok;
     } catch { return false; }
   }
+}
+
+/** Node fetch/undici waits only 300s for response headers; SFTP uploads hold the request open longer. */
+function requestJson(method: string, href: string, headers: Record<string, string>, body?: string): Promise<{ status: number; json: Record<string, unknown> }> {
+  const url = new URL(href);
+  return new Promise((resolveRequest, reject) => {
+    const request = httpRequest({
+      protocol: url.protocol,
+      hostname: url.hostname,
+      port: url.port,
+      path: `${url.pathname}${url.search}`,
+      method,
+      headers: {
+        ...headers,
+        ...(body === undefined ? {} : { "content-length": String(Buffer.byteLength(body)) })
+      }
+    }, (response) => {
+      const chunks: Buffer[] = [];
+      response.on("data", (chunk) => chunks.push(Buffer.from(chunk as Uint8Array)));
+      response.on("end", () => {
+        try {
+          resolveRequest({
+            status: response.statusCode ?? 0,
+            json: JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>
+          });
+        } catch {
+          reject(new AppError("CORE_UNAVAILABLE", "Core returned an invalid JSON response", true, undefined, undefined, 502));
+        }
+      });
+    });
+    request.on("error", () => {
+      reject(new AppError("CORE_UNAVAILABLE", "Could not connect to Hoplane Core", true, undefined, undefined, 503));
+    });
+    if (body !== undefined) request.write(body);
+    request.end();
+  });
 }
