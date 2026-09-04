@@ -8,7 +8,7 @@
   <strong>让 AI 安全地操作 SSH 主机，同时把凭据、权限与最终控制权留在本地。</strong>
 </p>
 
-Hoplane 是一个面向 AI Agent 的本地 SSH 网关与桌面运维工具。它把主机管理、本地加密凭据、Policy V4、操作审计、文件传输、主机级跳板连接与 SOCKS5 反向代理、AI 指令记录和人工交互终端放在同一个 App 中，并可一键接入 Codex、Cursor、Claude Code 与 WorkBuddy。
+Hoplane 是一个面向 AI Agent 的本地 SSH 网关与桌面运维工具。它把主机管理、本地加密凭据、Policy V4、操作审计、文件传输、主机级跳板连接与 SOCKS5 反向代理、AI 指令记录和人工交互终端放在同一个 App 中，并可一键接入 Codex、Cursor、Claude Code、WorkBuddy 与 Trae。
 
 AI 不会获得登录密码、私钥口令或 sudo 密码，也不能自行确认新的 SSH 主机指纹。所有 MCP 命令和文件操作都要经过主机开关、当前登录身份、权限策略与审计链路；需要人工处理时，用户可以在 App 内打开独立的交互式终端。
 
@@ -217,11 +217,11 @@ Hoplane 的核心设计：
 
 ### 5. 接入 AI Agent
 
-进入顶部“接入”页。Codex、Cursor、Claude Code 和 WorkBuddy 推荐使用一键 stdio 集成；其他支持 Streamable HTTP MCP 的客户端使用“其他 Agent”。
+进入顶部“接入”页。Codex、Cursor、Claude Code、WorkBuddy 和 Trae 推荐使用一键 stdio 集成；其他支持 Streamable HTTP MCP 的客户端使用“其他 Agent”。
 
 ![Hoplane Agent 接入](docs/images/hoplane-integrations.png)
 
-#### Codex、Cursor、Claude Code 和 WorkBuddy
+#### Codex、Cursor、Claude Code、WorkBuddy 和 Trae
 
 1. 点击对应 Agent 标签；
 2. 选择检测到的有效且可写配置目录，也可以手动填写绝对路径；
@@ -262,7 +262,7 @@ Hoplane 明确区分 AI 自动操作与用户人工终端：
 ## 工作方式
 
 ```text
-Codex / Cursor / Claude Code / WorkBuddy / Other Agents
+Codex / Cursor / Claude Code / WorkBuddy / Trae / Other Agents
                          │
                    stdio / HTTP MCP
                          │
@@ -457,6 +457,9 @@ Docker、Compose 与 Kubernetes 仍通过通用 `execute_command` 执行，不�
 | Cursor | `~/.cursor/skills/hoplane` | `~/.cursor/mcp.json` |
 | Claude Code | `~/.claude/skills/hoplane` | `~/.claude.json` |
 | WorkBuddy | `~/.workbuddy/skills/hoplane` | `~/.workbuddy/mcp.json` |
+| Trae | `~/.trae/skills/hoplane` | macOS: `~/Library/Application Support/Trae/User/mcp.json` |
+
+Trae 国内版使用 `~/.trae-cn/skills/hoplane`，并会扫描对应的 `Trae CN/User/mcp.json`。TRAE SOLO 不单独显示为接入项，而是在 Trae 标签的配置目录列表中显示为 `TRAE SOLO/User/mcp.json`，并复用 `~/.trae/skills/hoplane`。Windows 与 Linux 分别从 `%APPDATA%` 和 `$XDG_CONFIG_HOME`（默认 `~/.config`）下的 Trae 用户配置目录读取。Trae 配置会按其官方格式写入 `command`、`args` 与超时环境变量。
 
 App 会：
 

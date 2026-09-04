@@ -159,7 +159,7 @@ MCP 开关和保险库引用存入 `app_settings`；实际 `hpl_...` Token 只�
 
 Codex 集成安装器只检查 `CODEX_HOME`、`~/.codex`、XDG/macOS/Windows 应用数据目录等有限候选位置，不递归扫描用户目录。界面会校验候选目录、`config.toml` 基础结构和可写性；发现多个目录时由用户选择，也支持手动输入绝对路径，选择结果持久化到本地设置。安装器将 Skill 安装到选定 Codex Home，并以托管区块更新 `config.toml` 中的 `mcp_servers.hoplane`。已有配置会保留，第一次修改前写入 `config.toml.hoplane-backup`。安装包使用 Electron 的 `ELECTRON_RUN_AS_NODE=1` 模式启动包内 stdio 入口，因此 macOS 和 Windows 都不依赖外部 Node。App 诊断会实际启动该入口、完成 MCP 初始化并核对六个工具；Skill 自带的诊断入口负责检查 Core、保险库和允许 AI 访问的主机。
 
-Agent 接入页按 Codex、Cursor、Claude Code、其他 Agent 分为四个标签。前三者都使用安装包内稳定的 stdio 入口并一键安装 Hoplane Skill：Cursor 写入 `~/.cursor/skills/hoplane` 与 `~/.cursor/mcp.json`，Claude Code 写入 `~/.claude/skills/hoplane` 与用户级 `~/.claude.json`；修改已有 JSON 前保留 `.hoplane-backup`，其他字段和 MCP 服务不变。“其他 Agent”继续通过默认关闭的本机 Streamable HTTP 服务复制配置和安装说明。界面支持跟随系统、深色、浅色三档主题并在本机持久化。
+Agent 接入页按 Codex、Cursor、Claude Code、WorkBuddy、Trae、其他 Agent 分为六个标签。前五者都使用安装包内稳定的 stdio 入口并一键安装 Hoplane Skill：Cursor 写入 `~/.cursor/skills/hoplane` 与 `~/.cursor/mcp.json`，Claude Code 写入 `~/.claude/skills/hoplane` 与用户级 `~/.claude.json`，WorkBuddy 写入 `~/.workbuddy`，Trae 则分别写入全局 Skill 目录和平台用户配置目录中的 `User/mcp.json`；其配置目录候选同时覆盖 Trae、Trae 国内版和 TRAE SOLO，TRAE SOLO 沿用 Trae Skill 目录；修改已有 JSON 前保留 `.hoplane-backup`，其他字段和 MCP 服务不变。“其他 Agent”继续通过默认关闭的本机 Streamable HTTP 服务复制配置和安装说明。界面支持跟随系统、深色、浅色三档主题并在本机持久化。
 
 策略页只保留左侧策略列表，右侧提供可视化配置和 YAML 源码两个标签，编辑、取消和保存新版本按钮位于内容区右下角。每个策略写入 `~/.hoplane/policies/<slug>--<uuid>.yaml`，Core 使用 SQLite 保存最后一次验证通过的运行快照。文件监听会自动导入合法新增文件和应用合法修改；无效 YAML 显示错误并保留上一有效版本，文件删除则停用对应策略。更新接口使用 `expectedVersion` 防止覆盖外部变更。
 

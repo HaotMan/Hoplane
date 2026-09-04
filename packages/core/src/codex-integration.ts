@@ -52,12 +52,13 @@ interface CodexIntegrationOptions {
   environment?: NodeJS.ProcessEnv;
 }
 
-export type JsonAgentKind = "cursor" | "claude-code" | "workbuddy";
+export type JsonAgentKind = "cursor" | "claude-code" | "workbuddy" | "trae";
 
 export const JSON_AGENT_LABELS: Record<JsonAgentKind, string> = {
   cursor: "Cursor",
   "claude-code": "Claude Code",
-  workbuddy: "WorkBuddy"
+  workbuddy: "WorkBuddy",
+  trae: "Trae"
 };
 
 function jsonAgentConfigFileName(agent: JsonAgentKind): string {
@@ -100,6 +101,7 @@ interface JsonAgentIntegrationOptions {
   runtime?: StdioRuntime;
   candidateDirectories?: Array<{ path: string; label: string; source?: JsonAgentHomeCandidate["source"] }>;
   environment?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
 }
 
 export class CodexIntegrationService {
@@ -287,10 +289,12 @@ export class JsonAgentIntegrationService {
   private readonly runtime: StdioRuntime;
   private readonly candidateDirectories?: JsonAgentIntegrationOptions["candidateDirectories"];
   private readonly environment: NodeJS.ProcessEnv;
+  private readonly platform: NodeJS.Platform;
 
   constructor(private readonly agent: JsonAgentKind, options: JsonAgentIntegrationOptions = {}) {
     this.userHome = options.userHome ?? homedir();
     this.environment = options.environment ?? process.env;
+    this.platform = options.platform ?? process.platform;
     this.selectedConfigDirectory = options.configDirectory ? normalizeAgentConfigDirectory(options.configDirectory, this.userHome, this.agent) : undefined;
     this.candidateDirectories = options.candidateDirectories;
     this.skillSource = options.skillSource ?? process.env.HOPLANE_CODEX_SKILL_SOURCE ?? join(process.cwd(), "integrations", "codex", "hoplane");
@@ -301,17 +305,17 @@ export class JsonAgentIntegrationService {
     const discovered = await this.discoverConfigDirectories();
     const preferred = this.selectedConfigDirectory
       ?? discovered.find((candidate) => candidate.configStatus === "VALID")?.path
-      ?? defaultAgentConfigDirectory(this.agent, this.userHome);
+      ?? defaultAgentConfigDirectory(this.agent, this.userHome, this.environment, this.platform);
     const configDirectory = normalizeAgentConfigDirectory(preferred, this.userHome, this.agent);
     if (!discovered.some((candidate) => candidate.path === configDirectory)) {
-      discovered.unshift(await inspectJsonAgentDirectory(this.agent, configDirectory, "已选择的目录", "SELECTED", this.runtime));
+      discovered.unshift(await inspectJsonAgentDirectory(this.agent, configDirectory, "已选择的目录", "SELECTED", this.runtime, this.userHome));
     }
     const candidates = discovered.map((candidate) => ({ ...candidate, selected: candidate.path === configDirectory }));
     const selectedCandidate = candidates.find((candidate) => candidate.selected)!;
-    const { agentHome, skillPath, configPath } = jsonAgentPaths(this.agent, configDirectory);
+    const { agentHome, skillPath, configPath } = jsonAgentPaths(this.agent, configDirectory, this.userHome);
     const [skillInstalled, configInspection] = await Promise.all([
       access(join(skillPath, "SKILL.md"), constants.R_OK).then(() => true).catch(() => false),
-      inspectJsonAgentConfig(configPath, this.runtime)
+      inspectJsonAgentConfig(configPath, this.runtime, this.agent)
     ]);
     return {
       agent: this.agent,
@@ -324,7 +328,7 @@ export class JsonAgentIntegrationService {
       skillPath,
       configPath,
       runtimeCommand: this.runtime.command,
-      configSnippet: renderJsonMcpConfig(this.runtime),
+      configSnippet: renderJsonMcpConfig(this.runtime, this.agent),
       canInstall: selectedCandidate.writable && selectedCandidate.configStatus !== "INVALID",
       configError: configInspection.error,
       candidates
@@ -333,7 +337,7 @@ export class JsonAgentIntegrationService {
 
   async selectConfigDirectory(path: string): Promise<JsonAgentIntegrationState> {
     const normalized = normalizeAgentConfigDirectory(path, this.userHome, this.agent);
-    const candidate = await inspectJsonAgentDirectory(this.agent, normalized, "手动选择", "SELECTED", this.runtime);
+    const candidate = await inspectJsonAgentDirectory(this.agent, normalized, "手动选择", "SELECTED", this.runtime, this.userHome);
     if (candidate.configStatus === "INVALID") {
       throw new AppError("AGENT_INTEGRATION_DIRECTORY_INVALID", candidate.configDetail, false, undefined, { agent: this.agent, path: normalized }, 409);
     }
@@ -361,6 +365,8 @@ export class JsonAgentIntegrationService {
         { path: join(this.userHome, ".config", "workbuddy"), label: "XDG 常见目录", source: "COMMON" }
       );
       if (this.environment.APPDATA) seeds.push({ path: join(this.environment.APPDATA, ".workbuddy"), label: "Windows Roaming 用户目录", source: "COMMON" });
+    } else if (this.agent === "trae") {
+      seeds.push(...traeConfigDirectories(this.userHome, this.environment, this.platform));
     } else {
       seeds.push({ path: this.userHome, label: "用户主目录", source: "DEFAULT" });
       if (this.environment.USERPROFILE) seeds.push({ path: this.environment.USERPROFILE, label: "Windows 用户目录", source: "COMMON" });
@@ -370,7 +376,7 @@ export class JsonAgentIntegrationService {
       const path = normalizeAgentConfigDirectory(seed.path, this.userHome, this.agent);
       if (!unique.has(path)) unique.set(path, { ...seed, path });
     }
-    return Promise.all([...unique.values()].map((seed) => inspectJsonAgentDirectory(this.agent, seed.path, seed.label, seed.source, this.runtime)));
+    return Promise.all([...unique.values()].map((seed) => inspectJsonAgentDirectory(this.agent, seed.path, seed.label, seed.source, this.runtime, this.userHome)));
   }
 
   async install(): Promise<JsonAgentIntegrationState> {
@@ -393,7 +399,7 @@ export class JsonAgentIntegrationService {
       ...current,
       mcpServers: {
         ...currentServers,
-        hoplane: renderJsonMcpServer(this.runtime)
+        hoplane: renderJsonMcpServer(this.runtime, this.agent)
       }
     };
     const nextText = `${JSON.stringify(next, null, 2)}\n`;
@@ -423,8 +429,12 @@ export class JsonAgentIntegrationService {
   }
 }
 
-function jsonAgentPaths(agent: JsonAgentKind, configDirectory: string): { agentHome: string; skillPath: string; configPath: string } {
-  const agentHome = agent === "claude-code" ? join(configDirectory, ".claude") : configDirectory;
+function jsonAgentPaths(agent: JsonAgentKind, configDirectory: string, userHome: string): { agentHome: string; skillPath: string; configPath: string } {
+  const agentHome = agent === "claude-code"
+    ? join(configDirectory, ".claude")
+    : agent === "trae"
+      ? join(userHome, isTraeCnDirectory(configDirectory) ? ".trae-cn" : ".trae")
+      : configDirectory;
   return {
     agentHome,
     skillPath: join(agentHome, "skills", "hoplane"),
@@ -432,10 +442,32 @@ function jsonAgentPaths(agent: JsonAgentKind, configDirectory: string): { agentH
   };
 }
 
-function defaultAgentConfigDirectory(agent: JsonAgentKind, userHome: string): string {
+function defaultAgentConfigDirectory(agent: JsonAgentKind, userHome: string, environment: NodeJS.ProcessEnv, platform: NodeJS.Platform): string {
   if (agent === "cursor") return join(userHome, ".cursor");
   if (agent === "workbuddy") return join(userHome, ".workbuddy");
+  if (agent === "trae") return traeConfigDirectories(userHome, environment, platform)[0]!.path;
   return userHome;
+}
+
+function traeConfigDirectories(
+  userHome: string,
+  environment: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform
+): Array<{ path: string; label: string; source: JsonAgentHomeCandidate["source"] }> {
+  const configRoot = platform === "darwin"
+    ? join(userHome, "Library", "Application Support")
+    : platform === "win32"
+      ? environment.APPDATA ?? join(userHome, "AppData", "Roaming")
+      : environment.XDG_CONFIG_HOME ?? join(userHome, ".config");
+  return [
+    { path: join(configRoot, "Trae", "User"), label: "Trae 用户配置", source: "DEFAULT" },
+    { path: join(configRoot, "Trae CN", "User"), label: "Trae 国内版用户配置", source: "COMMON" },
+    { path: join(configRoot, "TRAE SOLO", "User"), label: "TRAE SOLO 用户配置", source: "COMMON" }
+  ];
+}
+
+function isTraeCnDirectory(path: string): boolean {
+  return /(?:^|[\\/])trae(?:[ _-]?cn)(?:[\\/]|$)/iu.test(path);
 }
 
 async function inspectJsonAgentDirectory(
@@ -443,12 +475,13 @@ async function inspectJsonAgentDirectory(
   path: string,
   label: string,
   source: JsonAgentHomeCandidate["source"],
-  runtime: StdioRuntime
+  runtime: StdioRuntime,
+  userHome: string
 ): Promise<JsonAgentHomeCandidate> {
   const info = await stat(path).catch(() => null);
   const exists = info !== null;
   const isDirectory = Boolean(info?.isDirectory());
-  const { agentHome, configPath } = jsonAgentPaths(agent, path);
+  const { agentHome, configPath } = jsonAgentPaths(agent, path, userHome);
   let configStatus: JsonAgentHomeCandidate["configStatus"] = "MISSING";
   let configDetail = `未找到 ${jsonAgentConfigFileName(agent)}，安装时将创建`;
   if (exists && !isDirectory) {
@@ -457,7 +490,7 @@ async function inspectJsonAgentDirectory(
   } else {
     const configInfo = await stat(configPath).catch(() => null);
     if (configInfo) {
-      const inspection = await inspectJsonAgentConfig(configPath, runtime);
+      const inspection = await inspectJsonAgentConfig(configPath, runtime, agent);
       configStatus = inspection.error ? "INVALID" : "VALID";
       configDetail = inspection.error ?? `${jsonAgentConfigFileName(agent)} 可读取并通过 JSON 结构检查`;
     }
@@ -603,20 +636,21 @@ function resolveStdioRuntime(): StdioRuntime {
   };
 }
 
-export function renderJsonMcpConfig(runtime: StdioRuntime): string {
-  return JSON.stringify({ mcpServers: { hoplane: renderJsonMcpServer(runtime) } }, null, 2);
+export function renderJsonMcpConfig(runtime: StdioRuntime, agent: JsonAgentKind = "cursor"): string {
+  return JSON.stringify({ mcpServers: { hoplane: renderJsonMcpServer(runtime, agent) } }, null, 2);
 }
 
-function renderJsonMcpServer(runtime: StdioRuntime): Record<string, unknown> {
+function renderJsonMcpServer(runtime: StdioRuntime, agent: JsonAgentKind): Record<string, unknown> {
+  const traeTimeouts = agent === "trae" ? { START_MCP_TIMEOUT_MS: "30000", RUN_MCP_TIMEOUT_MS: "3600000" } : {};
   return {
-    type: "stdio",
+    ...(agent === "trae" ? {} : { type: "stdio" }),
     command: runtime.command,
     args: [runtime.adapterEntry],
-    ...(runtime.electronRunAsNode ? { env: { ELECTRON_RUN_AS_NODE: "1" } } : {})
+    ...(runtime.electronRunAsNode || agent === "trae" ? { env: { ...traeTimeouts, ...(runtime.electronRunAsNode ? { ELECTRON_RUN_AS_NODE: "1" } : {}) } } : {})
   };
 }
 
-async function inspectJsonAgentConfig(configPath: string, runtime: StdioRuntime): Promise<{ configured: boolean; error: string | null }> {
+async function inspectJsonAgentConfig(configPath: string, runtime: StdioRuntime, agent: JsonAgentKind): Promise<{ configured: boolean; error: string | null }> {
   const info = await stat(configPath).catch(() => null);
   if (!info) return { configured: false, error: null };
   if (!info.isFile()) return { configured: false, error: "配置路径不是普通文件" };
@@ -626,7 +660,7 @@ async function inspectJsonAgentConfig(configPath: string, runtime: StdioRuntime)
     const servers = asPlainObject(config.mcpServers);
     if (config.mcpServers !== undefined && !servers) return { configured: false, error: "mcpServers 必须是 JSON 对象" };
     const hoplane = asPlainObject(servers?.hoplane);
-    return { configured: Boolean(hoplane && jsonMcpServerMatches(hoplane, runtime)), error: null };
+    return { configured: Boolean(hoplane && jsonMcpServerMatches(hoplane, runtime, agent)), error: null };
   } catch (error) {
     return { configured: false, error: error instanceof Error ? error.message : "配置文件无法读取" };
   }
@@ -652,9 +686,9 @@ function asPlainObject(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
 
-function jsonMcpServerMatches(server: Record<string, unknown>, runtime: StdioRuntime): boolean {
+function jsonMcpServerMatches(server: Record<string, unknown>, runtime: StdioRuntime, agent: JsonAgentKind): boolean {
   const env = asPlainObject(server.env);
-  return server.type === "stdio"
+  return (server.type === "stdio" || agent === "trae" && server.type === undefined)
     && server.command === runtime.command
     && Array.isArray(server.args)
     && server.args.length === 1

@@ -31,11 +31,11 @@ import type { AuditLog, Credential, Host, HostLogin, HostMonitorEvent, Policy, P
 
 type Page = "hosts" | "terminal" | "policies" | "audit" | "settings";
 type ThemePreference = "system" | "dark" | "light";
-type IntegrationChannel = "codex" | "cursor" | "claude-code" | "workbuddy" | "other";
+type IntegrationChannel = "codex" | "cursor" | "claude-code" | "workbuddy" | "trae" | "other";
 type HostTestOutcome = "ok" | "error";
-const JSON_AGENT_NAMES = { cursor: "Cursor", "claude-code": "Claude Code", workbuddy: "WorkBuddy" } as const;
+const JSON_AGENT_NAMES = { cursor: "Cursor", "claude-code": "Claude Code", workbuddy: "WorkBuddy", trae: "Trae" } as const;
 type JsonAgentChannel = keyof typeof JSON_AGENT_NAMES;
-function agentStateKey(agent: JsonAgentChannel): "cursor" | "claudeCode" | "workbuddy" {
+function agentStateKey(agent: JsonAgentChannel): "cursor" | "claudeCode" | "workbuddy" | "trae" {
   return agent === "claude-code" ? "claudeCode" : agent;
 }
 interface VaultState { localInitialized: boolean; unlocked: boolean }
@@ -1132,7 +1132,7 @@ interface JsonAgentIntegrationState {
   configDirectory: string; agentHome: string; skillPath: string; configPath: string; runtimeCommand: string; configSnippet: string;
   canInstall: boolean; configError: string | null; candidates: CodexHomeCandidate[];
 }
-interface AgentIntegrationsState { cursor: JsonAgentIntegrationState; claudeCode: JsonAgentIntegrationState; workbuddy: JsonAgentIntegrationState }
+interface AgentIntegrationsState { cursor: JsonAgentIntegrationState; claudeCode: JsonAgentIntegrationState; workbuddy: JsonAgentIntegrationState; trae: JsonAgentIntegrationState }
 
 function VaultGate({ state, notify, onReady }: { state: VaultState; notify: Notify; onReady(state: VaultState): void }) {
   const [busy, setBusy] = useState(false);
@@ -1165,13 +1165,13 @@ function SettingsPage({ notify, vaultState, onVaultChanged, onExportConfig, onIm
   const [integrationBusy, setIntegrationBusy] = useState(false);
   const [showToken, setShowToken] = useState(false);
   const [manualCodexHome, setManualCodexHome] = useState("");
-  const [manualAgentDirectories, setManualAgentDirectories] = useState<Record<JsonAgentChannel, string>>({ cursor: "", "claude-code": "", workbuddy: "" });
+  const [manualAgentDirectories, setManualAgentDirectories] = useState<Record<JsonAgentChannel, string>>({ cursor: "", "claude-code": "", workbuddy: "", trae: "" });
   const [integrationChannel, setIntegrationChannel] = useState<IntegrationChannel>("codex");
   const load = useCallback(async () => {
     try {
       const [mcpState, codexState, agentStates] = await Promise.all([api<McpSettings>("/v1/mcp-settings"), api<CodexIntegrationState>("/v1/codex-integration"), api<AgentIntegrationsState>("/v1/agent-integrations")]);
       setSettings(mcpState); setCodex(codexState); setAgentIntegrations(agentStates); setManualCodexHome(codexState.codexHome);
-      setManualAgentDirectories({ cursor: agentStates.cursor.configDirectory, "claude-code": agentStates.claudeCode.configDirectory, workbuddy: agentStates.workbuddy.configDirectory });
+      setManualAgentDirectories({ cursor: agentStates.cursor.configDirectory, "claude-code": agentStates.claudeCode.configDirectory, workbuddy: agentStates.workbuddy.configDirectory, trae: agentStates.trae.configDirectory });
     }
     catch (error) { notify("error", message(error)); }
   }, [notify]);
@@ -1296,7 +1296,7 @@ function SettingsPage({ notify, vaultState, onVaultChanged, onExportConfig, onIm
     try {
       const next = await api<AgentIntegrationsState>("/v1/agent-integrations");
       setAgentIntegrations(next);
-      setManualAgentDirectories({ cursor: next.cursor.configDirectory, "claude-code": next.claudeCode.configDirectory, workbuddy: next.workbuddy.configDirectory });
+      setManualAgentDirectories({ cursor: next.cursor.configDirectory, "claude-code": next.claudeCode.configDirectory, workbuddy: next.workbuddy.configDirectory, trae: next.trae.configDirectory });
       notify("ok", "常见配置目录已重新扫描");
     } catch (error) { notify("error", `目录扫描失败：${message(error)}`); }
     finally { setIntegrationBusy(false); }
@@ -1307,10 +1307,11 @@ function SettingsPage({ notify, vaultState, onVaultChanged, onExportConfig, onIm
     { id: "cursor", label: "Cursor", detail: "一键集成" },
     { id: "claude-code", label: "Claude Code", detail: "一键集成" },
     { id: "workbuddy", label: "WorkBuddy", detail: "一键集成" },
+    { id: "trae", label: "Trae", detail: "一键集成" },
     { id: "other", label: "其他 Agent", detail: "通用配置" }
   ];
 
-  const jsonChannel: JsonAgentChannel | null = integrationChannel === "cursor" || integrationChannel === "claude-code" || integrationChannel === "workbuddy" ? integrationChannel : null;
+  const jsonChannel: JsonAgentChannel | null = integrationChannel === "cursor" || integrationChannel === "claude-code" || integrationChannel === "workbuddy" || integrationChannel === "trae" ? integrationChannel : null;
   const selectedAgentInstalled = jsonChannel ? agentIntegrations?.[agentStateKey(jsonChannel)]?.installed ?? false : false;
 
   return <section><PageHeader eyebrow="Integrations" title="Agent 接入">
@@ -1369,7 +1370,7 @@ function AgentOneClickIntegration({ channel, integration, busy, manualDirectory,
   onCopy(value: string, label: string): void;
 }) {
   const name = JSON_AGENT_NAMES[channel];
-  const directoryPlaceholder = channel === "cursor" ? "/Users/name/.cursor" : channel === "workbuddy" ? "/Users/name/.workbuddy" : "/Users/name";
+  const directoryPlaceholder = channel === "cursor" ? "/Users/name/.cursor" : channel === "workbuddy" ? "/Users/name/.workbuddy" : channel === "trae" ? "/Users/name/Library/Application Support/Trae/User" : "/Users/name";
   return <article className="panel codex-integration agent-native-integration" id={`integration-panel-${channel}`} role="tabpanel" aria-labelledby={`integration-tab-${channel}`}>
     <div className="codex-integration-head"><div><span className="eyebrow">Recommended · stdio</span><h2>{name} 一键集成</h2><p>自动安装 Hoplane Skill，并把 App 内置 stdio MCP 写入 {name} 的用户级配置。不依赖系统 Node、本地 HTTP 服务或访问 Token。</p></div><span className={`badge integration-status-badge ${integration?.installed ? "allow" : ""}`}>{integration?.installed ? "已安装" : "未安装"}</span></div>
     <div className="codex-home-discovery">

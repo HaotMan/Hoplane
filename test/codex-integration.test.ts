@@ -97,7 +97,7 @@ describe("Codex integration", () => {
     await expect(service.selectCodexHome("relative/codex")).rejects.toThrow(/absolute/u);
   });
 
-  it("installs user-level Skills and stdio MCP config for Cursor and Claude Code", async () => {
+  it("installs user-level Skills and stdio MCP config for JSON-based agents", async () => {
     const root = await mkdtemp(join(tmpdir(), "hoplane-agent-integrations-")); dirs.push(root);
     const source = join(root, "skill-source");
     const command = join(root, "Hoplane");
@@ -110,28 +110,74 @@ describe("Codex integration", () => {
     await writeFile(adapterEntry, "", "utf8");
     await writeFile(diagnoseEntry, "", "utf8");
     await mkdir(join(root, ".cursor"), { recursive: true });
+    await mkdir(join(root, "Library", "Application Support", "Trae", "User"), { recursive: true });
+    await mkdir(join(root, "Library", "Application Support", "TRAE SOLO", "User"), { recursive: true });
     await writeFile(join(root, ".cursor", "mcp.json"), JSON.stringify({ mcpServers: { existing: { command: "existing" } }, keep: true }), "utf8");
     await writeFile(join(root, ".claude.json"), JSON.stringify({ theme: "dark" }), "utf8");
+    await writeFile(join(root, "Library", "Application Support", "Trae", "User", "mcp.json"), JSON.stringify({ traeSetting: true }), "utf8");
+    await writeFile(join(root, "Library", "Application Support", "TRAE SOLO", "User", "mcp.json"), JSON.stringify({ soloSetting: true }), "utf8");
     const options = { userHome: root, skillSource: source, runtime: { command, adapterEntry, diagnoseEntry, electronRunAsNode: true } };
 
     const cursor = await new JsonAgentIntegrationService("cursor", options).install();
     const claude = await new JsonAgentIntegrationService("claude-code", options).install();
     const workbuddy = await new JsonAgentIntegrationService("workbuddy", options).install();
+    const trae = await new JsonAgentIntegrationService("trae", { ...options, platform: "darwin" }).install();
+    const traeSolo = await new JsonAgentIntegrationService("trae", {
+      ...options,
+      configDirectory: join(root, "Library", "Application Support", "TRAE SOLO", "User"),
+      platform: "darwin"
+    }).install();
 
     expect(cursor).toMatchObject({ installed: true, restartRequired: true, skillPath: join(root, ".cursor", "skills", "hoplane") });
     expect(claude).toMatchObject({ installed: true, restartRequired: true, skillPath: join(root, ".claude", "skills", "hoplane") });
     expect(workbuddy).toMatchObject({ installed: true, restartRequired: true, skillPath: join(root, ".workbuddy", "skills", "hoplane"), configPath: join(root, ".workbuddy", "mcp.json") });
+    expect(trae).toMatchObject({ installed: true, restartRequired: true, skillPath: join(root, ".trae", "skills", "hoplane"), configPath: join(root, "Library", "Application Support", "Trae", "User", "mcp.json") });
+    expect(traeSolo).toMatchObject({ installed: true, restartRequired: true, skillPath: join(root, ".trae", "skills", "hoplane"), configPath: join(root, "Library", "Application Support", "TRAE SOLO", "User", "mcp.json") });
     expect(await readFile(join(cursor.skillPath, "SKILL.md"), "utf8")).toContain("name: hoplane");
     expect(await readFile(join(claude.skillPath, "scripts", "diagnose.cmd"), "utf8")).toContain("ELECTRON_RUN_AS_NODE=1");
     const cursorConfig = JSON.parse(await readFile(join(root, ".cursor", "mcp.json"), "utf8"));
     const claudeConfig = JSON.parse(await readFile(join(root, ".claude.json"), "utf8"));
     const workbuddyConfig = JSON.parse(await readFile(join(root, ".workbuddy", "mcp.json"), "utf8"));
+    const traeConfig = JSON.parse(await readFile(join(root, "Library", "Application Support", "Trae", "User", "mcp.json"), "utf8"));
+    const traeSoloConfig = JSON.parse(await readFile(join(root, "Library", "Application Support", "TRAE SOLO", "User", "mcp.json"), "utf8"));
     expect(cursorConfig).toMatchObject({ keep: true, mcpServers: { existing: { command: "existing" }, hoplane: { type: "stdio", command, args: [adapterEntry] } } });
     expect(claudeConfig).toMatchObject({ theme: "dark", mcpServers: { hoplane: { type: "stdio", command, args: [adapterEntry] } } });
     expect(workbuddyConfig).toMatchObject({ mcpServers: { hoplane: { type: "stdio", command, args: [adapterEntry] } } });
+    expect(traeConfig).toMatchObject({ traeSetting: true, mcpServers: { hoplane: { command, args: [adapterEntry], env: { START_MCP_TIMEOUT_MS: "30000", RUN_MCP_TIMEOUT_MS: "3600000", ELECTRON_RUN_AS_NODE: "1" } } } });
+    expect(traeConfig.mcpServers.hoplane).not.toHaveProperty("type");
+    expect(traeSoloConfig).toMatchObject({ soloSetting: true, mcpServers: { hoplane: { command, args: [adapterEntry] } } });
     expect((await new JsonAgentIntegrationService("cursor", options).getState()).installed).toBe(true);
     expect((await new JsonAgentIntegrationService("claude-code", options).getState()).installed).toBe(true);
     expect((await new JsonAgentIntegrationService("workbuddy", options).getState()).installed).toBe(true);
+    expect((await new JsonAgentIntegrationService("trae", { ...options, platform: "darwin" }).getState()).installed).toBe(true);
+    expect((await new JsonAgentIntegrationService("trae", { ...options, configDirectory: join(root, "Library", "Application Support", "TRAE SOLO", "User"), platform: "darwin" }).getState()).installed).toBe(true);
+  });
+
+  it("discovers Trae, Trae CN, and TRAE SOLO user configuration directories", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hoplane-trae-discovery-")); dirs.push(root);
+    const international = join(root, "Library", "Application Support", "Trae", "User");
+    const china = join(root, "Library", "Application Support", "Trae CN", "User");
+    const solo = join(root, "Library", "Application Support", "TRAE SOLO", "User");
+    await mkdir(international, { recursive: true });
+    await mkdir(china, { recursive: true });
+    await mkdir(solo, { recursive: true });
+    await writeFile(join(china, "mcp.json"), JSON.stringify({ mcpServers: {} }), "utf8");
+
+    const service = new JsonAgentIntegrationService("trae", { userHome: root, environment: {}, platform: "darwin", runtime });
+    const state = await service.getState();
+    expect(state.configDirectory).toBe(china);
+    expect(state.agentHome).toBe(join(root, ".trae-cn"));
+    expect(state.skillPath).toBe(join(root, ".trae-cn", "skills", "hoplane"));
+    expect(state.configPath).toBe(join(china, "mcp.json"));
+    expect(state.candidates.map((candidate) => candidate.path)).toEqual([international, china, solo]);
+
+    const windows = await new JsonAgentIntegrationService("trae", {
+      userHome: root,
+      environment: { APPDATA: join(root, "AppData", "Roaming") },
+      platform: "win32",
+      runtime
+    }).getState();
+    expect(windows.configDirectory).toBe(join(root, "AppData", "Roaming", "Trae", "User"));
   });
 
   it("scans bounded Cursor and Claude Code config directories and supports manual selection", async () => {
