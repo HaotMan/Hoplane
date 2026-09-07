@@ -180,6 +180,60 @@ describe("Codex integration", () => {
     expect(windows.configDirectory).toBe(join(root, "AppData", "Roaming", "Trae", "User"));
   });
 
+  it("installs ZCode skill and merges into the nested mcp.servers block", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hoplane-zcode-integration-")); dirs.push(root);
+    const source = join(root, "skill-source");
+    const command = join(root, "Hoplane");
+    const adapterEntry = join(root, "index.js");
+    const diagnoseEntry = join(root, "diagnose.js");
+    await mkdir(source, { recursive: true });
+    await writeFile(join(source, "SKILL.md"), "---\nname: hoplane\ndescription: test\n---\n", "utf8");
+    await writeFile(command, "#!/bin/sh\n", { mode: 0o700 });
+    await chmod(command, 0o700);
+    await writeFile(adapterEntry, "", "utf8");
+    await writeFile(diagnoseEntry, "", "utf8");
+    await mkdir(join(root, ".zcode", "cli"), { recursive: true });
+    await writeFile(join(root, ".zcode", "cli", "config.json"), JSON.stringify({
+      plugins: { "browser-use": true },
+      mcp: { servers: { existing: { command: "existing" } } }
+    }), "utf8");
+    const options = { userHome: root, skillSource: source, runtime: { command, adapterEntry, diagnoseEntry, electronRunAsNode: true } };
+
+    const state = await new JsonAgentIntegrationService("zcode", options).install();
+
+    expect(state).toMatchObject({
+      installed: true,
+      restartRequired: true,
+      skillPath: join(root, ".zcode", "skills", "hoplane"),
+      configPath: join(root, ".zcode", "cli", "config.json")
+    });
+    expect(await readFile(join(state.skillPath, "SKILL.md"), "utf8")).toContain("name: hoplane");
+    const config = JSON.parse(await readFile(join(root, ".zcode", "cli", "config.json"), "utf8"));
+    expect(config).toMatchObject({
+      plugins: { "browser-use": true },
+      mcp: { servers: { existing: { command: "existing" }, hoplane: { command, args: [adapterEntry], env: { ELECTRON_RUN_AS_NODE: "1" } } } }
+    });
+    expect(config.mcp.servers.hoplane).not.toHaveProperty("type");
+    const refreshed = await new JsonAgentIntegrationService("zcode", options).getState();
+    expect(refreshed.installed).toBe(true);
+    expect(refreshed.configSnippet).toContain('"servers"');
+  });
+
+  it("discovers the ZCode CLI directory and refuses malformed mcp blocks", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hoplane-zcode-discovery-")); dirs.push(root);
+    await mkdir(join(root, ".zcode", "cli"), { recursive: true });
+    await writeFile(join(root, ".zcode", "cli", "config.json"), JSON.stringify({ mcp: { servers: [] } }), "utf8");
+
+    const state = await new JsonAgentIntegrationService("zcode", { userHome: root, environment: {}, runtime }).getState();
+
+    expect(state.configDirectory).toBe(join(root, ".zcode", "cli"));
+    expect(state.agentHome).toBe(join(root, ".zcode"));
+    expect(state.configPath).toBe(join(root, ".zcode", "cli", "config.json"));
+    expect(state.skillPath).toBe(join(root, ".zcode", "skills", "hoplane"));
+    expect(state.canInstall).toBe(false);
+    expect(state.configError).toMatch(/mcp\.servers/u);
+  });
+
   it("scans bounded Cursor and Claude Code config directories and supports manual selection", async () => {
     const root = await mkdtemp(join(tmpdir(), "hoplane-agent-discovery-")); dirs.push(root);
     const cursorValid = join(root, ".cursor");

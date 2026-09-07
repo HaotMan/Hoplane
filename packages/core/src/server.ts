@@ -111,11 +111,13 @@ const savedCursorDirectory = database.getSetting<string | null>("integration.cur
 const savedClaudeCodeDirectory = database.getSetting<string | null>("integration.claude-code.directory", null);
 const savedWorkbuddyDirectory = database.getSetting<string | null>("integration.workbuddy.directory", null);
 const savedTraeDirectory = database.getSetting<string | null>("integration.trae.directory", null);
+const savedZcodeDirectory = database.getSetting<string | null>("integration.zcode.directory", null);
 const cursorIntegration = new JsonAgentIntegrationService("cursor", savedCursorDirectory ? { configDirectory: savedCursorDirectory } : {});
 const claudeCodeIntegration = new JsonAgentIntegrationService("claude-code", savedClaudeCodeDirectory ? { configDirectory: savedClaudeCodeDirectory } : {});
 const workbuddyIntegration = new JsonAgentIntegrationService("workbuddy", savedWorkbuddyDirectory ? { configDirectory: savedWorkbuddyDirectory } : {});
 const traeIntegration = new JsonAgentIntegrationService("trae", savedTraeDirectory ? { configDirectory: savedTraeDirectory } : {});
-const jsonAgentIntegrations = { cursor: cursorIntegration, "claude-code": claudeCodeIntegration, workbuddy: workbuddyIntegration, trae: traeIntegration } as const;
+const zcodeIntegration = new JsonAgentIntegrationService("zcode", savedZcodeDirectory ? { configDirectory: savedZcodeDirectory } : {});
+const jsonAgentIntegrations = { cursor: cursorIntegration, "claude-code": claudeCodeIntegration, workbuddy: workbuddyIntegration, trae: traeIntegration, zcode: zcodeIntegration } as const;
 const staticRoot = options.staticRoot ?? resolveDefaultStaticRoot();
 const uiBuildId = await computeUiBuildId(staticRoot);
 
@@ -372,18 +374,18 @@ async function routeApi(request: IncomingMessage, response: ServerResponse, url:
     return json(response, 200, await codexIntegration.diagnose());
   }
   if (method === "GET" && url.pathname === "/v1/agent-integrations") {
-    const [cursor, claudeCode, workbuddy, trae] = await Promise.all([cursorIntegration.getState(), claudeCodeIntegration.getState(), workbuddyIntegration.getState(), traeIntegration.getState()]);
-    return json(response, 200, { cursor, claudeCode, workbuddy, trae });
+    const [cursor, claudeCode, workbuddy, trae, zcode] = await Promise.all([cursorIntegration.getState(), claudeCodeIntegration.getState(), workbuddyIntegration.getState(), traeIntegration.getState(), zcodeIntegration.getState()]);
+    return json(response, 200, { cursor, claudeCode, workbuddy, trae, zcode });
   }
   if (method === "POST" && url.pathname.startsWith("/v1/agent-integrations/") && url.pathname.endsWith("/select")) {
-    const agent = z.enum(["cursor", "claude-code", "workbuddy", "trae"]).parse(url.pathname.split("/")[3]);
+    const agent = z.enum(["cursor", "claude-code", "workbuddy", "trae", "zcode"]).parse(url.pathname.split("/")[3]);
     const input = z.object({ path: z.string().trim().min(1).max(4096) }).parse(await body(request));
     const state = await jsonAgentIntegrations[agent].selectConfigDirectory(input.path);
     database.setSetting(`integration.${agent}.directory`, state.configDirectory);
     return json(response, 200, state);
   }
   if (method === "POST" && url.pathname.startsWith("/v1/agent-integrations/") && url.pathname.endsWith("/install")) {
-    const agent = z.enum(["cursor", "claude-code", "workbuddy", "trae"]).parse(url.pathname.split("/")[3]);
+    const agent = z.enum(["cursor", "claude-code", "workbuddy", "trae", "zcode"]).parse(url.pathname.split("/")[3]);
     return json(response, 200, await jsonAgentIntegrations[agent].install());
   }
   if (method === "GET" && url.pathname === "/v1/hosts") {

@@ -52,17 +52,18 @@ interface CodexIntegrationOptions {
   environment?: NodeJS.ProcessEnv;
 }
 
-export type JsonAgentKind = "cursor" | "claude-code" | "workbuddy" | "trae";
+export type JsonAgentKind = "cursor" | "claude-code" | "workbuddy" | "trae" | "zcode";
 
 export const JSON_AGENT_LABELS: Record<JsonAgentKind, string> = {
   cursor: "Cursor",
   "claude-code": "Claude Code",
   workbuddy: "WorkBuddy",
-  trae: "Trae"
+  trae: "Trae",
+  zcode: "ZCode"
 };
 
 function jsonAgentConfigFileName(agent: JsonAgentKind): string {
-  return agent === "claude-code" ? ".claude.json" : "mcp.json";
+  return agent === "claude-code" ? ".claude.json" : agent === "zcode" ? "config.json" : "mcp.json";
 }
 
 export interface JsonAgentIntegrationState {
@@ -367,6 +368,8 @@ export class JsonAgentIntegrationService {
       if (this.environment.APPDATA) seeds.push({ path: join(this.environment.APPDATA, ".workbuddy"), label: "Windows Roaming 用户目录", source: "COMMON" });
     } else if (this.agent === "trae") {
       seeds.push(...traeConfigDirectories(this.userHome, this.environment, this.platform));
+    } else if (this.agent === "zcode") {
+      seeds.push({ path: join(this.userHome, ".zcode", "cli"), label: "ZCode CLI 配置目录", source: "DEFAULT" });
     } else {
       seeds.push({ path: this.userHome, label: "用户主目录", source: "DEFAULT" });
       if (this.environment.USERPROFILE) seeds.push({ path: this.environment.USERPROFILE, label: "Windows 用户目录", source: "COMMON" });
@@ -393,15 +396,16 @@ export class JsonAgentIntegrationService {
     await rejectSymlink(state.configPath);
     await mkdir(dirname(state.configPath), { recursive: true, mode: 0o700 });
     const currentText = await readFile(state.configPath, "utf8").catch(() => "");
-    const current = parseJsonAgentConfig(currentText, state.configPath);
-    const currentServers = asPlainObject(current.mcpServers) ?? {};
-    const next = {
-      ...current,
-      mcpServers: {
-        ...currentServers,
-        hoplane: renderJsonMcpServer(this.runtime, this.agent)
-      }
-    };
+    const current = parseJsonAgentConfig(currentText, state.configPath, this.agent);
+    const hoplaneServer = renderJsonMcpServer(this.runtime, this.agent);
+    // ZCode 把 MCP 挂在 mcp.servers 嵌套键下，与其他 Agent 的顶层 mcpServers 不同。
+    let next: Record<string, unknown>;
+    if (this.agent === "zcode") {
+      const mcp = asPlainObject(current.mcp) ?? {};
+      next = { ...current, mcp: { ...mcp, servers: { ...(asPlainObject(mcp.servers) ?? {}), hoplane: hoplaneServer } } };
+    } else {
+      next = { ...current, mcpServers: { ...(asPlainObject(current.mcpServers) ?? {}), hoplane: hoplaneServer } };
+    }
     const nextText = `${JSON.stringify(next, null, 2)}\n`;
     if (nextText !== currentText) {
       if (currentText) await writeFile(`${state.configPath}.hoplane-backup`, currentText, { mode: 0o600, flag: "wx" }).catch(() => undefined);
@@ -434,7 +438,9 @@ function jsonAgentPaths(agent: JsonAgentKind, configDirectory: string, userHome:
     ? join(configDirectory, ".claude")
     : agent === "trae"
       ? join(userHome, isTraeCnDirectory(configDirectory) ? ".trae-cn" : ".trae")
-      : configDirectory;
+      : agent === "zcode"
+        ? join(userHome, ".zcode")
+        : configDirectory;
   return {
     agentHome,
     skillPath: join(agentHome, "skills", "hoplane"),
@@ -446,6 +452,7 @@ function defaultAgentConfigDirectory(agent: JsonAgentKind, userHome: string, env
   if (agent === "cursor") return join(userHome, ".cursor");
   if (agent === "workbuddy") return join(userHome, ".workbuddy");
   if (agent === "trae") return traeConfigDirectories(userHome, environment, platform)[0]!.path;
+  if (agent === "zcode") return join(userHome, ".zcode", "cli");
   return userHome;
 }
 
@@ -637,17 +644,24 @@ function resolveStdioRuntime(): StdioRuntime {
 }
 
 export function renderJsonMcpConfig(runtime: StdioRuntime, agent: JsonAgentKind = "cursor"): string {
-  return JSON.stringify({ mcpServers: { hoplane: renderJsonMcpServer(runtime, agent) } }, null, 2);
+  const hoplane = renderJsonMcpServer(runtime, agent);
+  return JSON.stringify(agent === "zcode" ? { mcp: { servers: { hoplane } } } : { mcpServers: { hoplane } }, null, 2);
 }
 
 function renderJsonMcpServer(runtime: StdioRuntime, agent: JsonAgentKind): Record<string, unknown> {
   const traeTimeouts = agent === "trae" ? { START_MCP_TIMEOUT_MS: "30000", RUN_MCP_TIMEOUT_MS: "3600000" } : {};
   return {
-    ...(agent === "trae" ? {} : { type: "stdio" }),
+    ...(agent === "trae" || agent === "zcode" ? {} : { type: "stdio" }),
     command: runtime.command,
     args: [runtime.adapterEntry],
     ...(runtime.electronRunAsNode || agent === "trae" ? { env: { ...traeTimeouts, ...(runtime.electronRunAsNode ? { ELECTRON_RUN_AS_NODE: "1" } : {}) } } : {})
   };
+}
+
+/* ZCode 用户级配置里 MCP 位于 mcp.servers，其余 Agent 使用顶层 mcpServers。 */
+function jsonAgentMcpServers(config: Record<string, unknown>, agent: JsonAgentKind): Record<string, unknown> | null {
+  if (agent !== "zcode") return asPlainObject(config.mcpServers);
+  return asPlainObject(asPlainObject(config.mcp)?.servers);
 }
 
 async function inspectJsonAgentConfig(configPath: string, runtime: StdioRuntime, agent: JsonAgentKind): Promise<{ configured: boolean; error: string | null }> {
@@ -656,9 +670,8 @@ async function inspectJsonAgentConfig(configPath: string, runtime: StdioRuntime,
   if (!info.isFile()) return { configured: false, error: "配置路径不是普通文件" };
   if (info.size > 2 * 1024 * 1024) return { configured: false, error: "配置文件超过 2 MiB 安全上限" };
   try {
-    const config = parseJsonAgentConfig(await readFile(configPath, "utf8"), configPath);
-    const servers = asPlainObject(config.mcpServers);
-    if (config.mcpServers !== undefined && !servers) return { configured: false, error: "mcpServers 必须是 JSON 对象" };
+    const config = parseJsonAgentConfig(await readFile(configPath, "utf8"), configPath, agent);
+    const servers = jsonAgentMcpServers(config, agent);
     const hoplane = asPlainObject(servers?.hoplane);
     return { configured: Boolean(hoplane && jsonMcpServerMatches(hoplane, runtime, agent)), error: null };
   } catch (error) {
@@ -666,7 +679,7 @@ async function inspectJsonAgentConfig(configPath: string, runtime: StdioRuntime,
   }
 }
 
-function parseJsonAgentConfig(content: string, configPath: string): Record<string, unknown> {
+function parseJsonAgentConfig(content: string, configPath: string, agent: JsonAgentKind): Record<string, unknown> {
   if (!content.trim()) return {};
   if (content.includes("\0") || content.includes("\uFFFD")) {
     throw new AppError("AGENT_INTEGRATION_CONFIG_INVALID", `${configPath} 包含无效文本编码`, false, undefined, { path: configPath }, 409);
@@ -679,6 +692,13 @@ function parseJsonAgentConfig(content: string, configPath: string): Record<strin
   if (object.mcpServers !== undefined && !asPlainObject(object.mcpServers)) {
     throw new AppError("AGENT_INTEGRATION_CONFIG_INVALID", `${configPath} 的 mcpServers 必须是 JSON 对象`, false, undefined, { path: configPath }, 409);
   }
+  if (agent === "zcode" && object.mcp !== undefined) {
+    const mcp = asPlainObject(object.mcp);
+    if (!mcp) throw new AppError("AGENT_INTEGRATION_CONFIG_INVALID", `${configPath} 的 mcp 必须是 JSON 对象`, false, undefined, { path: configPath }, 409);
+    if (mcp.servers !== undefined && !asPlainObject(mcp.servers)) {
+      throw new AppError("AGENT_INTEGRATION_CONFIG_INVALID", `${configPath} 的 mcp.servers 必须是 JSON 对象`, false, undefined, { path: configPath }, 409);
+    }
+  }
   return object;
 }
 
@@ -688,7 +708,7 @@ function asPlainObject(value: unknown): Record<string, unknown> | null {
 
 function jsonMcpServerMatches(server: Record<string, unknown>, runtime: StdioRuntime, agent: JsonAgentKind): boolean {
   const env = asPlainObject(server.env);
-  return (server.type === "stdio" || agent === "trae" && server.type === undefined)
+  return (server.type === "stdio" || (agent === "trae" || agent === "zcode") && server.type === undefined)
     && server.command === runtime.command
     && Array.isArray(server.args)
     && server.args.length === 1
