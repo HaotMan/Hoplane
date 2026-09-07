@@ -17,7 +17,7 @@ import { LocalCredentialVaultManager } from "./vault-manager.js";
 import { PolicyService } from "../../policy/src/index.js";
 import { SSHConnectionManager } from "../../ssh-core/src/connection-manager.js";
 import { OperationService } from "./operation-service.js";
-import { parseSshConfig } from "./ssh-config-import.js";
+import { parseSshConfig, type ImportedSshHost } from "./ssh-config-import.js";
 import { McpServiceManager } from "./mcp-service.js";
 import { HostMonitor } from "./host-monitor.js";
 import { CodexIntegrationService, JsonAgentIntegrationService } from "./codex-integration.js";
@@ -422,26 +422,115 @@ async function routeApi(request: IncomingMessage, response: ServerResponse, url:
       throw error;
     }
   }
-  if (method === "POST" && url.pathname === "/v1/hosts/import-ssh-config") {
+  if (method === "POST" && url.pathname === "/v1/hosts/ssh-config/preview") {
     const input = z.object({ path: z.string().max(4096).default("~/.ssh/config") }).parse(await body(request));
-    const imported = await parseSshConfig(input.path);
+    const { hosts, warnings } = await parseSshConfig(input.path);
+    const existingNames = new Set(database.listHosts().map((host) => host.name.toLowerCase()));
+    return json(response, 200, {
+      hosts: hosts.map((host) => ({ ...host, duplicate: existingNames.has(host.alias.toLowerCase()) })),
+      warnings
+    });
+  }
+  if (method === "POST" && url.pathname === "/v1/hosts/import-ssh-config") {
+    const input = z.object({
+      path: z.string().max(4096).default("~/.ssh/config"),
+      groupName: z.string().trim().min(1).max(120).default("SSH Config"),
+      aliases: z.array(z.string().min(1).max(256)).max(2000).optional()
+    }).parse(await body(request));
+    const { hosts: parsed, warnings } = await parseSshConfig(input.path);
+    const selected = input.aliases
+      ? parsed.filter((item) => input.aliases!.some((alias) => alias.toLowerCase() === item.alias.toLowerCase()))
+      : parsed;
+    if (input.aliases) {
+      for (const alias of input.aliases) {
+        if (!parsed.some((item) => item.alias.toLowerCase() === alias.toLowerCase())) warnings.push(`未找到主机别名：${alias}`);
+      }
+    }
+    const existingByName = new Map(database.listHosts().map((host) => [host.name.toLowerCase(), host.id]));
+    const pending = selected.filter((item) => {
+      if (existingByName.has(item.alias.toLowerCase())) {
+        warnings.push(`已跳过同名主机：${item.alias}`);
+        return false;
+      }
+      return true;
+    });
     const defaultPolicy = database.listPolicies().find((policy) => policy.name === DEFAULT_POLICY_TEMPLATE.name)
       ?? database.listPolicies()[0];
-    const created = [];
-    for (const item of imported) {
+    const pendingByName = new Map(pending.map((item) => [item.alias.toLowerCase(), item]));
+    const createdByName = new Map<string, Host>();
+    const created: Host[] = [];
+
+    const createImported = (item: ImportedSshHost, jumpHostId: string | null): Host => {
       let credentialId: string | null = null;
       if (item.identityFile) {
         credentialId = database.createCredential(`${item.alias} key`, "PRIVATE_KEY", null, { privateKeyPath: item.identityFile }).id;
       } else if (process.env.SSH_AUTH_SOCK) {
         credentialId = database.createCredential(`${item.alias} agent`, "SSH_AGENT", null, {}).id;
       }
-      created.push(database.createHost({
-        name: item.alias, hostname: item.hostname, port: item.port, username: item.username, credentialId,
-        policyId: defaultPolicy?.id ?? null, groupName: "SSH Config", tags: ["imported"], defaultDirectory: null,
+      const host = database.createHost({
+        name: item.alias, hostname: item.hostname, port: item.port, username: item.username, credentialId, jumpHostId,
+        policyId: defaultPolicy?.id ?? null, groupName: input.groupName, tags: ["imported"], defaultDirectory: null,
         enabled: true, aiAccessEnabled: false
-      }));
+      });
+      createdByName.set(host.name.toLowerCase(), host);
+      created.push(host);
+      return host;
+    };
+    const createImportedDirect = (item: ImportedSshHost, warning: string): void => {
+      warnings.push(warning);
+      createImported(item, null);
+    };
+
+    // ProxyJump 依赖拓扑：跳板目标先创建；无进展说明存在循环引用，剩余条目降级为直连。
+    let remaining = [...pending];
+    while (remaining.length > 0) {
+      const deferred: ImportedSshHost[] = [];
+      for (const item of remaining) {
+        const jumpName = item.proxyJump;
+        if (jumpName) {
+          const jumpKey = jumpName.toLowerCase();
+          const createdJump = createdByName.get(jumpKey);
+          if (createdJump) {
+            try {
+              createImported(item, createdJump.id);
+              continue;
+            } catch (error) {
+              if (error instanceof AppError && (error.code === "JUMP_HOST_CYCLE" || error.code === "JUMP_HOST_NOT_FOUND")) {
+                createImportedDirect(item, `主机 ${item.alias} 的跳板配置无效（${error.code}），已降级为直连`);
+                continue;
+              }
+              throw error;
+            }
+          }
+          if (pendingByName.has(jumpKey)) {
+            deferred.push(item);
+            continue;
+          }
+          const libraryJump = existingByName.get(jumpKey);
+          if (libraryJump) {
+            try {
+              createImported(item, libraryJump);
+              continue;
+            } catch (error) {
+              if (error instanceof AppError && (error.code === "JUMP_HOST_CYCLE" || error.code === "JUMP_HOST_NOT_FOUND")) {
+                createImportedDirect(item, `主机 ${item.alias} 的跳板配置无效（${error.code}），已降级为直连`);
+                continue;
+              }
+              throw error;
+            }
+          }
+          createImportedDirect(item, `主机 ${item.alias} 的 ProxyJump 目标 ${jumpName} 无法解析，已降级为直连`);
+          continue;
+        }
+        createImported(item, null);
+      }
+      if (deferred.length === remaining.length) {
+        for (const item of deferred) createImportedDirect(item, `主机 ${item.alias} 的 ProxyJump 存在循环引用，已降级为直连`);
+        break;
+      }
+      remaining = deferred;
     }
-    return json(response, 201, { imported: created.length, hosts: created });
+    return json(response, 201, { imported: created.length, skipped: selected.length - created.length, hosts: created, warnings });
   }
   const hostMatch = url.pathname.match(/^\/v1\/hosts\/([0-9a-f-]+)$/u);
   if (hostMatch && method === "PATCH") {

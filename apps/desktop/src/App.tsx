@@ -1418,11 +1418,28 @@ function ExportConfigDialog({ notify, onClose }: { notify: Notify; onClose(): vo
   </Modal>;
 }
 
+interface SshPreviewHost {
+  alias: string;
+  hostname: string;
+  port: number;
+  username: string;
+  identityFile?: string;
+  proxyJump?: string;
+  duplicate: boolean;
+}
+
 function ImportConfigDialog({ notify, onClose, onImported }: { notify: Notify; onClose(): void; onImported(): void }) {
+  const [mode, setMode] = useState<"hoplane" | "ssh-config">("hoplane");
   const [busy, setBusy] = useState(false);
   const [errorText, setErrorText] = useState("");
   const [fileName, setFileName] = useState("");
   const [bundle, setBundle] = useState<unknown>(null);
+  const [sshPath, setSshPath] = useState("~/.ssh/config");
+  const [sshBusy, setSshBusy] = useState(false);
+  const [sshPreview, setSshPreview] = useState<SshPreviewHost[] | null>(null);
+  const [sshWarnings, setSshWarnings] = useState<string[]>([]);
+  const [sshSelected, setSshSelected] = useState<Set<string>>(() => new Set());
+  const [groupNames, setGroupNames] = useState<string[]>([]);
   async function chooseFile(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
     event.target.value = "";
@@ -1435,7 +1452,7 @@ function ImportConfigDialog({ notify, onClose, onImported }: { notify: Notify; o
       setFileName(file.name);
     } catch { setBundle(null); setFileName(""); setErrorText("请选择由 Hoplane 导出的 .hoplane 文件"); }
   }
-  async function submit(event: FormEvent<HTMLFormElement>) {
+  async function submitHoplane(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const password = String(new FormData(event.currentTarget).get("password") ?? "");
     if (!bundle) { setErrorText("请先选择要导入的配置文件"); return; }
@@ -1450,8 +1467,54 @@ function ImportConfigDialog({ notify, onClose, onImported }: { notify: Notify; o
     } catch (error) { setErrorText(message(error)); }
     finally { setBusy(false); }
   }
-  return <Modal title="导入配置" onClose={() => !busy && onClose()}>
-    <form onSubmit={submit} className="form-grid">
+  async function loadGroupNames() {
+    try {
+      const hosts = await api<Host[]>("/v1/hosts");
+      setGroupNames([...new Set(hosts.map((host) => host.groupName).filter((name): name is string => Boolean(name)))].sort());
+    } catch { /* 分组列表仅用于输入建议，加载失败不阻断导入 */ }
+  }
+  async function previewSshConfig() {
+    if (!sshPath.trim()) return;
+    setSshBusy(true); setErrorText(""); setSshWarnings([]);
+    try {
+      const result = await post<{ hosts: SshPreviewHost[]; warnings: string[] }>("/v1/hosts/ssh-config/preview", { path: sshPath.trim() });
+      setSshPreview(result.hosts);
+      setSshWarnings(result.warnings);
+      setSshSelected(new Set(result.hosts.filter((host) => !host.duplicate).map((host) => host.alias)));
+      void loadGroupNames();
+    } catch (error) { setErrorText(message(error)); }
+    finally { setSshBusy(false); }
+  }
+  function switchMode(next: "hoplane" | "ssh-config") {
+    if (next === mode) return;
+    setMode(next);
+    setErrorText("");
+    if (next === "ssh-config" && !sshPreview && !sshBusy) void previewSshConfig();
+  }
+  async function submitSsh(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (sshSelected.size === 0) { setErrorText("请先勾选要导入的主机"); return; }
+    const groupName = String(new FormData(event.currentTarget).get("sshGroupName") ?? "").trim() || "SSH Config";
+    setBusy(true); setErrorText("");
+    try {
+      const result = await post<{ imported: number; skipped: number; warnings: string[] }>("/v1/hosts/import-ssh-config", { path: sshPath.trim(), groupName, aliases: [...sshSelected] });
+      onImported();
+      onClose();
+      const skipped = result.skipped > 0 ? `，跳过 ${result.skipped} 台` : "";
+      const warning = result.warnings.length > 0 ? `。${result.warnings[0]}${result.warnings.length > 1 ? `（共 ${result.warnings.length} 条警告）` : ""}` : "";
+      notify("ok", `已导入 ${result.imported} 台主机${skipped}${warning}`);
+    } catch (error) { setErrorText(message(error)); }
+    finally { setBusy(false); }
+  }
+  const selectableHosts = sshPreview?.filter((host) => !host.duplicate) ?? [];
+  const allSelected = selectableHosts.length > 0 && selectableHosts.every((host) => sshSelected.has(host.alias));
+  const someSelected = selectableHosts.some((host) => sshSelected.has(host.alias));
+  return <Modal title="导入配置" onClose={() => !busy && !sshBusy && onClose()}>
+    <div className="import-mode-switch" role="tablist" aria-label="导入方式">
+      <button type="button" role="tab" aria-selected={mode === "hoplane"} className={mode === "hoplane" ? "selected" : ""} onClick={() => switchMode("hoplane")}>Hoplane 配置文件</button>
+      <button type="button" role="tab" aria-selected={mode === "ssh-config"} className={mode === "ssh-config" ? "selected" : ""} onClick={() => switchMode("ssh-config")}>本地 SSH 配置</button>
+    </div>
+    {mode === "hoplane" && <form onSubmit={submitHoplane} className="form-grid">
       <p className="form-hint span-2">导入按 ID 合并：相同 ID 的主机、凭据和策略会被覆盖，现有其他主机会保留。目标电脑需要先解锁本地保险库。使用 SSH Agent 的主机仍需本机 Agent 可用。</p>
       <label className="span-2">配置文件
         <input type="file" accept=".hoplane,application/json" onChange={(event) => void chooseFile(event)} />
@@ -1460,7 +1523,41 @@ function ImportConfigDialog({ notify, onClose, onImported }: { notify: Notify; o
       <label className="span-2">导出密码<input name="password" type="password" minLength={10} maxLength={1024} required autoComplete="current-password" /></label>
       {errorText && <div className="form-error span-2" role="alert">{errorText}</div>}
       <div className="form-actions span-2"><button type="button" onClick={onClose} disabled={busy}>取消</button><button type="submit" className="primary" disabled={busy || !bundle}>{busy ? "导入中…" : "导入并覆盖同 ID 配置"}</button></div>
-    </form>
+    </form>}
+    {mode === "ssh-config" && <form onSubmit={submitSsh} className="form-grid">
+      <p className="form-hint span-2">解析本地 SSH 配置文件中的主机条目，支持 Include 递归展开与 ProxyJump 跳板映射。导入的主机默认不开放 AI 访问，与现有主机同名的条目会被跳过。</p>
+      <label className="span-2">配置文件路径
+        <input value={sshPath} onChange={(event) => setSshPath(event.target.value)} placeholder="~/.ssh/config" />
+        <small className="field-recommendation">默认读取本机用户目录下的 ~/.ssh/config，也可以填写其他绝对路径。</small>
+      </label>
+      <div className="span-2"><button type="button" disabled={sshBusy || !sshPath.trim()} onClick={() => void previewSshConfig()}>{sshBusy ? "解析中…" : sshPreview ? "重新解析" : "解析并预览"}</button></div>
+      {sshPreview && <div className="ssh-import-preview span-2" aria-label="SSH 配置解析预览">
+        <div className="ssh-import-toolbar">
+          <SelectionCheckbox label="全选可导入主机" checked={allSelected} indeterminate={!allSelected && someSelected} disabled={selectableHosts.length === 0} onChange={(selected) => setSshSelected(new Set(selected ? selectableHosts.map((host) => host.alias) : []))} />
+          <strong>{`已勾选 ${sshSelected.size} / ${selectableHosts.length} 台可导入主机`}</strong>
+        </div>
+        <ul>
+          {sshPreview.map((host) => <li key={host.alias} className={host.duplicate ? "duplicate" : ""}>
+            <SelectionCheckbox label={`导入 ${host.alias}`} checked={sshSelected.has(host.alias)} disabled={host.duplicate} onChange={(selected) => setSshSelected((current) => {
+              const next = new Set(current);
+              if (selected) next.add(host.alias); else next.delete(host.alias);
+              return next;
+            })} />
+            <span className="ssh-import-alias">{host.alias}</span>
+            <span className="ssh-import-target">{`${host.hostname}:${host.port}`}</span>
+            <span className="ssh-import-user">{host.username}</span>
+            {host.proxyJump && <span className="ssh-import-jump">{`跳板 ${host.proxyJump}`}</span>}
+            {host.identityFile && <span className="ssh-import-identity">{`私钥 ${host.identityFile}`}</span>}
+            {host.duplicate && <span className="ssh-import-duplicate">同名主机已存在</span>}
+          </li>)}
+        </ul>
+        {sshPreview.length === 0 && <p className="ssh-import-empty">没有解析到可导入的主机条目。</p>}
+      </div>}
+      {sshWarnings.length > 0 && <div className="ssh-import-warnings span-2" role="status">{sshWarnings.map((warning, index) => <small key={index}>{warning}</small>)}</div>}
+      <div className="field-label span-2"><span>分组</span><AppCombobox name="sshGroupName" ariaLabel="导入分组" options={groupNames} defaultValue="SSH Config" placeholder="选择已有分组或输入新分组" /></div>
+      {errorText && <div className="form-error span-2" role="alert">{errorText}</div>}
+      <div className="form-actions span-2"><button type="button" onClick={onClose} disabled={busy || sshBusy}>取消</button><button type="submit" className="primary" disabled={busy || sshSelected.size === 0}>{busy ? "导入中…" : `导入 ${sshSelected.size} 台主机`}</button></div>
+    </form>}
   </Modal>;
 }
 

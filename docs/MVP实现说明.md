@@ -118,6 +118,7 @@ POST           /v1/hosts/:id/test
 GET            /v1/hosts/:id/events  SSE 只读实时事件流
 POST           /v1/hosts/:id/trust-key
 POST           /v1/hosts/:id/credential/reveal  App 同源限定、主密码二次验证
+POST           /v1/hosts/ssh-config/preview
 POST           /v1/hosts/import-ssh-config
 GET/POST       /v1/credentials
 PATCH/DELETE   /v1/credentials/:id
@@ -181,7 +182,7 @@ API 请求体最大 1 MiB；命令最长 32 KiB；命令超时范围为 100 毫�
 2. 增加 Core 锁文件和单实例 IPC，进一步强化跨进程竞争处理；
 3. 增加连接空闲 TTL 和显式操作取消；
 4. 增加真实 SSH 容器的集成测试；
-5. 完善 SSH Config 的 Include、Match、ProxyJump 和通配符继承；
+5. 支持 SSH Config 的 Match 条件求值与 Host 通配符继承；
 6. 增加审计保留周期、导出和数据库容量管理；
 7. 为策略编辑器增加保存前命令模拟测试。
 8. 增加每个 Agent 独立 Token、过期时间和单独吊销能力。

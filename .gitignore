@@ -52,6 +52,15 @@ desktop.ini
 *.swo
 *~
 
+# AI coding assistant workspace folders
+.codebuddy/
+.zcode/
+.cursor/
+.trae/
+.windsurf/
+.claude/
+.aider*
+
 # Temporary and tool caches
 tmp/
 temp/
