@@ -21,6 +21,23 @@ describe("sudo invocation detection", () => {
     expect(findSudoInvocations("visudo")).toEqual([]);
     expect(findSudoInvocations("echo time sudo id")).toEqual([]);
   });
+
+  it("detects sudo obfuscated with shell quoting, escapes and prefixes", () => {
+    expect(findSudoInvocations("\\sudo id")).toEqual([0]);
+    expect(findSudoInvocations("s\\udo id")).toEqual([0]);
+    expect(findSudoInvocations("su''do id")).toEqual([0]);
+    expect(findSudoInvocations("su\"do\" id")).toEqual([0]);
+    expect(findSudoInvocations("VAR=x sudo id")).toEqual([6]);
+    expect(findSudoInvocations("true && \\sudo id")).toEqual([8]);
+    expect(findSudoInvocations("cd /tmp; su''do reboot")).toEqual([9]);
+    expect(findSudoInvocations("echo \"$(sudo id)\"")).toEqual([8]);
+  });
+
+  it("does not mistake quoted command-substitution text for commands", () => {
+    expect(findSudoInvocations("echo \"a$() sudo id\"")).toEqual([]);
+    expect(findSudoInvocations("echo \"a$(id) sudo b\"")).toEqual([]);
+    expect(findSudoInvocations("echo su''do")).toEqual([]);
+  });
 });
 
 describe("managed sudo execution", () => {
@@ -60,6 +77,15 @@ describe("managed sudo execution", () => {
   it("does not rewrite sudo mentioned inside quoted text", () => {
     const prepared = prepareSudoExecution("sudo sh -c 'echo sudo done' && echo \"try sudo later\"", true, "HOPLANE_TEST_PROMPT");
     expect(prepared.command).toBe("sudo -S -p 'HOPLANE_TEST_PROMPT' sh -c 'echo sudo done' && echo \"try sudo later\"");
+  });
+
+  it("rewrites the whole obfuscated sudo word, not just four characters", () => {
+    expect(prepareSudoExecution("su''do reboot", false)).toEqual({ command: "sudo -n reboot" });
+    expect(prepareSudoExecution("\\sudo reboot", false)).toEqual({ command: "sudo -n reboot" });
+    expect(prepareSudoExecution("VAR=x \\sudo id", true, "HOPLANE_TEST_PROMPT")).toEqual({
+      command: "VAR=x sudo -S -p 'HOPLANE_TEST_PROMPT' id",
+      promptMarker: "HOPLANE_TEST_PROMPT"
+    });
   });
 });
 

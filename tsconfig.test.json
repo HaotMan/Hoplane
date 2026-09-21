@@ -1,0 +1,8 @@
+{
+  "extends": "./tsconfig.node.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": ["test/**/*.ts"],
+  "exclude": ["test/verify-packaged-mcp.mjs", "test/desktop-api.test.ts", "test/host-list.test.ts", "test/terminal-clipboard.test.ts"]
+}

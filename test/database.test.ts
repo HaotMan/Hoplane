@@ -239,4 +239,100 @@ describe("HoplaneDatabase", () => {
     expect(db.getHost(host.id)?.groupName).toBe("生产节点");
     db.close();
   });
+
+  it("does not reset policies when a single policy row contains corrupted JSON", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hoplane-test-")); dirs.push(dir);
+    const path = join(dir, "corrupt-policy.sqlite3");
+    const db = new HoplaneDatabase(path);
+    const document = db.listPolicies()[0]!.document;
+    const corrupted = db.createPolicy("损坏的策略", document);
+    const survivor = db.createPolicy("幸存的策略", document);
+    const host = db.createHost({
+      name: "node", hostname: "127.0.0.1", port: 22, username: "root", credentialId: null,
+      policyId: survivor.id, groupName: null, tags: [], defaultDirectory: null, enabled: true, aiAccessEnabled: true
+    });
+    db.close();
+
+    const raw = new DatabaseSync(path);
+    raw.prepare("UPDATE policies SET policy_json='{broken' WHERE id=?").run(corrupted.id);
+    raw.close();
+
+    const reopened = new HoplaneDatabase(path);
+    expect(reopened.listPolicies().map((policy) => policy.id)).toContain(survivor.id);
+    expect(reopened.getHost(host.id)?.policyId).toBe(survivor.id);
+    const degraded = reopened.getPolicy(corrupted.id);
+    expect(degraded?.document.commandBlacklist[0]?.pattern).toBe("[\\s\\S]*");
+    expect(degraded?.document.files.allowUpload).toBe(false);
+    reopened.close();
+  });
+
+  it("backs up policies before the legacy reset instead of silently destroying them", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hoplane-test-")); dirs.push(dir);
+    const path = join(dir, "legacy-reset.sqlite3");
+    const db = new HoplaneDatabase(path);
+    const document = db.listPolicies()[0]!.document;
+    const custom = db.createPolicy("升级前的自定义策略", document);
+    db.close();
+
+    const raw = new DatabaseSync(path);
+    raw.prepare("UPDATE policies SET policy_json=? WHERE id=?").run(JSON.stringify({ ...document, schemaVersion: 2 }), custom.id);
+    raw.close();
+
+    const reopened = new HoplaneDatabase(path);
+    expect(reopened.getPolicy(custom.id)).toBeNull();
+    const backup = reopened.db.prepare("SELECT name FROM policy_reset_backup WHERE id=?").get(custom.id) as { name: string } | undefined;
+    expect(backup?.name).toBe("升级前的自定义策略");
+    reopened.close();
+  });
+
+  it("does not trigger the legacy reset for policies from a newer schema", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hoplane-test-")); dirs.push(dir);
+    const path = join(dir, "future-schema.sqlite3");
+    const db = new HoplaneDatabase(path);
+    const document = db.listPolicies()[0]!.document;
+    const custom = db.createPolicy("来自未来版本的策略", document);
+    db.close();
+
+    const raw = new DatabaseSync(path);
+    raw.prepare("UPDATE policies SET policy_json=? WHERE id=?").run(JSON.stringify({ ...document, schemaVersion: 5 }), custom.id);
+    raw.close();
+
+    const reopened = new HoplaneDatabase(path);
+    expect(reopened.getPolicy(custom.id)?.name).toBe("来自未来版本的策略");
+    reopened.close();
+  });
+
+  it("keeps listing hosts and credentials when a row contains corrupted JSON", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hoplane-test-")); dirs.push(dir);
+    const path = join(dir, "corrupt-columns.sqlite3");
+    const db = new HoplaneDatabase(path);
+    const host = db.createHost({
+      name: "node", hostname: "127.0.0.1", port: 22, username: "root", credentialId: null,
+      policyId: null, groupName: null, tags: ["prod"], defaultDirectory: null, enabled: true, aiAccessEnabled: true
+    });
+    const credential = db.createCredential("key", "PRIVATE_KEY", "vault://secret", { privateKeyPath: "/tmp/id_ed25519" });
+    db.close();
+
+    const raw = new DatabaseSync(path);
+    raw.prepare("UPDATE hosts SET tags_json='{broken' WHERE id=?").run(host.id);
+    raw.prepare("UPDATE credentials SET metadata_json='{broken' WHERE id=?").run(credential.id);
+    raw.close();
+
+    const reopened = new HoplaneDatabase(path);
+    expect(reopened.listHosts().map((row) => row.id)).toContain(host.id);
+    expect(reopened.getHost(host.id)?.tags).toEqual([]);
+    expect(reopened.listCredentials().map((row) => row.id)).toContain(credential.id);
+    expect(reopened.getCredential(credential.id)?.metadata).toEqual({});
+    reopened.close();
+  });
+
+  it("coerces non-finite audit pagination instead of failing the query", async () => {
+    const db = await database();
+    for (let index = 0; index < 3; index += 1) db.createAudit({ id: `op-${index}`, clientType: "UI", operationType: "EXECUTE_COMMAND" });
+    expect(() => db.listAudit({ limit: Number("abc") })).not.toThrow();
+    expect(db.listAudit({ limit: Number("abc") })).toHaveLength(3);
+    expect(db.listAudit({ offset: Number("abc") })).toHaveLength(3);
+    expect(db.listAudit({ limit: 2 })).toHaveLength(2);
+    db.close();
+  });
 });

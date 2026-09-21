@@ -279,7 +279,9 @@ export class HoplaneDatabase {
       try {
         const rows = this.db.prepare("SELECT id,policy_json FROM policies").all() as Row[];
         for (const row of rows) {
-          const raw = JSON.parse(String(row.policy_json)) as { schemaVersion?: unknown };
+          let raw: { schemaVersion?: unknown };
+          try { raw = JSON.parse(String(row.policy_json)) as { schemaVersion?: unknown }; }
+          catch { continue; } // Leave corrupted rows alone; reads degrade them to fail-closed documents.
           if (raw.schemaVersion !== 3) continue;
           const upgraded = policyDocumentSchema.parse(raw);
           this.db.prepare("UPDATE policies SET policy_json=?,schema_version=4,version=version+1,updated_at=? WHERE id=?")
@@ -388,8 +390,12 @@ export class HoplaneDatabase {
   private hasPreV3PolicyDocuments(): boolean {
     const rows = this.db.prepare("SELECT policy_json FROM policies").all() as Row[];
     return rows.some((row) => {
-      try { return ![3, 4].includes(Number((JSON.parse(String(row.policy_json)) as { schemaVersion?: unknown }).schemaVersion)); }
-      catch { return true; }
+      let schemaVersion: unknown;
+      try { schemaVersion = (JSON.parse(String(row.policy_json)) as { schemaVersion?: unknown }).schemaVersion; }
+      catch { return false; } // Corrupted JSON is not legacy data; the row degrades to a fail-closed document instead of triggering the reset.
+      // Legacy means "older than v3" (including documents without a schemaVersion);
+      // documents from any newer schema (e.g. a future v5) must never trigger the destructive reset.
+      return !(Number(schemaVersion) >= 3);
     });
   }
 
@@ -409,6 +415,14 @@ export class HoplaneDatabase {
           .filter((row) => LEGACY_READONLY_TEMPLATE_NAMES.has(String(row.name)) || LEGACY_OPERATIONS_TEMPLATE_NAMES.has(String(row.name)))
           .flatMap((row) => row.source_path ? [String(row.source_path)] : []);
         if (legacyPaths.length > 0) this.setSetting(POLICY_TEMPLATE_CONSOLIDATION_CLEANUP_SETTING, legacyPaths);
+        // The reset replaces every policy, so keep a recoverable copy first —
+        // schema_migrations policy_reset_backup always survives it.
+        this.db.exec(`CREATE TABLE IF NOT EXISTS policy_reset_backup (
+          id TEXT PRIMARY KEY, name TEXT NOT NULL, source_path TEXT, policy_json TEXT NOT NULL,
+          schema_version INTEGER, enabled INTEGER, backed_up_at TEXT NOT NULL)`);
+        this.db.prepare(`INSERT OR REPLACE INTO policy_reset_backup
+          (id,name,source_path,policy_json,schema_version,enabled,backed_up_at)
+          SELECT id,name,source_path,policy_json,schema_version,enabled,? FROM policies`).run(now());
         this.db.prepare("UPDATE hosts SET policy_id=NULL").run();
         this.db.prepare("DELETE FROM policies").run();
       }
@@ -881,8 +895,10 @@ export class HoplaneDatabase {
     const values: SQLInputValue[] = [];
     if (filters.hostId) { where.push("(host_id=? OR peer_host_id=?)"); values.push(filters.hostId, filters.hostId); }
     if (filters.status) { where.push("status=?"); values.push(filters.status); }
-    const limit = Math.min(Math.max(filters.limit ?? 100, 1), 500);
-    const offset = Math.max(filters.offset ?? 0, 0);
+    // Coerce non-finite values (e.g. a caller passing Number("abc")) to the
+    // defaults: node:sqlite rejects NaN bindings outright.
+    const limit = Number.isFinite(filters.limit) ? Math.min(Math.max(Math.trunc(filters.limit as number), 1), 500) : 100;
+    const offset = Number.isFinite(filters.offset) ? Math.max(Math.trunc(filters.offset as number), 0) : 0;
     values.push(limit, offset);
     const sql = `SELECT * FROM audit_logs ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY created_at DESC LIMIT ? OFFSET ?`;
     return (this.db.prepare(sql).all(...values) as Row[]).map(mapAudit);
@@ -896,7 +912,7 @@ function mapHost(row: Row): Host {
   return {
     id: String(row.id), name: String(row.name), hostname: String(row.hostname), port: Number(row.port), username: String(row.username),
     credentialId: nullable(row.credential_id), activeLoginId: nullable(row.active_login_id), jumpHostId: nullable(row.jump_host_id), policyId: nullable(row.policy_id), groupName: nullable(row.group_name),
-    tags: JSON.parse(String(row.tags_json)) as string[], defaultDirectory: nullable(row.default_directory),
+    tags: parseJsonColumn(row.tags_json, []), defaultDirectory: nullable(row.default_directory),
     enabled: Boolean(row.enabled), aiAccessEnabled: Boolean(row.ai_access_enabled), hostTransferEnabled: Boolean(row.host_transfer_enabled), monitorOutputEnabled: Boolean(row.monitor_output_enabled),
     proxyEnabled: Boolean(row.proxy_enabled), proxyLocalHost: String(row.proxy_local_host), proxyLocalPort: Number(row.proxy_local_port), proxyRemotePort: Number(row.proxy_remote_port), configRevision: Number(row.config_revision),
     createdAt: String(row.created_at), updatedAt: String(row.updated_at)
@@ -916,15 +932,29 @@ function mapCredential(row: Row): Credential {
   return {
     id: String(row.id), name: String(row.name), type: String(row.type) as CredentialType,
     secretRef: nullable(row.secret_ref), sudoMode: String(row.sudo_mode ?? "NONE") as SudoAuthMode, sudoSecretRef: nullable(row.sudo_secret_ref),
-    metadata: JSON.parse(String(row.metadata_json)) as Credential["metadata"],
+    metadata: parseJsonColumn(row.metadata_json, {} as Credential["metadata"]),
     hasSecret: Boolean(row.secret_ref), hasSudoSecret: Boolean(row.sudo_secret_ref), createdAt: String(row.created_at), updatedAt: String(row.updated_at)
   };
 }
 
+/** Deny-everything placeholder for corrupted policy documents: a broken row must fail closed, not vanish or crash the list. */
+const FAIL_CLOSED_POLICY_DOCUMENT: PolicyDocument = {
+  schemaVersion: 4,
+  commandBlacklist: [{ pattern: "[\\s\\S]*", description: "策略数据已损坏，所有命令均被拒绝" }],
+  files: {
+    allowUpload: false, allowDownload: false, allowOverwrite: false,
+    maxUploadBytes: 0, maxDownloadBytes: 0,
+    allowedLocalPaths: [], allowedRemoteUploadPaths: [], allowedRemoteDownloadPaths: []
+  }
+};
+
 function mapPolicy(row: Row): Policy {
+  let document: PolicyDocument;
+  try { document = policyDocumentSchema.parse(JSON.parse(String(row.policy_json))); }
+  catch { document = FAIL_CLOSED_POLICY_DOCUMENT; }
   return {
     id: String(row.id), name: String(row.name), version: Number(row.version),
-    document: policyDocumentSchema.parse(JSON.parse(String(row.policy_json))), schemaVersion: 4, enabled: Boolean(row.enabled),
+    document, schemaVersion: 4, enabled: Boolean(row.enabled),
     sourcePath: nullable(row.source_path), sourceStatus: String(row.source_status) as PolicySourceStatus,
     sourceError: nullable(row.source_error), sourceHash: nullable(row.source_hash),
     createdAt: String(row.created_at), updatedAt: String(row.updated_at)
@@ -946,6 +976,17 @@ function mapAudit(row: Row): AuditLog {
 }
 
 function nullable(value: unknown): string | null { return value == null ? null : String(value); }
+
+/** Parses a JSON column with a fallback so one corrupted row cannot take down every listing API. */
+function parseJsonColumn<T>(value: unknown, fallback: T): T {
+  try {
+    const parsed = JSON.parse(String(value)) as T;
+    if (Array.isArray(fallback)) return Array.isArray(parsed) ? parsed : fallback;
+    return parsed !== null && typeof parsed === typeof fallback ? parsed : fallback;
+  } catch {
+    return fallback;
+  }
+}
 
 function validateRegexes(document: PolicyDocument): void {
   const patterns = document.commandBlacklist.map((rule) => rule.pattern);

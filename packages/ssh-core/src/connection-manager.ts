@@ -16,7 +16,7 @@ import { basename, dirname, join } from "node:path/posix";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import type { CommandResult, Credential, Host, HostStatus, ProxyTunnelState } from "../../shared/src/index.js";
-import { AppError } from "../../shared/src/index.js";
+import { AppError, scanShellWords } from "../../shared/src/index.js";
 import type { HoplaneDatabase } from "../../core/src/database.js";
 import type { CredentialVault } from "../../core/src/vault.js";
 
@@ -1149,69 +1149,38 @@ export interface PreparedSudoExecution {
   promptMarker?: string;
 }
 
-const COMMAND_SEPARATORS = new Set([";", "&", "|", "(", "{", "`", "\n"]);
-
 /**
- * Finds the offset of every `sudo` that starts a shell command: at the beginning
- * of the string or right after a separator (`;`, `&&`, `||`, `|`, `(`, `` ` ``,
- * `{`, newline), or immediately after the shell `time` wrapper (`time sudo`
- * and `time -p sudo`). Text inside single/double quotes is skipped, so e.g.
- * `echo "a && sudo b"` is not treated as a sudo invocation. sudo credentials do
- * not carry across invocations on a non-interactive SSH channel (no TTY means no
- * usable timestamp cache), so every invocation needs its own authentication.
+ * Finds the span of every `sudo` that starts a shell command: at the beginning
+ * of the string, right after a separator (`;`, `&&`, `||`, `|`, `(`, `` ` ``,
+ * `{`, newline) or inside a command substitution, after assignment prefixes
+ * (`VAR=x sudo`), and immediately after the shell `time` wrapper. Words are
+ * resolved with shell quote removal, so obfuscations such as `\sudo`,
+ * `su''do` or `su"do"` are detected too, while text inside quoted arguments
+ * (`echo "a && sudo b"`) is not. sudo credentials do not carry across
+ * invocations on a non-interactive SSH channel (no TTY means no usable
+ * timestamp cache), so every invocation needs its own authentication.
  */
+export function findSudoInvocationSpans(command: string): Array<{ start: number; end: number }> {
+  return scanShellWords(command)
+    .filter((word) => word.atCommandPosition && !word.isPrefix && word.text === "sudo")
+    .map((word) => ({ start: word.start, end: word.end }));
+}
+
+/** Offset-only view of {@link findSudoInvocationSpans} for callers that only need to know where sudo runs. */
 export function findSudoInvocations(command: string): number[] {
-  const offsets: number[] = [];
-  let atCommandStart = true;
-  let insideTimeWrapper = false;
-  for (let index = 0; index < command.length; index += 1) {
-    const char = command[index]!;
-    if (char === "\\") { index += 1; atCommandStart = false; insideTimeWrapper = false; continue; }
-    if (char === "'") {
-      const end = command.indexOf("'", index + 1);
-      index = end < 0 ? command.length : end;
-      atCommandStart = false;
-      insideTimeWrapper = false;
-      continue;
-    }
-    if (char === '"') {
-      index += 1;
-      while (index < command.length && command[index] !== '"') { if (command[index] === "\\") index += 1; index += 1; }
-      atCommandStart = false;
-      insideTimeWrapper = false;
-      continue;
-    }
-    if (COMMAND_SEPARATORS.has(char)) { atCommandStart = true; insideTimeWrapper = false; continue; }
-    if (/\s/u.test(char)) continue;
-    if (atCommandStart && command.startsWith("time", index) && /\s/u.test(command[index + 4] ?? "")) {
-      index += 3;
-      insideTimeWrapper = true;
-      continue;
-    }
-    if (atCommandStart && insideTimeWrapper && command.startsWith("-p", index) && (index + 2 === command.length || /\s/u.test(command[index + 2]!))) {
-      index += 1;
-      continue;
-    }
-    if (atCommandStart && command.startsWith("sudo", index) && (index + 4 === command.length || /\s/u.test(command[index + 4]!))) {
-      offsets.push(index);
-      index += 3;
-    }
-    atCommandStart = false;
-    insideTimeWrapper = false;
-  }
-  return offsets;
+  return findSudoInvocationSpans(command).map((span) => span.start);
 }
 
 /** Adds non-interactive sudo authentication without ever placing a password in the command. */
 export function prepareSudoExecution(command: string, hasManagedPassword: boolean, marker = `HOPLANE_SUDO_${randomUUID()}_`): PreparedSudoExecution {
-  const invocations = findSudoInvocations(command);
+  const invocations = findSudoInvocationSpans(command);
   if (invocations.length === 0) return { command };
   const replacement = hasManagedPassword ? `sudo -S -p ${shellQuote(marker)}` : "sudo -n";
   let rewritten = "";
   let cursor = 0;
-  for (const offset of invocations) {
-    rewritten += command.slice(cursor, offset) + replacement;
-    cursor = offset + "sudo".length;
+  for (const span of invocations) {
+    rewritten += command.slice(cursor, span.start) + replacement;
+    cursor = span.end;
   }
   rewritten += command.slice(cursor);
   return hasManagedPassword ? { command: rewritten, promptMarker: marker } : { command: rewritten };

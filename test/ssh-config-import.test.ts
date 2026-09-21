@@ -30,7 +30,7 @@ describe("SSH config import", () => {
     expect(hosts.map((host) => host.alias)).toEqual(["dev", "prod"]);
     expect(hosts[0]).toMatchObject({ hostname: "10.0.0.2", username: "alice" });
     expect(hosts[1]).toMatchObject({ hostname: "10.0.0.3" });
-    expect(hosts[1].username).not.toBe("attacker");
+    expect(hosts[1]!.username).not.toBe("attacker");
   });
 
   it("expands Include directives with relative paths, globs, and cycle protection", async () => {

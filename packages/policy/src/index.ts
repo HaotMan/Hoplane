@@ -2,13 +2,22 @@ import { realpath, stat } from "node:fs/promises";
 import { dirname, isAbsolute, normalize, relative, resolve, sep } from "node:path";
 import * as posix from "node:path/posix";
 import type { PolicyDocument, PolicyResult } from "../../shared/src/index.js";
+import { normalizedCommandSegments } from "../../shared/src/index.js";
 
 export class PolicyService {
   evaluateCommand(policy: PolicyDocument, command: string, _directory?: string): PolicyResult {
     if (!command.trim()) return deny("COMMAND_EMPTY", "Command is empty");
+    // Beside the raw command, each rule is tested against every normalized
+    // command segment (quote removal applied, assignment/`time` prefixes
+    // dropped) so anchored patterns cannot be evaded with `r''m -rf /`,
+    // `VAR=x rm -rf /` or `echo ok; rm -rf /`.
+    const candidates = [command, ...normalizedCommandSegments(command)];
     for (const rule of policy.commandBlacklist) {
-      if (new RegExp(rule.pattern, "u").test(command)) {
-        return deny("COMMAND_BLACKLISTED", rule.description ?? "Command matched a blacklist rule", rule.pattern);
+      const pattern = new RegExp(rule.pattern, "u");
+      for (const candidate of candidates) {
+        if (pattern.test(candidate)) {
+          return deny("COMMAND_BLACKLISTED", rule.description ?? "Command matched a blacklist rule", rule.pattern);
+        }
       }
     }
     return allow("BLACKLIST_CLEAR", "Command did not match any blacklist rule");

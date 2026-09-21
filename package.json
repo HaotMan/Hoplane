@@ -27,7 +27,7 @@
     "build:app": "pnpm build && electron-builder --mac",
     "build:app:win": "pnpm build && electron-builder --win --x64",
     "build:app:linux": "pnpm build && electron-builder --linux deb --x64 --publish never",
-    "typecheck": "tsc -p tsconfig.node.json --noEmit && tsc -p apps/desktop/tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.node.json --noEmit && tsc -p tsconfig.test.json && tsc -p apps/desktop/tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"
   },

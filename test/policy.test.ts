@@ -66,6 +66,26 @@ describe("PolicyService V3 blacklist mode", () => {
     expect(service.evaluateCommand(findPolicyTemplate("deny-all")!.document, "uptime").decision).toBe("DENY");
   });
 
+  it("cannot be bypassed by quote splitting, escapes, prefixes or chained commands", () => {
+    const document = policy([{ pattern: "^\\s*(?:rm|dd)(?:\\s|$)", description: "禁止删除" }]);
+    expect(service.evaluateCommand(document, "rm -rf /").decision).toBe("DENY");
+    expect(service.evaluateCommand(document, "r''m -rf /").decision).toBe("DENY");
+    expect(service.evaluateCommand(document, "r\"\"m -rf /").decision).toBe("DENY");
+    expect(service.evaluateCommand(document, "r\\m -rf /").decision).toBe("DENY");
+    expect(service.evaluateCommand(document, "VAR=x rm -rf /").decision).toBe("DENY");
+    expect(service.evaluateCommand(document, "echo ok; rm -rf /").decision).toBe("DENY");
+    expect(service.evaluateCommand(document, "time rm -rf /").decision).toBe("DENY");
+    expect(service.evaluateCommand(document, "echo \"$(rm -rf /)\"").decision).toBe("DENY");
+  });
+
+  it("still allows deletion commands that only appear as quoted arguments", () => {
+    const document = policy([{ pattern: "^\\s*(?:rm|dd)(?:\\s|$)", description: "禁止删除" }]);
+    expect(service.evaluateCommand(document, "echo 'rm -rf /'").decision).toBe("ALLOW");
+    expect(service.evaluateCommand(document, "echo \"a$() rm -rf /\"").decision).toBe("ALLOW");
+    expect(service.evaluateCommand(document, "grep rm /var/log/app.log").decision).toBe("ALLOW");
+    expect(service.evaluateCommand(document, "myrm file").decision).toBe("ALLOW");
+  });
+
   it("applies source and destination file constraints to host transfers", () => {
     const source = policy();
     source.files.allowedRemoteDownloadPaths = ["/exports"];

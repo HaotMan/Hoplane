@@ -790,10 +790,13 @@ async function routeApi(request: IncomingMessage, response: ServerResponse, url:
   }
 
   if (method === "GET" && url.pathname === "/v1/audit-logs") {
+    const limitParam = Number(url.searchParams.get("limit") ?? 100);
+    const offsetParam = Number(url.searchParams.get("offset") ?? 0);
     return json(response, 200, database.listAudit({
       hostId: url.searchParams.get("hostId") ?? undefined,
       status: url.searchParams.get("status") ?? undefined,
-      limit: Number(url.searchParams.get("limit") ?? 100), offset: Number(url.searchParams.get("offset") ?? 0)
+      limit: Number.isFinite(limitParam) ? limitParam : 100,
+      offset: Number.isFinite(offsetParam) ? offsetParam : 0
     }));
   }
   if (method === "POST" && url.pathname === "/v1/operations/execute") {
